@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import uuid
 import asyncio
 import logging
 import sqlite3
@@ -20,7 +21,10 @@ from psycopg2.pool import ThreadedConnectionPool
 
 import redis
 import jwt
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import (
+    FastAPI, Request, Form, WebSocket, WebSocketDisconnect, Depends,
+    HTTPException,
+)
 from fastapi.responses import (
     HTMLResponse,
     RedirectResponse,
@@ -50,6 +54,13 @@ from emb_pace import PacedEmbeddings
 from rbac import fetch_user_profile
 from tools import build_available_tools, run_chatbot_graph
 from chart_engine import detect_chart_opportunity
+from voice_bridge import (
+    get_elevenlabs_signed_url,
+    mint_voice_session_token,
+    verify_voice_session_token,
+    VoiceBridgeError,
+    VOICE_SESSION_TOKEN_TTL_SECONDS,
+)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG & LOGGING
@@ -95,6 +106,19 @@ class CFG:
     AZURE_EMBED_DEPLOYMENT: str = os.getenv(
         "AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small"
     )
+
+    # ElevenLabs real-time voice-to-voice (Conversational AI / Agents Platform).
+    # Accepts either ELEVENLABS_API_KEY or the existing ELEVENLABS var.
+    # Voice/model selection now lives on the Agent itself in ElevenLabs'
+    # dashboard (Voice + TTS model family) — not configured here anymore.
+    ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS", "")
+    ELEVENLABS_AGENT_ID: str = os.getenv("ELEVENLABS_AGENT_ID", "")
+    # Static shared secret configured once in the Agent's Custom LLM "API Key"
+    # field (ElevenLabs calls it OPENAI_API_KEY there, but it's just an
+    # opaque bearer secret) — proves a /v1/chat/completions call really came
+    # from our agent. Generate any long random string and set it in both
+    # places (here and the ElevenLabs dashboard).
+    ELEVENLABS_CUSTOMLLM_SHARED_SECRET: str = os.getenv("ELEVENLABS_CUSTOMLLM_SHARED_SECRET", "")
 
     # JWT
     JWT_SECRET: str = os.getenv("JWT_SECRET")
@@ -149,6 +173,8 @@ client = AzureOpenAI(
     azure_endpoint=cfg.AZURE_OPENAI_ENDPOINT,
     api_key=cfg.AZURE_OPENAI_KEY,
     api_version=cfg.AZURE_OPENAI_API_VERSION,
+    timeout=20.0,
+    max_retries=1,
 )
 
 embeddings = AzureOpenAIEmbeddings(
@@ -433,6 +459,7 @@ async def handle_query(
                 pg_conn_fn=pg_conn,
                 policy_cfg=POLICY_CFG,
                 emb=emb,
+                redis_client=redis_client,
                 tool_results_collector=tool_results_for_chart,
             ):
                 assistant_response += chunk
@@ -477,6 +504,144 @@ async def handle_query(
                 yield f"<replace>{assistant_response}</replace>"
 
     return StreamingResponse(generate(), media_type="text/html")
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# VOICE — real-time voice-to-voice via ElevenLabs' Conversational AI agent.
+#
+# The client connects DIRECTLY to ElevenLabs' own WebSocket for the live
+# audio duplex (that's their product's whole latency advantage) — our
+# backend never relays raw audio. Our two jobs:
+#   1. Mint a signed URL (via ElevenLabs, server-side) so the client never
+#      sees our raw ElevenLabs API key.
+#   2. Be the agent's "Custom LLM": ElevenLabs handles STT/TTS and calls our
+#      /v1/chat/completions for the actual answer, using our existing
+#      RBAC-scoped tools/graph — never our own /ws/chat.
+# Neither of these can add latency to /api/query; they're entirely separate
+# request paths.
+# ────────────────────────────────────────────────────────────────────────────────
+@app.post("/api/voice/signed-url")
+async def voice_signed_url(user_id: int = Depends(get_current_user)):
+    """JWT-gated: only an already-authenticated app user can start a voice
+    session. Returns an ElevenLabs signed URL plus a short-lived internal
+    token the client must echo back via ElevenLabs' dynamic_variables —
+    that token is how /v1/chat/completions later learns which user (for
+    RBAC) is actually on the call, since ElevenLabs' Custom LLM auth is a
+    single static shared secret, not per-user."""
+    try:
+        signed_url = await get_elevenlabs_signed_url(
+            agent_id=cfg.ELEVENLABS_AGENT_ID,
+            api_key=cfg.ELEVENLABS_API_KEY,
+        )
+    except VoiceBridgeError as e:
+        return JSONResponse({"error": e.message}, status_code=e.status_code)
+
+    voice_token = mint_voice_session_token(
+        user_id=user_id,
+        secret=cfg.JWT_SECRET,
+        expires_in_seconds=VOICE_SESSION_TOKEN_TTL_SECONDS,
+    )
+    return JSONResponse({
+        "signed_url": signed_url,
+        "dynamic_variables": {"voice_session_token": voice_token},
+    })
+
+
+@app.post("/v1/chat/completions")
+async def voice_custom_llm(request: Request):
+    """ElevenLabs' agent calls this (server-to-server) as its 'Custom LLM' —
+    OpenAI-compatible request/response shape. Auth is two-layered:
+    the static shared secret proves the caller really is our ElevenLabs
+    agent; the voice_session_token embedded in the system message (via the
+    agent's own {{voice_session_token}} prompt variable) tells us which of
+    our users is actually speaking, for RBAC-scoped tool access."""
+    auth_header = request.headers.get("authorization", "")
+    if not cfg.ELEVENLABS_CUSTOMLLM_SHARED_SECRET or auth_header != f"Bearer {cfg.ELEVENLABS_CUSTOMLLM_SHARED_SECRET}":
+        raise HTTPException(status_code=401, detail="Invalid or missing shared secret")
+
+    body = await request.json()
+    messages = body.get("messages") or []
+    system_content = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
+
+    match = re.search(r"voice_session_token=(\S+)", system_content)
+    voice_user_id = verify_voice_session_token(match.group(1), cfg.JWT_SECRET) if match else None
+    if voice_user_id is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid voice session token")
+
+    convo = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+    if not convo or convo[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="No user utterance to respond to")
+    query = convo[-1]["content"]
+
+    with pg_conn() as conn:
+        user_profile = fetch_user_profile(conn, voice_user_id)
+        user_name = (
+            user_profile.get("full_name_en") or user_profile.get("full_name_ar") or "Unknown User"
+        )
+        user_role = user_profile.get("designation") or ""
+        user_email = user_profile.get("email") or ""
+        user_contact_no = user_profile.get("contact_no") or ""
+        available_tools = build_available_tools(conn, voice_user_id)
+
+    model_name = body.get("model") or "ehcd-chatbot"
+
+    async def sse():
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def _run():
+            try:
+                for piece in run_chatbot_graph(
+                    query=query,
+                    conversation_history=convo,
+                    available_tools=available_tools,
+                    user_id=voice_user_id,
+                    user_name=user_name,
+                    user_role=user_role,
+                    user_email=user_email,
+                    user_contact_no=user_contact_no,
+                    client=client,
+                    model=cfg.AZURE_OPENAI_DEPLOYMENT,
+                    pg_conn_fn=pg_conn,
+                    policy_cfg=POLICY_CFG,
+                    emb=emb,
+                    redis_client=redis_client,
+                    voice_mode=True,
+                ):
+                    loop.call_soon_threadsafe(q.put_nowait, piece)
+            except Exception as e:
+                logger.error(f"Voice bridge graph error: {e}")
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, None)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        while True:
+            piece = await q.get()
+            if piece is None:
+                break
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        final_payload = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -562,6 +727,7 @@ async def websocket_chat(ws: WebSocket):
                         pg_conn_fn=pg_conn,
                         policy_cfg=POLICY_CFG,
                         emb=emb,
+                        redis_client=redis_client,
                         tool_results_collector=tool_results_for_chart,
                     ):
                         loop.call_soon_threadsafe(async_q.put_nowait, ("chunk", chunk))
