@@ -1,0 +1,43 @@
+# env-stag — STAGING configuration for ehcd-chatbot.
+# Mirrors the be-hn-ehdc convention: Dockerfile does `cp env-${APP_ENV} .env`.
+#
+# app.py:15 calls load_dotenv() with the default override=False, so real environment
+# variables WIN over this file. The `ehcd-chatbot-secrets` k8s Secret is the runtime
+# source of truth; this file is the committed fallback and key-list record.
+#
+# PLACEHOLDERS ONLY — no staging environment exists yet. Fill when staging is built.
+# Present so that `--build-arg APP_ENV=stag` does not fail on a missing file.
+# Target state is Key Vault + CSI driver (checklist P10).
+
+# --- postgres — RBAC lookups against the ehcd-backend database ---
+PG_HOST=<fill>
+PG_DB=<fill>
+PG_USER=<fill>
+PG_PASS=<fill>
+PG_PORT=<fill>
+RBAC_USER_ROLES_TABLE=<fill>
+DB_SCHEMA=<fill>
+
+# --- azure openai ---
+ENDPOINT_URL=<fill>
+DEPLOYMENT_NAME=<fill>
+AZURE_OPENAI_API_KEY=<fill>
+AZURE_OPENAI_API_VERSION=<fill>
+AZURE_EMBEDDING_DEPLOYMENT=<fill>
+
+# --- azure blob — education xlsx + policy pdfs (policy prefix is hardcoded "policies/") ---
+AZURE_BLOB_CONN_STR=<fill>
+AZURE_BLOB_CONTAINER=<fill>
+AZURE_BLOB_PREFIX=<fill>
+
+# --- jwt — issued by ehcd-backend, verified here. MUST match the backend byte for byte ---
+JWT_SECRET=<fill>
+JWT_EXPIRY_HOURS=<fill>
+USER_ID_CLAIM=<fill>
+
+# --- redis — in-cluster service (infra_yamls/redis.yaml) ---
+REDIS_HOST=<fill>
+REDIS_PORT=<fill>
+
+# --- storage ---
+DATA_ROOT=<fill>
