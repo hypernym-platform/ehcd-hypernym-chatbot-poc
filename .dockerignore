@@ -1,1 +1,39 @@
-venv
+# Build context excludes. The Dockerfile does `COPY . .`, so anything left here
+# lands in an image layer and is pushed to the registry — keep secrets out.
+
+# secrets — MUST stay excluded (env is injected by the k8s Secret at runtime)
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.pfx
+
+# vcs / editors
+.git/
+.gitignore
+.idea/
+.vscode/
+.claude/
+
+# python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# local runtime state — rebuilt in-container, synced from Azure Blob
+data/faiss/
+data/hashes/
+data/docs/
+data/*.db
+documents.db
+sessions.db
+
+# ACR Tasks writes a temp <hash>_Dockerfile into the uploaded context
+*_Dockerfile
+
+# not needed at runtime
+docker-compose.yml
+*.html
+README.md
