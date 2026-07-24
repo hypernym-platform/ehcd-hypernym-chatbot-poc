@@ -1,4 +1,4 @@
-import os, json, hashlib, shutil, tempfile, logging
+import os, json, hashlib, shutil, tempfile, logging, threading
 from typing import List, Any, Dict, Optional
 from dataclasses import dataclass
 from langchain_core.documents import Document
@@ -7,6 +7,31 @@ from langchain_community.document_loaders import PyPDFLoader
 from emb_pace import PacedEmbeddings
 
 logger = logging.getLogger(__name__)
+
+# In-process cache of the loaded FAISS index, keyed by faiss_dir. Avoids
+# re-reading + re-deserializing the index from disk on every single
+# search_policy call (previously happened on every policy-tool invocation).
+# Invalidated automatically when the on-disk index file's mtime changes
+# (i.e. after update_policy_index_if_changed rebuilds it).
+_faiss_cache: Dict[str, tuple] = {}
+_faiss_cache_lock = threading.Lock()
+
+
+def _load_faiss_cached(faiss_dir: str, emb: PacedEmbeddings):
+    index_file = os.path.join(faiss_dir, "index.faiss")
+    if not os.path.exists(index_file):
+        return None
+    mtime = os.path.getmtime(index_file)
+    cached = _faiss_cache.get(faiss_dir)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    with _faiss_cache_lock:
+        cached = _faiss_cache.get(faiss_dir)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        vs = FAISS.load_local(faiss_dir, emb, allow_dangerous_deserialization=True)
+        _faiss_cache[faiss_dir] = (mtime, vs)
+        return vs
 
 @dataclass(frozen=True)
 class PolicyConfig:
@@ -84,7 +109,9 @@ def search_policy(cfg: PolicyConfig, emb: PacedEmbeddings, query: str, k: int = 
     if not os.path.exists(cfg.faiss_dir):
         return []
     try:
-        vs = FAISS.load_local(cfg.faiss_dir, emb, allow_dangerous_deserialization=True)
+        vs = _load_faiss_cached(cfg.faiss_dir, emb)
+        if vs is None:
+            return []
         if query_embedding is not None and hasattr(vs, "similarity_search_by_vector"):
             return vs.similarity_search_by_vector(query_embedding, k=k)
         return vs.similarity_search(query, k=k)
