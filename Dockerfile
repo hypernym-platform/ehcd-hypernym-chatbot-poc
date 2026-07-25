@@ -1,6 +1,4 @@
-# App layer only — dependencies live in the base image built from Dockerfile.base
-# (python:3.12-slim + curl + pip install). deploy-dev.sh passes BASE pinned to a
-# hash of requirements.txt, so a code-only change rebuilds just the COPY below.
+
 ARG BASE=acrehcddev.azurecr.io/ehcd-chatbot-base:latest
 FROM ${BASE}
 
