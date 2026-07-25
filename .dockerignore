@@ -1,5 +1,14 @@
 # Build context excludes. The Dockerfile does `COPY . .`, so anything left here
 # lands in an image layer and is pushed to the registry — keep secrets out.
+#
+# ⚠ WRITE DIRECTORY PATTERNS WITHOUT A TRAILING SLASH (`venv`, not `venv/`).
+# azure-cli's tar packer (acr/_archive_utils.py, class IgnoreRule) only strips a
+# trailing slash for `!` negation rules, so `venv/` compiles to the regex
+# `^venv/$` and matches neither the directory entry nor its children — az then
+# uploads the whole thing. That was silently sending ~471 MB of venv per build.
+# Docker itself treats `venv` and `venv/` alike, so the slashless form is correct
+# for both. (`.git` and `.venv` escaped the bug only because _archive_utils
+# hardcodes them.)
 
 # secrets — MUST stay excluded (env is injected by the k8s Secret at runtime)
 .env
@@ -10,22 +19,22 @@
 *.pfx
 
 # vcs / editors
-.git/
+.git
 .gitignore
-.idea/
-.vscode/
-.claude/
+.idea
+.vscode
+.claude
 
 # python
-venv/
-.venv/
-__pycache__/
+venv
+.venv
+__pycache__
 *.py[cod]
 
 # local runtime state — rebuilt in-container, synced from Azure Blob
-data/faiss/
-data/hashes/
-data/docs/
+data/faiss
+data/hashes
+data/docs
 data/*.db
 documents.db
 sessions.db
@@ -33,7 +42,9 @@ sessions.db
 # ACR Tasks writes a temp <hash>_Dockerfile into the uploaded context
 *_Dockerfile
 
-# not needed at runtime
+# not needed at runtime. NOTE `*.html` only matches root level (both docker and
+# az compile it to a non-slash-crossing pattern), so templates/*.html — which
+# app.py serves via Jinja2 — still ships. Do not "fix" this to **/*.html.
 docker-compose.yml
 *.html
 README.md

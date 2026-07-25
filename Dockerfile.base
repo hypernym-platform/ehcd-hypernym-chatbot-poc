@@ -1,0 +1,19 @@
+# Dependency layer for ehcd-chatbot. Rebuilt ONLY when requirements.txt changes:
+# deploy-dev.sh tags this image with a hash of that file and reuses the tag when
+# it already exists in ACR. Keeps a code-only deploy at the COPY in ./Dockerfile.
+#
+# Base is mirrored into ACR (`az acr import docker.io/library/python:3.12-slim`)
+# so the build agent pulls same-region and never hits Docker Hub rate limits.
+FROM acrehcddev.azurecr.io/base/python:3.12-slim
+
+# curl is only used by the docker-compose healthcheck (k8s probes are HTTP), but
+# it is cheap and removing it would break local compose runs.
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# No compilers needed: faiss-cpu, tiktoken, pandas, psycopg2-binary and the
+# langchain stack all ship manylinux wheels. A future dep without one fails
+# loudly right here with "gcc: not found" — add the compiler to THIS file.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
