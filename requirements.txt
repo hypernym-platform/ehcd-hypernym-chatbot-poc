@@ -1,3 +1,4 @@
+#dependensies
 fastapi
 uvicorn[standard]
 python-dotenv
