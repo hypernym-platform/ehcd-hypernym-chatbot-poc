@@ -73,7 +73,14 @@ SECRETS="${EHCD_CHATBOT_SECRETS:-$HOME/.config/ehcd/chatbot-dev.secrets.env}"
 if [ -f "$SECRETS" ]; then
   echo "rendering k8s Secret from env-dev.tmpl + $SECRETS"
   RENDERED=$(mktemp); trap 'rm -f "$RENDERED"' EXIT
-  ( set -a; . "$SECRETS"; set +a
+  # NOT `source`: an Azure connection string contains `;`, which bash reads as a
+  # command separator and silently truncates the value at. Parse literally instead.
+  ( while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      key=${line%%=*}
+      case "$key" in *[!A-Za-z0-9_]*|'') continue ;; esac
+      printf -v "$key" '%s' "${line#*=}"; export "$key"
+    done < "$SECRETS"
     envsubst '${PG_PASS} ${AZURE_OPENAI_API_KEY} ${AZURE_BLOB_CONN_STR} ${JWT_SECRET} ${ELEVENLABS_API_KEY} ${ELEVENLABS_AGENT_ID} ${ELEVENLABS_CUSTOMLLM_SHARED_SECRET}' \
       < env-dev.tmpl | grep -vE '^[[:space:]]*(#|$)' > "$RENDERED" )
   az aks command invoke -g "$RG" -n "$CLUSTER" -o tsv --file "$RENDERED" \
