@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . .
 
 ARG APP_ENV=dev
-RUN cp env-${APP_ENV} .env
+#RUN cp env-${APP_ENV} .env
 
 EXPOSE 8080
 
