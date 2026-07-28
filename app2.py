@@ -11,7 +11,7 @@ import tiktoken
 
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
