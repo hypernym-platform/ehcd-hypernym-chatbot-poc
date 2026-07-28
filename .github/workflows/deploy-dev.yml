@@ -1,27 +1,25 @@
 # Auto-build + deploy to the EHCD dev AKS cluster on every push to `development`.
-# No SSH, no docker, no secrets in git — auth is passwordless OIDC (federated identity).
+# No SSH, no docker, no secrets — auth is passwordless OIDC (federated identity).
 # ACR builds the image server-side; the dev Deployment is restarted to pull the new
 # :dev-v1.0 tag (imagePullPolicy: Always). Chatbot is strategy: Recreate → brief blip.
-#
-# Runtime env vars/secrets come from the GitHub "development" Environment and are
-# rendered into a Kubernetes Secret (ehcd-chatbot-env) that the Deployment consumes
-# via envFrom.secretRef. Secrets/vars are scoped per environment, so staging/production
-# values are never resolvable from a push to `development`.
 name: deploy-dev
+
 on:
   push:
     branches: [development]
   workflow_dispatch: {}
+
 permissions:
   id-token: write
   contents: read
+
 concurrency:
   group: deploy-dev
   cancel-in-progress: true
+
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
-    environment: development
     steps:
       - uses: actions/checkout@v4
 
@@ -55,46 +53,7 @@ jobs:
             --build-arg APP_ENV=dev \
             --platform linux/amd64 .
 
-      # Renders the development environment's secrets/vars into a Kubernetes Secret
-      # manifest. Values come from the GitHub "development" Environment, so this step
-      # only ever sees dev values on a push to the development branch.
-      # NOTE: add every runtime secret/var your app needs here.
-      - name: Render env secret manifest
+      - name: Redeploy on dev AKS
         run: |
-          cat <<EOF > env-secret.yaml
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: ehcd-chatbot-env
-            namespace: ${{ vars.AKS_NAMESPACE }}
-          type: Opaque
-          stringData:
-            AZURE_BLOB_CONN_STR: "${{ secrets.AZURE_BLOB_CONN_STR }}"
-            AZURE_BLOB_CONTAINER: "${{ secrets.AZURE_BLOB_CONTAINER }}"
-            AZURE_BLOB_PREFIX: "${{ secrets.AZURE_BLOB_PREFIX }}"
-            AZURE_EMBEDDING_DEPLOYMENT: "${{ secrets.AZURE_EMBEDDING_DEPLOYMENT }}"
-            AZURE_OPENAI_API_KEY: "${{ secrets.AZURE_OPENAI_API_KEY }}"
-            AZURE_OPENAI_API_VERSION: "${{ secrets.AZURE_OPENAI_API_VERSION }}"
-            DATA_ROOT: "${{ secrets.DATA_ROOT }}"
-            DEPLOYMENT_NAME: "${{ secrets.DEPLOYMENT_NAME }}"
-            ELEVENLABS: "${{ secrets.ELEVENLABS }}"
-            ELEVENLABS_AGENT_ID: "${{ secrets.ELEVENLABS_AGENT_ID }}"
-            ELEVENLABS_CUSTOMLLM_SHARED_SECRET: "${{ secrets.ELEVENLABS_CUSTOMLLM_SHARED_SECRET }}"
-            ENDPOINT_URL: "${{ secrets.ENDPOINT_URL }}"
-            JWT_SECRET: "${{ secrets.JWT_SECRET }}"
-            PG_DB: "${{ secrets.PG_DB }}"
-            PG_HOST: "${{ secrets.PG_HOST }}"
-            PG_PASS: "${{ secrets.PG_PASS }}"
-            PG_PORT: "${{ secrets.PG_PORT }}"
-            PG_USER: "${{ secrets.PG_USER }}"
-            REDIS_HOST: "${{ secrets.REDIS_HOST }}"
-            REDIS_PORT: "${{ secrets.REDIS_PORT }}"
-          EOF
-
-      - name: Apply secret + redeploy on dev AKS
-        run: |
-          az aks command invoke -g ${{ vars.RESOURCE_GROUP }} -n ${{ vars.AKS_CLUSTER }} \
-            --command "kubectl apply -f env-secret.yaml -n ${{ vars.AKS_NAMESPACE }} && \
-                       kubectl -n ${{ vars.AKS_NAMESPACE }} rollout restart deploy/ehcd-chatbot && \
-                       kubectl -n ${{ vars.AKS_NAMESPACE }} rollout status deploy/ehcd-chatbot --timeout=300s" \
-            --file env-secret.yaml
+          az aks command invoke -g rg-ehcd-dev -n aks-ehcd-dev \
+            --command "kubectl -n dev rollout restart deploy/ehcd-chatbot && kubectl -n dev rollout status deploy/ehcd-chatbot --timeout=300s"
