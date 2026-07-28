@@ -60,10 +60,27 @@ else
   az acr build -r "$ACR" -t "$BASE_REPO:$BASE_TAG" -f Dockerfile.base --platform linux/amd64 .
 fi
 
-# APP_ENV=dev makes the Dockerfile do `cp env-dev .env`; env-dev holds <fill>
-# placeholders, so the k8s Secret ehcd-chatbot-secrets supplies the real values.
+# The image bakes no env file — all config comes from the k8s Secret
+# ehcd-chatbot-secrets, so the same image is environment-agnostic.
 az acr build -r "$ACR" -t "$IMAGE" \
-  --build-arg BASE="$BASE_IMAGE" --build-arg APP_ENV=dev --platform linux/amd64 .
+  --build-arg BASE="$BASE_IMAGE" --platform linux/amd64 .
+
+# Optional local equivalent of CI's "Render env file" step: if you keep the dev
+# secret values in a local file (chmod 600, OUTSIDE the repo), this re-renders
+# env-dev.tmpl and re-applies the Secret. Without the file the existing Secret is
+# left untouched — CI is the normal way to change it.
+SECRETS="${EHCD_CHATBOT_SECRETS:-$HOME/.config/ehcd/chatbot-dev.secrets.env}"
+if [ -f "$SECRETS" ]; then
+  echo "rendering k8s Secret from env-dev.tmpl + $SECRETS"
+  RENDERED=$(mktemp); trap 'rm -f "$RENDERED"' EXIT
+  ( set -a; . "$SECRETS"; set +a
+    envsubst '${PG_PASS} ${AZURE_OPENAI_API_KEY} ${AZURE_BLOB_CONN_STR} ${JWT_SECRET} ${ELEVENLABS_API_KEY} ${ELEVENLABS_AGENT_ID} ${ELEVENLABS_CUSTOMLLM_SHARED_SECRET}' \
+      < env-dev.tmpl | grep -vE '^[[:space:]]*(#|$)' > "$RENDERED" )
+  az aks command invoke -g "$RG" -n "$CLUSTER" -o tsv --file "$RENDERED" \
+    --command "kubectl -n $NS create secret generic ehcd-chatbot-secrets --from-env-file=$(basename "$RENDERED") --dry-run=client -o yaml | kubectl apply -f -"
+else
+  echo "no secrets file at $SECRETS -> leaving Secret ehcd-chatbot-secrets as-is"
+fi
 
 # Tag is fixed and mutable, so the rollout is what picks up the new image
 # (imagePullPolicy: Always in the Deployment).

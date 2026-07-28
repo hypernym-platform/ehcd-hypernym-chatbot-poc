@@ -18,6 +18,12 @@
 *.crt
 *.pfx
 
+# config templates are a CI input, not a runtime file — the Dockerfile no longer
+# copies an env file into the image (see env-dev.tmpl).
+env-dev.tmpl
+env-stag
+env.rendered
+
 # vcs / editors
 .git
 .gitignore

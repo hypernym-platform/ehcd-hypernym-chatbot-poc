@@ -7,8 +7,10 @@ WORKDIR /app
 
 COPY . .
 
-ARG APP_ENV=dev
-RUN cp env-${APP_ENV} .env
+# No env file is baked in — config comes from the k8s Secret ehcd-chatbot-secrets,
+# which CI renders from env-dev.tmpl + the repo's GitHub Environment. Keeps the
+# image environment-agnostic and keeps credentials out of registry layers.
+# (`load_dotenv()` in app.py is override=False, so a missing .env is a no-op.)
 
 EXPOSE 8080
 

@@ -1,7 +1,16 @@
 # Auto-build + deploy to the EHCD dev AKS cluster on every push to `development`.
-# No SSH, no docker, no secrets — auth is passwordless OIDC (federated identity).
-# ACR builds the image server-side; the dev Deployment is restarted to pull the new
-# :dev-v1.0 tag (imagePullPolicy: Always). Chatbot is strategy: Recreate → brief blip.
+# No SSH, no docker, no stored credentials — auth is passwordless OIDC (federated
+# identity). ACR builds the image server-side; the k8s Secret is re-rendered from
+# env-dev.tmpl + this repo's GitHub Environment `dev`; the Deployment is then
+# restarted, which both picks up the new :dev-v1.0 image (imagePullPolicy: Always)
+# and re-reads the Secret (envFrom does NOT hot-reload).
+# Chatbot is strategy: Recreate → brief blip.
+#
+# ⚠ `environment: dev` below CHANGES THE OIDC SUBJECT to
+#     repo:<org>/<repo>:environment:dev
+# instead of repo:<org>/<repo>:ref:refs/heads/development. The managed identity
+# id-gh-ehcd-dev-deploy needs a federated credential for that exact subject or
+# azure/login fails with AADSTS70021 — see hn_devops scripts/setup-github-oidc.sh.
 name: deploy-dev
 
 on:
@@ -20,6 +29,7 @@ concurrency:
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
+    environment: dev          # source of the secrets/vars used by "Render env file"
     steps:
       - uses: actions/checkout@v4
 
@@ -45,15 +55,53 @@ jobs:
               -f Dockerfile.base --platform linux/amd64 .
           fi
 
+      # No --build-arg APP_ENV: the image no longer bakes an env file.
       - name: Build image in ACR
         run: |
           az acr build -r acrehcddev \
             -t ehcd-chatbot:dev-v1.0 \
             --build-arg BASE=acrehcddev.azurecr.io/ehcd-chatbot-base:${{ steps.base.outputs.tag }} \
-            --build-arg APP_ENV=dev \
             --platform linux/amd64 .
+
+      # Fills the ${...} placeholders in env-dev.tmpl from the `dev` Environment.
+      # envsubst gets an explicit variable list so nothing else in the file can be
+      # expanded by accident. Comments and blank lines are stripped because
+      # `kubectl --from-env-file` wants bare KEY=VALUE lines. Only key NAMES are
+      # printed — values are never echoed.
+      - name: Render env file from GitHub Environment
+        env:
+          PG_PASS:                            ${{ secrets.PG_PASS }}
+          AZURE_OPENAI_API_KEY:               ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_BLOB_CONN_STR:                ${{ secrets.AZURE_BLOB_CONN_STR }}
+          JWT_SECRET:                         ${{ secrets.JWT_SECRET }}
+          ELEVENLABS_API_KEY:                 ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_CUSTOMLLM_SHARED_SECRET: ${{ secrets.ELEVENLABS_CUSTOMLLM_SHARED_SECRET }}
+          ELEVENLABS_AGENT_ID:                ${{ vars.ELEVENLABS_AGENT_ID }}
+        run: |
+          set -euo pipefail
+          # Required = the app cannot work without them. ELEVENLABS_* are optional:
+          # unset renders empty, which just leaves the voice endpoints disabled.
+          for v in PG_PASS AZURE_OPENAI_API_KEY AZURE_BLOB_CONN_STR JWT_SECRET; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is not set in the 'dev' GitHub Environment"
+              exit 1
+            fi
+          done
+          envsubst '${PG_PASS} ${AZURE_OPENAI_API_KEY} ${AZURE_BLOB_CONN_STR} ${JWT_SECRET} ${ELEVENLABS_API_KEY} ${ELEVENLABS_AGENT_ID} ${ELEVENLABS_CUSTOMLLM_SHARED_SECRET}' \
+            < env-dev.tmpl | grep -vE '^[[:space:]]*(#|$)' > env.rendered
+          echo "rendered keys:"
+          cut -d= -f1 env.rendered
+
+      # --file uploads into the run pod's working directory, so the command
+      # references the bare filename. The Secret manifest only ever exists inside
+      # the in-cluster pipe; the command output is just "secret/... configured".
+      - name: Sync k8s Secret ehcd-chatbot-secrets
+        run: |
+          az aks command invoke -g rg-ehcd-dev -n aks-ehcd-dev -o tsv \
+            --file env.rendered \
+            --command "kubectl -n dev create secret generic ehcd-chatbot-secrets --from-env-file=env.rendered --dry-run=client -o yaml | kubectl apply -f -"
 
       - name: Redeploy on dev AKS
         run: |
-          az aks command invoke -g rg-ehcd-dev -n aks-ehcd-dev \
+          az aks command invoke -g rg-ehcd-dev -n aks-ehcd-dev -o tsv \
             --command "kubectl -n dev rollout restart deploy/ehcd-chatbot && kubectl -n dev rollout status deploy/ehcd-chatbot --timeout=300s"
