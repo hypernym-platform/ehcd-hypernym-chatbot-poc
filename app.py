@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 from openai import AzureOpenAI
 
@@ -72,6 +73,19 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="EHCD Hypernym Chatbot")
 app.add_middleware(SessionMiddleware, secret_key="fs78sf7s8d6v7sdy7sdbds7v")
+# Allows the frontend (a different origin: different domain/port) to call this
+# API from the browser at all. Without this, the browser's automatic CORS
+# preflight (an OPTIONS request) gets no answer and blocks every real request
+# before it's even sent — auth headers never even come into play.
+# TODO: narrow allow_origins to the real frontend domain(s) before production;
+# "*" is fine for now since auth is a Bearer header, not cookies (no credentials
+# implicated), but should be tightened once the frontend's real origin is known.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Static files & templates
 app.mount("/static", StaticFiles(directory="static"), name="static")
