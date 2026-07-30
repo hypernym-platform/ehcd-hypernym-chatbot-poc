@@ -23,7 +23,6 @@ from typing import Optional
 import httpx
 import jwt
 
-
 logger = logging.getLogger(__name__)
 
 ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1"
