@@ -712,7 +712,9 @@ def router_node(state: ChatState) -> dict:
             api_kwargs["tools"] = available_tools
             api_kwargs["tool_choice"] = "auto"
 
+        _t0 = time.time()
         response = client.chat.completions.create(**api_kwargs)
+        logger.info(f"[TIMING] router_node LLM call: {time.time() - _t0:.2f}s")
     except Exception as e:
         logger.error(f"OpenAI API error in router: {e}")
         chunk_queue = state["chunk_queue"]
@@ -767,6 +769,7 @@ def tool_executor_node(state: ChatState) -> dict:
 
         logger.info(f"Tool call: {fn_name}({fn_args})")
 
+        _t0 = time.time()
         # Each tool gets its own connection from the pool
         with pg_conn_fn() as conn:
             result_str = execute_tool(
@@ -777,11 +780,14 @@ def tool_executor_node(state: ChatState) -> dict:
                 policy_cfg=policy_cfg,
                 emb=emb_obj,
             )
+        logger.info(f"[TIMING] tool {fn_name}: {time.time() - _t0:.2f}s")
         return tool_call, result_str
 
     # Execute all tools in parallel
+    _t0 = time.time()
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
         results = list(pool.map(_run_one_tool, tool_calls))
+    logger.info(f"[TIMING] tool_executor_node total (parallel, {len(tool_calls)} tools): {time.time() - _t0:.2f}s")
 
     # Append tool results to messages and collect for chart detection
     for tool_call, result_str in results:
@@ -875,6 +881,8 @@ def answer_node(state: ChatState) -> dict:
     )
 
     full_text = ""
+    _t0 = time.time()
+    _first_chunk_at = None
     try:
         response = client.chat.completions.create(
             model=model,
@@ -887,6 +895,9 @@ def answer_node(state: ChatState) -> dict:
         )
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
+                if _first_chunk_at is None:
+                    _first_chunk_at = time.time()
+                    logger.info(f"[TIMING] answer_node time-to-first-token: {_first_chunk_at - _t0:.2f}s")
                 text = chunk.choices[0].delta.content
                 full_text += text
                 chunk_queue.put(text)
@@ -894,6 +905,7 @@ def answer_node(state: ChatState) -> dict:
         logger.error(f"OpenAI streaming error in answer node: {e}")
         full_text = "I encountered an error processing your request. Please try again."
         chunk_queue.put(full_text)
+    logger.info(f"[TIMING] answer_node total generation: {time.time() - _t0:.2f}s")
 
     chunk_queue.put(None)  # Sentinel: end of stream
 

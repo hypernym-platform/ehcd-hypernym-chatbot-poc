@@ -125,7 +125,7 @@ class CFG:
     # Accepts either ELEVENLABS_API_KEY or the existing ELEVENLABS var.
     # Voice/model selection now lives on the Agent itself in ElevenLabs'
     # dashboard (Voice + TTS model family) — not configured here anymore.
-    ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
+    ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS", "")
     ELEVENLABS_AGENT_ID: str = os.getenv("ELEVENLABS_AGENT_ID", "")
     # Static shared secret configured once in the Agent's Custom LLM "API Key"
     # field (ElevenLabs calls it OPENAI_API_KEY there, but it's just an
@@ -604,6 +604,8 @@ async def voice_custom_llm(request: Request):
         created = int(time.time())
         loop = asyncio.get_event_loop()
         q: asyncio.Queue = asyncio.Queue()
+        turn_started_at = time.time()
+        logger.info(f"[TIMING] voice turn started, query={query!r}")
 
         def _run():
             try:
@@ -632,10 +634,14 @@ async def voice_custom_llm(request: Request):
 
         threading.Thread(target=_run, daemon=True).start()
 
+        first_piece_at = None
         while True:
             piece = await q.get()
             if piece is None:
                 break
+            if first_piece_at is None:
+                first_piece_at = time.time()
+                logger.info(f"[TIMING] voice turn time-to-first-piece: {first_piece_at - turn_started_at:.2f}s")
             payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -644,6 +650,8 @@ async def voice_custom_llm(request: Request):
                 "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
             }
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        logger.info(f"[TIMING] voice turn TOTAL (our backend, excludes ElevenLabs STT/TTS): {time.time() - turn_started_at:.2f}s")
 
         final_payload = {
             "id": chunk_id,
