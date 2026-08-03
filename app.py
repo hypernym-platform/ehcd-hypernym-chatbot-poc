@@ -535,7 +535,10 @@ async def handle_query(
 # request paths.
 # ────────────────────────────────────────────────────────────────────────────────
 @app.post("/api/voice/signed-url")
-async def voice_signed_url(user_id: int = Depends(get_current_user)):
+async def voice_signed_url(
+    conversation_id: str = "default",  # ADDED: needed to check history for this chat
+    user_id: int = Depends(get_current_user),
+):
     """JWT-gated: only an already-authenticated app user can start a voice
     session. Returns an ElevenLabs signed URL plus a short-lived internal
     token the client must echo back via ElevenLabs' dynamic_variables —
@@ -555,9 +558,21 @@ async def voice_signed_url(user_id: int = Depends(get_current_user)):
         secret=cfg.JWT_SECRET,
         expires_in_seconds=VOICE_SESSION_TOKEN_TTL_SECONDS,
     )
+
+    # suppress repeat greeting on continuing chats
+    # Reuses the same Redis-backed conversation history already used by
+    # /api/query and /ws/chat — if this chat already has turns, the
+    # frontend should pass an empty firstMessage override into
+    # Conversation.startSession() so the agent doesn't re-greet on every
+    # new mic click within the same ongoing chat.
+    history_key = f"uid:{user_id}:conv:{conversation_id}"
+    is_continuation = len(get_conversation_history(history_key)) > 0
+    # ═════════════════════════════════════════════════════════════
+
     return JSONResponse({
         "signed_url": signed_url,
         "dynamic_variables": {"voice_session_token": voice_token},
+        "skip_greeting": is_continuation,  # ADDED
     })
 
 
