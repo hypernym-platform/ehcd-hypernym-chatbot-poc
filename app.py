@@ -579,7 +579,7 @@ async def voice_signed_url(
 @app.post("/v1/chat/completions")
 async def voice_custom_llm(request: Request):
     """ElevenLabs' agent calls this (server-to-server) as its 'Custom LLM' —
-    OpenAI-compatible request/response shape. Auth is two-layered:
+    Azure OpenAI-compatible request/response shape. Auth is two-layered:
     the static shared secret proves the caller really is our ElevenLabs
     agent; the voice_session_token embedded in the system message (via the
     agent's own {{voice_session_token}} prompt variable) tells us which of
