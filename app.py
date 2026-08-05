@@ -244,34 +244,91 @@ def save_conversation_history(user_key: str, history: list):
     trimmed = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
     redis_client.set(f"user_{user_key}_history", json.dumps(trimmed), ex=3600)
 
-def _strip_html_incremental(chunk: str, pending_tag: str) -> tuple[str, str]:
+_SVG_OPEN_RE = re.compile(r"<svg[\s>]", re.IGNORECASE)
+_SVG_CLOSE_RE = re.compile(r"</svg\s*>", re.IGNORECASE)
+
+
+def _strip_html_incremental(
+    chunk: str, pending_tag: str, in_svg: bool = False
+) -> tuple[str, str, bool]:
     """
     Strip HTML tags from streamed chunks while preserving partial tags across chunk boundaries.
+
+    Also suppresses entire <svg>...</svg> blocks — including any text nodes inside them
+    (e.g. <text>45%</text> chart labels) — so that a chart the model draws inline never
+    leaks into the plain-text stream before we know whether to discard it. Charts are
+    rendered exclusively via the separately-generated `chart_data` payload.
     """
     if not chunk:
-        return "", pending_tag
+        return "", pending_tag, in_svg
 
     data = f"{pending_tag}{chunk}" if pending_tag else chunk
     out_chars = []
     in_tag = False
     tag_start = -1
+    i = 0
+    n = len(data)
 
-    for idx, ch in enumerate(data):
+    while i < n:
+        ch = data[i]
+
+        if in_svg:
+            # Look for the closing </svg> tag; suppress everything until then.
+            m = _SVG_CLOSE_RE.search(data, i)
+            if m:
+                in_svg = False
+                i = m.end()
+                continue
+            # No closing tag yet in this buffer — hold everything from here
+            # as pending in case </svg> arrives in the next chunk.
+            return "".join(out_chars), data[i:], in_svg
+
         if in_tag:
             if ch == ">":
                 in_tag = False
                 tag_start = -1
+            i += 1
             continue
 
         if ch == "<":
-            in_tag = True
-            tag_start = idx
-            continue
+            # Check whether an <svg ...> opening tag starts here.
+            m = _SVG_OPEN_RE.match(data, i)
+            if m:
+                in_svg = True
+                i += 1  # consume just the '<'; rest handled by in_svg branch
+                continue
+            # Could be the start of "<svg" but chunk cuts off mid-word — hold it
+            # as a pending partial tag rather than misreading it as plain text.
+            if not _could_be_partial_svg_open(data, i) :
+                in_tag = True
+                tag_start = i
+                i += 1
+                continue
+            return "".join(out_chars), data[i:], in_svg
 
         out_chars.append(ch)
+        i += 1
 
     next_pending_tag = data[tag_start:] if in_tag and tag_start != -1 else ""
-    return "".join(out_chars), next_pending_tag
+    return "".join(out_chars), next_pending_tag, in_svg
+
+
+def _could_be_partial_svg_open(data: str, idx: int) -> bool:
+    """True if data[idx:] is a prefix of '<svg' that got cut off at a chunk boundary."""
+    remainder = data[idx:]
+    return len(remainder) < 4 and "<svg"[: len(remainder)] == remainder
+
+
+def _strip_svg_blocks(html: str) -> str:
+    """
+    Defense-in-depth: remove any <svg>...</svg> block from the final assembled
+    response whenever we're about to attach system-generated chart_data. This
+    guarantees the user never sees a duplicate/competing chart even if the
+    model ignored the system prompt instructions.
+    """
+    if not html or "<svg" not in html.lower():
+        return html
+    return re.sub(r"<svg\b.*?</svg\s*>", "", html, flags=re.IGNORECASE | re.DOTALL)
 
 
 
@@ -417,6 +474,7 @@ async def handle_query(
         assistant_response = ""
         tool_results_for_chart = []
         pending_tag = ""
+        in_svg = False
 
         try:
             for chunk in run_chatbot_graph(
@@ -436,7 +494,9 @@ async def handle_query(
                 tool_results_collector=tool_results_for_chart,
             ):
                 assistant_response += chunk
-                plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
+                plain_text_chunk, pending_tag, in_svg = _strip_html_incremental(
+                    chunk, pending_tag, in_svg
+                )
                 if plain_text_chunk:
                     yield plain_text_chunk
 
@@ -467,8 +527,12 @@ async def handle_query(
         # Send the final <replace> payload
         if assistant_response:
             if chart_data:
+                # Safety net: if the model drew its own SVG chart despite the
+                # system prompt, strip it so the frontend only renders the
+                # single system-generated chart_data visualization.
+                clean_html = _strip_svg_blocks(assistant_response)
                 final_payload = json.dumps(
-                    {"html": assistant_response, "chart_data": chart_data},
+                    {"html": clean_html, "chart_data": chart_data},
                     ensure_ascii=False,
                     default=str,
                 )
@@ -542,6 +606,7 @@ async def websocket_chat(ws: WebSocket):
             assistant_response = ""
             tool_results_for_chart = []
             pending_tag = ""
+            in_svg = False
             async_q = asyncio.Queue()
             loop = asyncio.get_event_loop()
 
@@ -584,7 +649,9 @@ async def websocket_chat(ws: WebSocket):
                     break
                 elif msg_type == "chunk":
                     assistant_response += msg_data
-                    plain, pending_tag = _strip_html_incremental(msg_data, pending_tag)
+                    plain, pending_tag, in_svg = _strip_html_incremental(
+                        msg_data, pending_tag, in_svg
+                    )
                     if plain:
                         await ws.send_json({"type": "chunk", "content": plain})
 
@@ -603,10 +670,17 @@ async def websocket_chat(ws: WebSocket):
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
 
+            # Safety net: if the model drew its own SVG chart despite the
+            # system prompt, strip it so the client only renders the single
+            # system-generated chart_data visualization.
+            final_html = (
+                _strip_svg_blocks(assistant_response) if chart_data else assistant_response
+            )
+
             # Send final result
             await ws.send_json({
                 "type": "done",
-                "html": assistant_response,
+                "html": final_html,
                 "chart_data": json.loads(
                     json.dumps(chart_data, default=str, ensure_ascii=False)
                 ) if chart_data else None,
