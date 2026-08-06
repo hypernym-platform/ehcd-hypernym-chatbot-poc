@@ -232,7 +232,7 @@ def pg_conn():
 # ────────────────────────────────────────────────────────────────────────────────
 # CHAT HISTORY (Redis)
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MESSAGES = 40
 
 
 def get_conversation_history(user_key: str) -> list:
