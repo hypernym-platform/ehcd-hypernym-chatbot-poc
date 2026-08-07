@@ -603,7 +603,21 @@ def tool_executor_node(state: ChatState) -> dict:
             if isinstance(parsed, list):
                 tool_results_for_chart.extend(parsed)
             elif isinstance(parsed, dict) and "error" not in parsed:
-                tool_results_for_chart.append(parsed)
+                if (
+                    isinstance(parsed.get("columns"), list)
+                    and isinstance(parsed.get("rows"), list)
+                ):
+                    # SQL-style tabular result (query_education_data) — this is a
+                    # {"columns": [...], "rows": [[...], ...]} wrapper, not one
+                    # record per data row. Expand each row into its own dict so
+                    # the chart extractor sees real columns (year, total_students,
+                    # ...) instead of only the wrapper's own "row_count" field.
+                    cols = parsed["columns"]
+                    for row in parsed["rows"]:
+                        if isinstance(row, (list, tuple)):
+                            tool_results_for_chart.append(dict(zip(cols, row)))
+                else:
+                    tool_results_for_chart.append(parsed)
         except (json.JSONDecodeError, TypeError):
             pass
 
