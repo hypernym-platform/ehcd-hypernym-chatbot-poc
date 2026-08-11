@@ -384,7 +384,7 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]
     allowed_ids = accessible_task_ids(conn, user_id)
 
     query = """
-        SELECT t.id, t.task_id, t.task_name, t.task_name_ar,
+        SELECT t.id, t.id AS task_id, t.task_name, t.task_name_ar,
                t.status_en, t.status_ar, t.date_of_request,
                t.requires_presentation_to_main_council,
                t.presentation_readiness, t.got_presented,
