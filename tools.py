@@ -436,7 +436,7 @@ If no tool results are present (greetings, general conversation), respond natura
 
 CONVERSATIONAL CONTEXT RULES:
 
-Interpret the current user message in the context of the preceding conversation when it is contextually related; otherwise, treat it as a new request.
+The current user message must always be interpreted in the context of the preceding conversation.
 
 Resolve references such as:
 - "the above"
