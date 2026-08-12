@@ -234,15 +234,113 @@ def pg_conn():
 # ────────────────────────────────────────────────────────────────────────────────
 MAX_HISTORY_MESSAGES = 40
 
-
 def get_conversation_history(user_key: str) -> list:
-    h = redis_client.get(f"user_{user_key}_history")
-    return json.loads(h) if h else []
+    redis_key = f"user_{user_key}_history"
+
+    try:
+        h = redis_client.get(redis_key)
+
+        logger.info(
+            "[CHAT_HISTORY][GET] key=%s exists=%s",
+            redis_key,
+            h is not None
+        )
+
+        if not h:
+            logger.info("[CHAT_HISTORY][GET] No history found.")
+            return []
+
+        history = json.loads(h)
+
+        logger.info(
+            "[CHAT_HISTORY][GET] Loaded %d messages",
+            len(history)
+        )
+
+        logger.info(
+            "[CHAT_HISTORY][GET] History=%s",
+            history
+        )
+
+        return history
+
+    except Exception as e:
+        logger.error(
+            "[CHAT_HISTORY][GET] Failed for key=%s: %s",
+            redis_key,
+            e,
+            exc_info=True
+        )
+        return []
 
 
 def save_conversation_history(user_key: str, history: list):
-    trimmed = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
-    redis_client.set(f"user_{user_key}_history", json.dumps(trimmed), ex=3600)
+    redis_key = f"user_{user_key}_history"
+
+    try:
+        trimmed = (
+            history[-MAX_HISTORY_MESSAGES:]
+            if len(history) > MAX_HISTORY_MESSAGES
+            else history
+        )
+
+        redis_client.set(
+            redis_key,
+            json.dumps(trimmed, ensure_ascii=False),
+            ex=3600
+        )
+
+        logger.info(
+            "[CHAT_HISTORY][SAVE] key=%s messages=%d",
+            redis_key,
+            len(trimmed)
+        )
+
+        logger.info(
+            "[CHAT_HISTORY][SAVE] History=%s",
+            trimmed
+        )
+
+    except Exception as e:
+        logger.error(
+            "[CHAT_HISTORY][SAVE] Failed for key=%s: %s",
+            redis_key,
+            e,
+            exc_info=True
+        )
+
+#def get_conversation_history(user_key: str) -> list:
+#    h = redis_client.get(f"user_{user_key}_history")
+#    return json.loads(h) if h else []
+
+
+#def save_conversation_history(user_key: str, history: list):
+#    trimmed = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
+#    redis_client.set(f"user_{user_key}_history", json.dumps(trimmed), ex=3600)
+
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+_WHITESPACE_RE = re.compile(r"[ \t]+")
+
+
+def _strip_html_for_history(text: str) -> str:
+    """
+    Strip HTML markup before persisting an assistant turn to Redis history.
+
+    We store/replay conversation history verbatim into future LLM calls (see
+    run_chatbot_graph), so a raw HTML table (<table><tr><th>...) costs real
+    tokens on every follow-up turn for pure formatting with no extra meaning,
+    and any malformed/dangling tags in a stored response get replayed back to
+    the model as if they were its own prior output. Stripping tags here keeps
+    the actual data (names, numbers, values) available for the model to
+    resolve follow-ups like "put them in bullets" against, without the
+    markup overhead or corruption risk. The original HTML is still streamed
+    to the client unchanged — only what gets persisted/replayed changes.
+    """
+    if not text:
+        return text
+    stripped = _HTML_TAG_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", stripped).strip()
+
 
 def _strip_html_incremental(chunk: str, pending_tag: str) -> tuple[str, str]:
     """
@@ -449,9 +547,9 @@ async def handle_query(
             assistant_response = error_msg
             yield error_msg
 
-        # Save conversation history
+        # Save conversation history (plain-text — see _strip_html_for_history)
         conversation_history.append(
-            {"role": "assistant", "content": assistant_response}
+            {"role": "assistant", "content": _strip_html_for_history(assistant_response)}
         )
         save_conversation_history(history_key, conversation_history)
 
@@ -588,9 +686,9 @@ async def websocket_chat(ws: WebSocket):
                     if plain:
                         await ws.send_json({"type": "chunk", "content": plain})
 
-            # Save history
+            # Save history (plain-text — see _strip_html_for_history)
             conversation_history.append(
-                {"role": "assistant", "content": assistant_response}
+                {"role": "assistant", "content": _strip_html_for_history(assistant_response)}
             )
             save_conversation_history(history_key, conversation_history)
 

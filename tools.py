@@ -415,8 +415,11 @@ Tool selection rules:
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains.
 5. If the question does NOT need any tools (greetings, general knowledge, casual conversation) → respond with a short text answer.
-6. If tool results are already present in the conversation from previous calls and they contain enough data to answer the question, do NOT call more tools — just respond with a short text so the answer node can format the full response.
-7. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
+6. If tool results are already present in the conversation from previous call and they contain enough data to answer the question, do NOT call more tools — just respond with a short text so the answer node can format the full response.
+7. When the current question refers to a previous request using words such as
+"them", "those", "the above", "the list", "it", "same", "previous", or similar,
+use the conversation history to identify what the user is referring to.
+8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 
 User information:
 - Name: {user_name}
@@ -425,8 +428,8 @@ User information:
 - Contact: {user_contact_no}
 Current Date: {today}
 
-Conversation history:
-{history}
+The conversation history (previous user/assistant turns) appears as regular
+messages before the current user message below — read them directly.
 """
 
 ANSWER_SYSTEM_PROMPT = """You are an expert advisor for the Education, Human Development, and Community Development Council (EHCD).
@@ -436,7 +439,7 @@ If no tool results are present (greetings, general conversation), respond natura
 
 CONVERSATIONAL CONTEXT RULES:
 
-The current user message must always be interpreted in the context of the preceding conversation.
+The latest user message may be a follow-up to an earlier request.
 
 Resolve references such as:
 - "the above"
@@ -454,7 +457,7 @@ Resolve references such as:
 - "put them in bullets"
 - "summarize that"
 - "show that differently"
-using conversation history when applicable.
+using the previous user and assistant messages in conversation history when applicable.
 
 If the current message is a follow-up to the previous request,
 resolve its meaning using the conversation history before deciding
@@ -467,7 +470,7 @@ User: "List all tasks"
 Assistant: [task list]
 
 Current:
-"State tasks in bullets"
+"State them in bullets"
 
 Interpretation:
 "Present the tasks from the previous response as bullet points."
@@ -829,9 +832,7 @@ def run_chatbot_graph(
     Run the LangGraph chatbot and yield response chunks.
     Drop-in replacement for the old generate_tool_response().
     """
-    trimmed = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
     today = datetime.now().strftime("%B %d, %Y")
-    history_text = "\n".join(f"{e['role']}: {e['content']}" for e in trimmed)
 
     system_content = ROUTER_SYSTEM_PROMPT.format(
         user_name=user_name,
@@ -839,13 +840,28 @@ def run_chatbot_graph(
         user_email=user_email,
         user_contact_no=user_contact_no,
         today=today,
-        history=history_text,
     )
 
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": query},
+    # Replay real prior turns (not a flattened text summary) so both the
+    # router and the answer node can resolve follow-ups like "put them in
+    # bullets" against the actual previous assistant response. app.py always
+    # appends the current query as the last entry of conversation_history
+    # before calling us, so drop that duplicate here — `query` below covers it.
+    MAX_HISTORY_TURNS_IN_CONTEXT = 10  # ~5 user/assistant exchanges replayed verbatim
+    prior_turns = conversation_history[:-1] if conversation_history else []
+    prior_turns = prior_turns[-MAX_HISTORY_TURNS_IN_CONTEXT:]
+    history_messages = [
+        {"role": e["role"], "content": e["content"]}
+        for e in prior_turns
+        if e.get("role") in ("user", "assistant") and e.get("content")
     ]
+
+    messages = (
+        [{"role": "system", "content": system_content}]
+        + history_messages
+        + [{"role": "user", "content": query}]
+    )
+
 
     chunk_q = queue.Queue()
 
