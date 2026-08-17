@@ -847,7 +847,7 @@ def run_chatbot_graph(
     # bullets" against the actual previous assistant response. app.py always
     # appends the current query as the last entry of conversation_history
     # before calling us, so drop that duplicate here — `query` below covers it.
-    MAX_HISTORY_TURNS_IN_CONTEXT = 10  # ~5 user/assistant exchanges replayed verbatim
+    MAX_HISTORY_TURNS_IN_CONTEXT = 14  # ~7 user/assistant exchanges replayed verbatim
     prior_turns = conversation_history[:-1] if conversation_history else []
     prior_turns = prior_turns[-MAX_HISTORY_TURNS_IN_CONTEXT:]
     history_messages = [

@@ -609,7 +609,7 @@ async def websocket_chat(ws: WebSocket):
                     await ws.send_json({"type": "error", "message": "Token missing user_id"})
                     continue
             except (jwt.ExpiredSignatureError, jwt.InvalidTokenError) as e:
-                await ws.send_json({"type": "error", "message": f"Auth failed: {e}"})
+                await ws.send_json({"type": "error", "status_code": 401, "message": f"Auth failed: {e}"})
                 continue
 
             query = (data.get("query") or "").strip()
