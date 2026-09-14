@@ -2,8 +2,14 @@ import sqlite3
 import os
 
 class Documents:
-    def __init__(self, db_path='documents.db', directory_path='doc-policy'):
-        self.db_path = db_path
+    def __init__(self, db_path=None, directory_path='doc-policy'):
+        # Default under DATA_ROOT (a mounted volume) rather than the image, which
+        # is read-only in Kubernetes. `directory_path` is read-only and stays put.
+        self.db_path = db_path or os.getenv(
+            "DOCUMENTS_DB_PATH",
+            os.path.join(os.getenv("DATA_ROOT", "./data"), "documents.db"),
+        )
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self.directory_path = directory_path
         self.init_db()  
 

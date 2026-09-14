@@ -179,6 +179,14 @@ POLICY_CFG = PolicyConfig(
 os.makedirs(cfg.DOC_DIR, exist_ok=True)
 os.makedirs(cfg.HASH_DIR, exist_ok=True)
 os.makedirs(cfg.FAISS_DIR, exist_ok=True)
+os.makedirs(cfg.ROOT, exist_ok=True)
+
+# Every path the app writes to at runtime must sit under DATA_ROOT, which is a
+# mounted volume in Kubernetes. Nothing may be written into the image itself:
+# the container runs with readOnlyRootFilesystem.
+SESSIONS_DB_PATH = os.getenv(
+    "SESSIONS_DB_PATH", os.path.join(cfg.ROOT, "sessions.db")
+)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Azure OpenAI clients
@@ -833,7 +841,7 @@ SESSION_LIFETIME = timedelta(hours=1)
 
 
 def init_db():
-    conn = sqlite3.connect("sessions.db")
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
     cur = conn.cursor()
     cur.execute(
         """CREATE TABLE IF NOT EXISTS active_sessions
@@ -844,7 +852,7 @@ def init_db():
 
 
 def add_session(username):
-    conn = sqlite3.connect("sessions.db")
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
     cur = conn.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO active_sessions (username, last_active) VALUES (?, ?)",
@@ -855,7 +863,7 @@ def add_session(username):
 
 
 def remove_session(username):
-    conn = sqlite3.connect("sessions.db")
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM active_sessions WHERE username = ?", (username,))
     conn.commit()
@@ -864,7 +872,7 @@ def remove_session(username):
 
 def cleanup_expired_sessions():
     expiration_time = datetime.now() - SESSION_LIFETIME
-    conn = sqlite3.connect("sessions.db")
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM active_sessions WHERE last_active < ?", (expiration_time,))
     conn.commit()
@@ -873,7 +881,7 @@ def cleanup_expired_sessions():
 
 def count_active_sessions():
     cleanup_expired_sessions()
-    conn = sqlite3.connect("sessions.db")
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM active_sessions")
     c = cur.fetchone()[0]
@@ -883,7 +891,7 @@ def count_active_sessions():
 
 def is_user_logged_in(username):
     cleanup_expired_sessions()
-    conn = sqlite3.connect("sessions.db")
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM active_sessions WHERE username = ?", (username,))
     r = cur.fetchone()
