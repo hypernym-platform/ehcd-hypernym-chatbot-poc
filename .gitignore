@@ -180,3 +180,7 @@ plans/
 
 #Scripts
 add_app_owner.py
+
+# Claude Code local IDE state (machine-specific, not for the shared repo)
+.claude/
+.mcp.json

@@ -154,7 +154,18 @@ def _extract_chart_data(
                 "chart_type": "pie",
             }
 
-    # Case 3: Generic numeric data extraction
+    # Case 3: Homogeneous row dicts (e.g. SQL query results like
+    # {"year": 2022, "total_students": 509738, "total_schools": 776}) —
+    # pivot into a proper grouped-bar chart: one categorical column for the
+    # x-axis, each remaining numeric column becomes its own series. This is
+    # what makes "bar chart of X and Y by year" show real grouped bars
+    # instead of one bar per numeric field with no shared category.
+    row_dict_chart = _extract_row_dicts_chart(tool_results)
+    if row_dict_chart:
+        return row_dict_chart
+
+    # Case 4: Generic numeric data extraction (fallback for anything that
+    # doesn't look like a set of homogeneous rows)
     numeric_items = []
     for item in tool_results:
         name = (
@@ -179,6 +190,60 @@ def _extract_chart_data(
         }
 
     return None
+
+
+def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
+    """
+    Pivot a list of homogeneous row dicts (e.g. query_education_data results,
+    already expanded from {"columns","rows"} into one dict per row) into a
+    grouped bar chart: pick one categorical column for the x-axis labels,
+    and every numeric column becomes its own series.
+
+    Example: [{"year": 2022, "total_students": 509738, "total_schools": 776},
+              {"year": 2023, "total_students": 527759, "total_schools": 757}]
+    -> labels ["2022", "2023"], datasets for "Total Students" and "Total Schools".
+    """
+    rows = [r for r in tool_results if isinstance(r, dict)]
+    if len(rows) < 2:
+        return None
+
+    common_keys = set.intersection(*(set(r.keys()) for r in rows))
+    if not common_keys:
+        return None
+
+    EXCLUDE = {"id", "task_id", "resolution_id"}
+
+    # Prefer a conventionally-named category column for the x-axis.
+    preferred_label_cols = ["year", "label", "name", "category", "region", "period", "sector"]
+    label_col = next((c for c in preferred_label_cols if c in common_keys), None)
+
+    # Otherwise pick the first column that isn't purely numeric across all rows.
+    if label_col is None:
+        for key in sorted(common_keys - EXCLUDE):
+            if any(_to_float(r.get(key)) is None for r in rows):
+                label_col = key
+                break
+
+    numeric_cols = [
+        key for key in sorted(common_keys - EXCLUDE - {label_col})
+        if all(_to_float(r.get(key)) is not None for r in rows)
+    ]
+    if not numeric_cols:
+        return None
+
+    labels = [str(r.get(label_col, f"Row {i + 1}")) for i, r in enumerate(rows)] if label_col else [
+        f"Row {i + 1}" for i in range(len(rows))
+    ]
+
+    datasets = [
+        {
+            "label": col.replace("_", " ").title(),
+            "data": [_to_float(r.get(col)) or 0 for r in rows],
+        }
+        for col in numeric_cols[:6]
+    ]
+
+    return {"labels": labels, "datasets": datasets, "chart_type": "bar"}
 
 
 def _to_float(val) -> Optional[float]:
