@@ -55,6 +55,22 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Filter by category name (partial match)",
                     },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results per page (default 10, max 50). Keep the default unless continuing a previous page.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "How many results to skip (default 0). The result includes "
+                            "total_count/returned_count/offset and a note when more "
+                            "results exist beyond this page — if the user asks for "
+                            "more/the rest, call this tool again with the offset value "
+                            "given in that note (same limit) to get the NEXT page. "
+                            "Never jump straight to a large offset or limit to try to "
+                            "fetch everything at once."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -105,6 +121,22 @@ TOOL_DEFINITIONS = [
                     "category_id": {
                         "type": "integer",
                         "description": "Filter by category ID",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results per page (default 10, max 50). Keep the default unless continuing a previous page.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "How many results to skip (default 0). The result includes "
+                            "total_count/returned_count/offset and a note when more "
+                            "results exist beyond this page — if the user asks for "
+                            "more/the rest, call this tool again with the offset value "
+                            "given in that note (same limit) to get the NEXT page. "
+                            "Never jump straight to a large offset or limit to try to "
+                            "fetch everything at once."
+                        ),
                     },
                 },
                 "required": [],
@@ -161,6 +193,22 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Filter tasks requiring main council presentation",
                     },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results per page (default 10, max 50). Keep the default unless continuing a previous page.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "How many results to skip (default 0). The result includes "
+                            "total_count/returned_count/offset and a note when more "
+                            "results exist beyond this page — if the user asks for "
+                            "more/the rest, call this tool again with the offset value "
+                            "given in that note (same limit) to get the NEXT page. "
+                            "Never jump straight to a large offset or limit to try to "
+                            "fetch everything at once."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -214,6 +262,22 @@ TOOL_DEFINITIONS = [
                     "entity_name": {
                         "type": "string",
                         "description": "Filter by responsible entity name (partial match)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results per page (default 10, max 50). Keep the default unless continuing a previous page.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "How many results to skip (default 0). The result includes "
+                            "total_count/returned_count/offset and a note when more "
+                            "results exist beyond this page — if the user asks for "
+                            "more/the rest, call this tool again with the offset value "
+                            "given in that note (same limit) to get the NEXT page. "
+                            "Never jump straight to a large offset or limit to try to "
+                            "fetch everything at once."
+                        ),
                     },
                 },
                 "required": [],
@@ -308,6 +372,63 @@ TOOL_DEFS_BY_NAME = {t["function"]["name"]: t for t in TOOL_DEFINITIONS}
 # Tool dispatcher (unchanged)
 # ---------------------------------------------------------------------------
 
+_LIST_TOOL_NAMES = {"list_projects", "list_sg_offices", "list_tasks", "list_resolutions"}
+DEFAULT_PAGE_LIMIT = 10
+MAX_PAGE_LIMIT = 50
+
+
+def _paginate_list_tool_result(result, arguments: dict):
+    """
+    Cap how many items a list_* tool hands to the model in one response.
+
+    True page-by-page pagination (limit + offset), not a "re-ask with a
+    bigger limit" scheme: jumping straight to limit=total_count on a "show
+    more" follow-up would just reproduce the same enumeration-reliability
+    problem at a larger N (proven: the model starts abbreviating/hiding
+    items in HTML comments/garbling well before it runs out of token
+    budget -- see the live test in this debugging session, breakdown by
+    item 5-9 of 23). Each page stays small enough to reliably enumerate in
+    full, and a follow-up request advances the offset to the next page
+    instead of re-listing everything from the top.
+    """
+    try:
+        limit = int(arguments.get("limit") or DEFAULT_PAGE_LIMIT)
+    except (TypeError, ValueError):
+        limit = DEFAULT_PAGE_LIMIT
+    limit = max(1, min(limit, MAX_PAGE_LIMIT))
+    try:
+        offset = int(arguments.get("offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    if isinstance(result, list):
+        items, extra = result, {}
+    elif isinstance(result, dict) and isinstance(result.get("data"), list):
+        items, extra = result["data"], {k: v for k, v in result.items() if k != "data"}
+    else:
+        return result  # error dict, or a shape we don't recognize -- leave alone
+
+    total_count = len(items)
+    page = items[offset:offset + limit]
+    next_offset = offset + len(page)
+
+    out = {
+        **extra,
+        "data": page,
+        "total_count": total_count,
+        "returned_count": len(page),
+        "offset": offset,
+    }
+    if next_offset < total_count:
+        out["note"] = (
+            f"Showing items {offset + 1}-{next_offset} of {total_count} total. "
+            f"If the user asks for more or the rest, call this tool again "
+            f"with offset={next_offset} (same limit) to get the next page."
+        )
+    return out
+
+
 def execute_tool(
     tool_name: str,
     arguments: dict,
@@ -358,6 +479,9 @@ def execute_tool(
             result = _search_policy(arguments.get("query", ""), policy_cfg, emb, qvec)
         else:
             result = {"error": f"Unknown tool: {tool_name}"}
+
+        if tool_name in _LIST_TOOL_NAMES:
+            result = _paginate_list_tool_result(result, arguments)
 
         return json.dumps(result, default=str, ensure_ascii=False)
 
@@ -415,11 +539,14 @@ Tool selection rules:
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains.
 5. If the question does NOT need any tools (greetings, general knowledge, casual conversation) → respond with a short text answer.
-6. If tool results are already present in the conversation from previous call and they contain enough data to answer the question, do NOT call more tools — just respond with a short text so the answer node can format the full response.
+6. If tool results are already present in the conversation from previous call and they contain enough data to answer the question, do NOT call more tools — just respond with a short text so the answer node can format the full response. This does NOT apply when rule 9 says otherwise.
 7. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
 use the conversation history to identify what the user is referring to.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
+9. The list_projects/list_sg_offices/list_tasks/list_resolutions tools return one PAGE at a time (default 10 items), plus total_count/returned_count/offset and a "note" when more items exist beyond the current page.
+   - If the user says the previous list was incomplete, "not all", missing items, or asks for "the rest"/"more" — call the SAME list tool again with offset set to the value given in that note (same limit as before). This overrides rule 6.
+   - Never set a large limit or jump straight to a high offset to try to fetch everything in one call — always advance one page at a time. Each response should only ever need to enumerate about one page's worth of items.
 
 User information:
 - Name: {user_name}
@@ -536,6 +663,14 @@ Response formatting rules:
 - When listing items, provide a concise summary with key details
 - For tables, use <table><tr><td> tags
 - If query asks to state the information in bullet points, generate each point as bullet.
+- If a tool result includes total_count and returned_count and total_count is
+  greater than returned_count, you MUST include every item that is actually
+  present in the tool result's data — never skip or abbreviate items that
+  were given to you, never hide any of them inside an HTML comment, and
+  never summarize a subset instead of listing them individually. After
+  listing all of them, add a short note stating how many are shown out of
+  the total (e.g. "Showing 10 of 23 — want the next page?"). Never claim a
+  list is "complete" or "all of them" when total_count exceeds returned_count.
 
 CHARTS — you have NO chart-drawing ability of your own:
 - NEVER draw a bar/line/pie chart yourself, in any form — no <svg> bars/axes, no <canvas>, no HTML/CSS bar divs, no ASCII art, no "Graphical Representation" section. This applies even if you can see the underlying numbers.
@@ -695,6 +830,12 @@ def tool_executor_node(state: ChatState) -> dict:
                     for row in parsed["rows"]:
                         if isinstance(row, (list, tuple)):
                             tool_results_for_chart.append(dict(zip(cols, row)))
+                elif isinstance(parsed.get("data"), list):
+                    # Paginated list_* result — {"data": [...], "total_count":
+                    # N, ...} wrapper, not one record per item. Extend with the
+                    # actual page items so the chart extractor sees real
+                    # records instead of the wrapper's own total_count/offset.
+                    tool_results_for_chart.extend(parsed["data"])
                 else:
                     tool_results_for_chart.append(parsed)
         except (json.JSONDecodeError, TypeError):
@@ -737,7 +878,7 @@ def answer_node(state: ChatState) -> dict:
             model=model,
             messages=answer_messages,
             max_tokens=4000,
-            temperature=0.7,
+            temperature=0.3,
             top_p=0.95,
             frequency_penalty=0.2,
             stream=True,
