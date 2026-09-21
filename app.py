@@ -48,7 +48,7 @@ from emb_pace import PacedEmbeddings
 
 # Modular imports
 from rbac import fetch_user_profile
-from tools import build_available_tools, run_chatbot_graph
+from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
 from chart_engine import detect_chart_opportunity
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -350,6 +350,7 @@ def _strip_html_for_history(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", stripped).strip()
 
 
+
 def _strip_html_incremental(chunk: str, pending_tag: str) -> tuple[str, str]:
     """
     Strip HTML tags from streamed chunks while preserving partial tags across chunk boundaries.
@@ -570,17 +571,30 @@ async def handle_query(
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
 
+        # Deterministic data HTML (see render_tool_result_html in tools.py) —
+        # placed ahead of the model's own <p> summary so the complete,
+        # correctly-tagged data always reaches the client regardless of what
+        # the model wrote. assistant_response itself (used for history above)
+        # stays untouched — only what's actually sent to the client changes.
+        data_html = ""
+        try:
+            if tool_results_for_chart:
+                data_html = render_tool_result_html(tool_results_for_chart)
+        except Exception as e:
+            logger.error(f"Tool result HTML render error: {e}")
+        final_html = f"{data_html}{assistant_response}"
+
         # Send the final <replace> payload
         if assistant_response:
             if chart_data:
                 final_payload = json.dumps(
-                    {"html": assistant_response, "chart_data": chart_data},
+                    {"html": final_html, "chart_data": chart_data},
                     ensure_ascii=False,
                     default=str,
                 )
                 yield f"<replace>{final_payload}</replace>"
             else:
-                yield f"<replace>{assistant_response}</replace>"
+                yield f"<replace>{final_html}</replace>"
 
     return StreamingResponse(generate(), media_type="text/html")
 
@@ -709,10 +723,22 @@ async def websocket_chat(ws: WebSocket):
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
 
+            # Deterministic data HTML (see render_tool_result_html in
+            # tools.py) — placed ahead of the model's own <p> summary, same
+            # as the REST endpoint. assistant_response itself (used for
+            # history above) stays untouched.
+            data_html = ""
+            try:
+                if tool_results_for_chart:
+                    data_html = render_tool_result_html(tool_results_for_chart)
+            except Exception as e:
+                logger.error(f"WS tool result HTML render error: {e}")
+            final_html = f"{data_html}{assistant_response}"
+
             # Send final result
             await ws.send_json({
                 "type": "done",
-                "html": assistant_response,
+                "html": final_html,
                 "chart_data": json.loads(
                     json.dumps(chart_data, default=str, ensure_ascii=False)
                 ) if chart_data else None,
