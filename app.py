@@ -85,7 +85,7 @@ class CFG:
 
     # Azure OpenAI
     AZURE_OPENAI_ENDPOINT = os.getenv(
-        "ENDPOINT_URL", "https://app-openai-uae.services.ai.azure.com/"
+        "ENDPOINT_URL", "https://app-openai-uae.cognitiveservices.azure.com/"
     )
     AZURE_OPENAI_DEPLOYMENT = os.getenv("DEPLOYMENT_NAME", "gpt-4o")
     AZURE_OPENAI_KEY: str = os.getenv("AZURE_OPENAI_API_KEY", "")
