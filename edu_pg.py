@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # SQLite DB path
 # ---------------------------------------------------------------------------
-EDU_DB_PATH = os.getenv("EDU_DB_PATH", os.path.join("data", "edu_data.db"))
+EDU_DB_PATH = os.getenv(
+    "EDU_DB_PATH",
+    os.path.join(os.getenv("DATA_ROOT", "./data"), "edu_data.db"),
+)
 
 # Thread-local connections for SQLite (thread-safety)
 _local = threading.local()

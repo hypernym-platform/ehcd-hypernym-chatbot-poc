@@ -104,7 +104,7 @@ def list_projects(conn, user_id: int, filters: dict = None) -> List[Dict[str, An
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY p.id"
+    query += " ORDER BY p.id DESC"
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(query, params)
