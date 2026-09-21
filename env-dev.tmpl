@@ -37,7 +37,11 @@ AZURE_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 
 # --- blob storage (policy documents synced into DATA_ROOT) -------------------
 AZURE_BLOB_CONN_STR=${AZURE_BLOB_CONN_STR}
-AZURE_BLOB_CONTAINER=ehdc-test-bot
+# Dev reads from its own container. It previously shared `ehdc-test-bot` with
+# production, so dev ingestion ran against the live policy corpus and any
+# container-level change hit both environments at once. Contents were copied
+# across on 2026-09-21, so the dev index rebuilds to the same result.
+AZURE_BLOB_CONTAINER=ehdc-test-bot-dev
 AZURE_BLOB_PREFIX=policies/
 
 # --- auth --------------------------------------------------------------------
