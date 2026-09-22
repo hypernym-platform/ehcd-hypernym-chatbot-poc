@@ -381,9 +381,8 @@ def _search_policy(query_text: str, policy_cfg, emb_obj, qvec=None) -> List[Dict
 # Deterministic tool-result → HTML serializer
 # ---------------------------------------------------------------------------
 # Generic across every tool's output shape (list_projects, get_project_details,
-# execute_education_sql, search_policy, ...) — no per-tool special-casing,
-# and no <table> tags (table rendering is the frontend's own job; this only
-# ever produces <ul>/<li>/<strong>). Used in two places:
+# execute_education_sql, search_policy, ...) — no per-tool special-casing.
+# Produces <table>/<tr>/<th>/<td> only (no <ul>/<li>). Used in two places:
 #   1. tool_executor_node — replaces the raw JSON the LLM would otherwise see
 #      for a tool result, so the model never has to invent HTML structure.
 #   2. app.py — appended ahead of the model's own <p> summary in the final
@@ -422,8 +421,16 @@ def _format_scalar(val) -> str:
     return m.group(1) if m else text  # midnight timestamps are really just dates
 
 
+def _drop_fields(keys) -> set:
+    keys = set(keys)
+    return {
+        raw for raw, labels in _RAW_FIELD_SUPERSEDED_BY.items()
+        if raw in keys and any(lbl in keys for lbl in labels)
+    }
+
+
 def render_tool_result_html(data: Any) -> str:
-    """Recursively render any JSON-shaped tool result as HTML."""
+    """Recursively render any JSON-shaped tool result as an HTML table."""
     # SQL-style {"columns": [...], "rows": [[...], ...]} wrapper
     # (query_education_data) — expand into labeled records first so values
     # aren't shown as an unlabeled list of raw numbers.
@@ -436,27 +443,49 @@ def render_tool_result_html(data: Any) -> str:
         expanded = [dict(zip(cols, row)) for row in data["rows"] if isinstance(row, (list, tuple))]
         return render_tool_result_html(expanded)
 
+    if isinstance(data, list):
+        if not data:
+            return "<p>No results found.</p>"
+        dict_items = [d for d in data if isinstance(d, dict)]
+        if dict_items and len(dict_items) == len(data):
+            # Homogeneous list of records (e.g. 23 projects) — one real
+            # table, one row per record, columns = the fields they share.
+            common_keys = set.intersection(*(set(d.keys()) for d in dict_items))
+            drop = _drop_fields(common_keys)
+            columns = [
+                k for k in dict_items[0].keys()
+                if k in common_keys and not _ID_LIKE_RE.search(str(k)) and k not in drop
+            ]
+            if columns:
+                head = "".join(f"<th>{html.escape(_humanize_field(c))}</th>" for c in columns)
+                body_rows = []
+                for d in dict_items:
+                    cells = []
+                    for c in columns:
+                        val = d.get(c)
+                        if isinstance(val, (dict, list)) and val:
+                            cells.append(f"<td>{render_tool_result_html(val)}</td>")
+                        else:
+                            cells.append(f"<td>{html.escape(_format_scalar(val))}</td>")
+                    body_rows.append(f"<tr>{''.join(cells)}</tr>")
+                return f"<table><tr>{head}</tr>{''.join(body_rows)}</table>"
+        # Non-homogeneous list, or list of scalars — one column, one row each
+        rows = "".join(f"<tr><td>{render_tool_result_html(item)}</td></tr>" for item in data)
+        return f"<table>{rows}</table>"
+
     if isinstance(data, dict):
-        keys = set(data.keys())
-        drop = {
-            raw for raw, labels in _RAW_FIELD_SUPERSEDED_BY.items()
-            if raw in keys and any(lbl in keys for lbl in labels)
-        }
-        items = []
+        keys = data.keys()
+        drop = _drop_fields(keys)
+        rows = []
         for key, val in data.items():
             if _ID_LIKE_RE.search(str(key)) or key in drop:
                 continue
             label = html.escape(_humanize_field(key))
             if isinstance(val, (dict, list)) and val:
-                items.append(f"<li><strong>{label}</strong>{render_tool_result_html(val)}</li>")
+                rows.append(f"<tr><th>{label}</th><td>{render_tool_result_html(val)}</td></tr>")
             else:
-                items.append(f"<li><strong>{label}</strong>: {html.escape(_format_scalar(val))}</li>")
-        return f"<ul>{''.join(items)}</ul>" if items else "<p>No data.</p>"
-
-    if isinstance(data, list):
-        if not data:
-            return "<p>No results found.</p>"
-        return "<ul>" + "".join(f"<li>{render_tool_result_html(item)}</li>" for item in data) + "</ul>"
+                rows.append(f"<tr><th>{label}</th><td>{html.escape(_format_scalar(val))}</td></tr>")
+        return f"<table>{''.join(rows)}</table>" if rows else "<p>No data.</p>"
 
     return html.escape(_format_scalar(data))
 
