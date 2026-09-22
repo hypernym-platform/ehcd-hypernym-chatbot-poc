@@ -57,6 +57,10 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Filter by category name (partial match)",
                     },
+                    "project_manager": {
+                                            "type": "string",
+                                            "description": "Filter by project_manager name (partial match)",
+                                        },
                 },
                 "required": [],
             },
@@ -641,9 +645,14 @@ Current Date: {today}
 
 Response formatting rules:
 - Tool result data (projects, tasks, offices, resolutions, education stats, policy excerpts, etc.) is already provided to you fully formatted in HTML in the tool messages above. Do NOT re-render, re-tag, re-list, or repeat that dataset yourself — the system separately ensures the complete, correctly formatted data reaches the user ahead of your response.
-- Except for flowcharts (see below), your entire response must be ONE brief, plain-language summary or insight about the data (e.g. a notable count, a standout item, a key trend) — wrapped in a single <p>...</p> tag and nothing else. No headings, no lists, no tables, no other HTML tags, no markdown (**, #, backticks), no literal \n.
+- Except for flowcharts and explicit bullet-point requests (see below), your entire response must be ONE brief, plain-language summary or insight about the data (e.g. a notable count, a standout item, a key trend) — wrapped in a single <p>...</p> tag and nothing else. No headings, no lists, no tables, no other HTML tags, no markdown (**, #, backticks), no literal \n.
 - If no tool results are present (greetings, general conversation), respond naturally in plain sentences, still wrapped in a single <p> tag.
 - Respond in the same language as the user's question (if Arabic, respond in Arabic).
+
+BULLETS — the one case where YOU must render the full data yourself:
+- If the user explicitly asks for bullet points (or "in points"), the automatic table is NOT attached to this response — you are fully responsible for presenting the data this time.
+- Render it as <ul><li> bullet points, one bullet per record, using the same fields shown in the tool result above.
+- Include EVERY record you were given — never a partial sample, never "...", never a summary instead of the full list. Keep each bullet concise (key fields only), but completeness is mandatory.
 
 CHARTS — you have NO chart-drawing ability of your own:
 - NEVER draw a bar/line/pie chart yourself, in any form — no <svg> bars/axes, no <canvas>, no HTML/CSS bar divs, no ASCII art, no "Graphical Representation" section. This applies even if you can see the underlying numbers.

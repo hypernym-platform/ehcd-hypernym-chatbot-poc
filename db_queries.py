@@ -102,6 +102,10 @@ def list_projects(conn, user_id: int, filters: dict = None) -> List[Dict[str, An
         conditions.append("(c.category_name_en ILIKE %s OR c.category_name_ar ILIKE %s)")
         params.extend([f"%{filters['category']}%", f"%{filters['category']}%"])
 
+    if filters.get("project_manager"):
+        conditions.append("u.full_name_en ILIKE %s")
+        params.append(f"%{filters['project_manager']}%")
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY p.id DESC"

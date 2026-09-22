@@ -350,6 +350,15 @@ def _strip_html_for_history(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", stripped).strip()
 
 
+def _wants_bullets(query: str) -> bool:
+    """True if the user explicitly asked for bullet points instead of the
+    default table. In that case the deterministic table must NOT be
+    attached — ANSWER_SYSTEM_PROMPT tells the model to render the full data
+    as bullets itself instead, and attaching the table too would duplicate
+    the data in two formats in the same response."""
+    q = query.lower()
+    return any(w in q for w in ("bullet", "in points", "point form", "point-form"))
+
 
 def _strip_html_incremental(chunk: str, pending_tag: str) -> tuple[str, str]:
     """
@@ -576,9 +585,13 @@ async def handle_query(
         # correctly-tagged data always reaches the client regardless of what
         # the model wrote. assistant_response itself (used for history above)
         # stays untouched — only what's actually sent to the client changes.
+        # Skipped when a chart already covers this data, or when the user
+        # asked for bullets instead — either way the model's own response
+        # carries the data in that case, and attaching the table too would
+        # show it twice in two different formats.
         data_html = ""
         try:
-            if tool_results_for_chart:
+            if tool_results_for_chart and not chart_data and not _wants_bullets(query):
                 data_html = render_tool_result_html(tool_results_for_chart)
         except Exception as e:
             logger.error(f"Tool result HTML render error: {e}")
@@ -725,11 +738,12 @@ async def websocket_chat(ws: WebSocket):
 
             # Deterministic data HTML (see render_tool_result_html in
             # tools.py) — placed ahead of the model's own <p> summary, same
-            # as the REST endpoint. assistant_response itself (used for
-            # history above) stays untouched.
+            # as the REST endpoint. Skipped for chart/bullet requests, same
+            # reasoning as the REST endpoint. assistant_response itself
+            # (used for history above) stays untouched.
             data_html = ""
             try:
-                if tool_results_for_chart:
+                if tool_results_for_chart and not chart_data and not _wants_bullets(query):
                     data_html = render_tool_result_html(tool_results_for_chart)
             except Exception as e:
                 logger.error(f"WS tool result HTML render error: {e}")
