@@ -360,6 +360,22 @@ def _wants_bullets(query: str) -> bool:
     return any(w in q for w in ("bullet", "in points", "point form", "point-form"))
 
 
+_COUNT_PHRASES = ("how many", "how much", "count of", "total number of", "number of")
+_LISTING_PHRASES = ("list", "show me", "give me all", "display", "table")
+
+
+def _wants_count_only(query: str) -> bool:
+    """True if the user asked a pure count question ("how many projects are
+    there?") rather than a listing request. In that case no table should be
+    attached at all — list_*'s total_count field lets the model answer with
+    the exact number directly, and showing the full data table for a
+    question that never asked to see the data would be noise, not help."""
+    q = query.lower()
+    if any(p in q for p in _LISTING_PHRASES):
+        return False  # an explicit listing request always wins
+    return any(p in q for p in _COUNT_PHRASES)
+
+
 def _strip_html_incremental(chunk: str, pending_tag: str) -> tuple[str, str]:
     """
     Strip HTML tags from streamed chunks while preserving partial tags across chunk boundaries.
@@ -585,13 +601,19 @@ async def handle_query(
         # correctly-tagged data always reaches the client regardless of what
         # the model wrote. assistant_response itself (used for history above)
         # stays untouched — only what's actually sent to the client changes.
-        # Skipped when a chart already covers this data, or when the user
-        # asked for bullets instead — either way the model's own response
-        # carries the data in that case, and attaching the table too would
-        # show it twice in two different formats.
+        # Skipped when a chart already covers this data, when the user asked
+        # for bullets instead, or when it's a pure count question — in each
+        # case the model's own response carries the answer, and attaching
+        # the table too would either duplicate the data or show an entire
+        # table nobody asked to see just to answer "how many".
         data_html = ""
         try:
-            if tool_results_for_chart and not chart_data and not _wants_bullets(query):
+            if (
+                tool_results_for_chart
+                and not chart_data
+                and not _wants_bullets(query)
+                and not _wants_count_only(query)
+            ):
                 data_html = render_tool_result_html(tool_results_for_chart)
         except Exception as e:
             logger.error(f"Tool result HTML render error: {e}")
@@ -738,12 +760,18 @@ async def websocket_chat(ws: WebSocket):
 
             # Deterministic data HTML (see render_tool_result_html in
             # tools.py) — placed ahead of the model's own <p> summary, same
-            # as the REST endpoint. Skipped for chart/bullet requests, same
-            # reasoning as the REST endpoint. assistant_response itself
-            # (used for history above) stays untouched.
+            # as the REST endpoint. Skipped for chart/bullet/count-only
+            # requests, same reasoning as the REST endpoint.
+            # assistant_response itself (used for history above) stays
+            # untouched.
             data_html = ""
             try:
-                if tool_results_for_chart and not chart_data and not _wants_bullets(query):
+                if (
+                    tool_results_for_chart
+                    and not chart_data
+                    and not _wants_bullets(query)
+                    and not _wants_count_only(query)
+                ):
                     data_html = render_tool_result_html(tool_results_for_chart)
             except Exception as e:
                 logger.error(f"WS tool result HTML render error: {e}")

@@ -4,6 +4,7 @@ Inspects tool results and user query to determine if a chart/graph is appropriat
 then generates Chart.js-compatible JSON configuration.
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 # Brown color palette as specified
@@ -246,15 +247,39 @@ def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
     return {"labels": labels, "datasets": datasets, "chart_type": "bar"}
 
 
+_MAGNITUDE_SUFFIXES = {
+    "k": 1_000, "thousand": 1_000,
+    "m": 1_000_000, "million": 1_000_000,
+    "b": 1_000_000_000, "billion": 1_000_000_000,
+}
+_MAGNITUDE_RE = re.compile(
+    r"^([\d.]+)\s*(k|m|b|thousand|million|billion)?$", re.IGNORECASE
+)
+
+
 def _to_float(val) -> Optional[float]:
-    """Try converting value to float."""
+    """
+    Try converting value to float. Budget fields in this DB are sometimes
+    stored as human-typed strings with a magnitude suffix (e.g. "25 Million",
+    "0 M") rather than plain numbers — a bare float() call on those silently
+    fails and drops the project from any budget chart entirely, even though
+    real budget data exists. Understands k/m/b and thousand/million/billion,
+    case-insensitive, in addition to plain numbers.
+    """
     if val is None:
         return None
-    try:
-        s = str(val).replace(",", "").strip()
-        return float(s)
-    except (ValueError, TypeError):
+    s = str(val).replace(",", "").strip()
+    if not s:
         return None
+    m = _MAGNITUDE_RE.match(s)
+    if not m:
+        return None
+    try:
+        number = float(m.group(1))
+    except ValueError:
+        return None
+    suffix = (m.group(2) or "").lower()
+    return number * _MAGNITUDE_SUFFIXES.get(suffix, 1)
 
 
 def _infer_chart_type(query: str, labels: list) -> str:

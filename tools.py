@@ -539,7 +539,6 @@ Tool selection rules:
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
 use the conversation history to identify what the user is referring to.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
-
 User information:
 - Name: {user_name}
 - Role: {user_role}
@@ -635,6 +634,7 @@ STRICT RULES:
 - NEVER invent or fabricate EHCD data — only use what the tool results contain.
 - If a tool returns an access denied error, tell the user they do not have permission to view that data.
 - If data is not found, say so clearly rather than guessing.
+- When a tool result contains an explicit count such as total_count, treat that value as authoritative. Never calculate or infer the count by counting returned records.
 
 User information:
 - Name: {user_name}
@@ -645,6 +645,7 @@ Current Date: {today}
 
 Response formatting rules:
 - Tool result data (projects, tasks, offices, resolutions, education stats, policy excerpts, etc.) is already provided to you fully formatted in HTML in the tool messages above. Do NOT re-render, re-tag, re-list, or repeat that dataset yourself — the system separately ensures the complete, correctly formatted data reaches the user ahead of your response.
+- list_projects/list_sg_offices/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
 - Except for flowcharts and explicit bullet-point requests (see below), your entire response must be ONE brief, plain-language summary or insight about the data (e.g. a notable count, a standout item, a key trend) — wrapped in a single <p>...</p> tag and nothing else. No headings, no lists, no tables, no other HTML tags, no markdown (**, #, backticks), no literal \n.
 - If no tool results are present (greetings, general conversation), respond naturally in plain sentences, still wrapped in a single <p> tag.
 - Respond in the same language as the user's question (if Arabic, respond in Arabic).
@@ -822,6 +823,18 @@ def tool_executor_node(state: ChatState) -> dict:
                 for row in parsed["rows"]:
                     if isinstance(row, (list, tuple)):
                         tool_results_for_chart.append(dict(zip(cols, row)))
+            elif isinstance(parsed.get("total_count"), int):
+                # {"total_count": N, "<projects|data|...>": [...]} wrapper —
+                # every list_* tool now returns an explicit count alongside
+                # its records (so the model can answer "how many" from that
+                # number instead of trying to count records itself), not one
+                # record per data row. Extend with the actual list, whatever
+                # its key is named, not the wrapper dict.
+                list_key = next(
+                    (k for k, v in parsed.items() if isinstance(v, list)), None
+                )
+                if list_key:
+                    tool_results_for_chart.extend(parsed[list_key])
             else:
                 tool_results_for_chart.append(parsed)
 
