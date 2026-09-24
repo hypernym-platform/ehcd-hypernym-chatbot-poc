@@ -156,7 +156,12 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].astype(str).replace({"nan": None, "NaN": None}).str.strip()
-    for dt in ["year","from_date","to_date","start_date","end_date","created_at","updated_at","date","birth_date","dob"]:
+    # NOTE: "year" is deliberately excluded — every education table uses it as a
+    # plain 4-digit number (see EDU_SCHEMA_FOR_TOOL in edu_pg.py), never a calendar
+    # date. Coercing it with pd.to_datetime turned 2022 into Timestamp('2022-01-01'),
+    # which then got stored as the TEXT "2022-01-01 00:00:00" in SQLite — silently
+    # breaking every LLM-generated "WHERE year = 2022" query (0 rows, no error).
+    for dt in ["from_date","to_date","start_date","end_date","created_at","updated_at","date","birth_date","dob"]:
         if dt in df.columns:
             try:
                 df[dt] = pd.to_datetime(df[dt], errors="coerce")

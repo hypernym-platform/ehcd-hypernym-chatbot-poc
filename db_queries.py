@@ -58,7 +58,7 @@ def _fmt_jsonb(j: Any) -> str:
 # PROJECTS
 # ---------------------------------------------------------------------------
 
-def list_projects(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]:
+def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     """List projects the user can access, with optional filters."""
     filters = filters or {}
     superadmin = is_superadmin(conn, user_id)
@@ -85,7 +85,10 @@ def list_projects(conn, user_id: int, filters: dict = None) -> List[Dict[str, An
             )
             managed_ids = [r[0] for r in cur.fetchall()]
         if not managed_ids:
-            return []
+            return {
+                "total_count": 0,
+                "projects": []
+            }
         conditions.append("p.id = ANY(%s)")
         params.append(managed_ids)
 
@@ -102,9 +105,13 @@ def list_projects(conn, user_id: int, filters: dict = None) -> List[Dict[str, An
         conditions.append("(c.category_name_en ILIKE %s OR c.category_name_ar ILIKE %s)")
         params.extend([f"%{filters['category']}%", f"%{filters['category']}%"])
 
+    if filters.get("project_manager"):
+        conditions.append("u.full_name_en ILIKE %s")
+        params.append(f"%{filters['project_manager']}%")
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY p.id"
+    query += " ORDER BY p.id DESC"
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(query, params)
@@ -136,7 +143,10 @@ def list_projects(conn, user_id: int, filters: dict = None) -> List[Dict[str, An
                 item["spent_budget"] = budget.get("spent_budget")
                 item["budget_left"] = budget.get("budget_left")
         result.append(item)
-    return result
+    return {
+    "total_count": len(result),
+    "projects": result
+    }
 
 
 def _get_project_budget(conn, project_id: int) -> Optional[Dict]:
@@ -236,8 +246,8 @@ def get_project_details(conn, user_id: int, project_id: int = None,
 # SG OFFICE
 # ---------------------------------------------------------------------------
 
-def list_sg_offices(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]:
-    """List SG offices the user can access."""
+def list_sg_offices(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List SG offices the user can access. Returns {"total_count": N, "data": [...]}."""
     filters = filters or {}
     allowed_ids = accessible_sg_office_ids(conn, user_id)
 
@@ -255,7 +265,7 @@ def list_sg_offices(conn, user_id: int, filters: dict = None) -> List[Dict[str, 
 
     if allowed_ids is not None:
         if not allowed_ids:
-            return {"message": "You do not have access to any SG offices. Please contact your administrator to get access.", "data": []}
+            return {"message": "You do not have access to any SG offices. Please contact your administrator to get access.", "total_count": 0, "data": []}
         conditions.append("s.id = ANY(%s)")
         params.append(allowed_ids)
 
@@ -280,7 +290,7 @@ def list_sg_offices(conn, user_id: int, filters: dict = None) -> List[Dict[str, 
         rows = cur.fetchall()
 
     if not rows:
-        return {"message": "No SG offices found matching your criteria.", "data": []}
+        return {"message": "No SG offices found matching your criteria.", "total_count": 0, "data": []}
 
     result = []
     for r in rows:
@@ -289,7 +299,7 @@ def list_sg_offices(conn, user_id: int, filters: dict = None) -> List[Dict[str, 
         item["start_date"] = str(item["start_date"]) if item.get("start_date") else None
         item["end_date"] = str(item["end_date"]) if item.get("end_date") else None
         result.append(item)
-    return result
+    return {"total_count": len(result), "data": result}
 
 
 def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
@@ -378,13 +388,13 @@ def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
 # TASK MANAGEMENT
 # ---------------------------------------------------------------------------
 
-def list_tasks(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]:
-    """List tasks the user can access."""
+def list_tasks(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List tasks the user can access. Returns {"total_count": N, "data": [...]}."""
     filters = filters or {}
     allowed_ids = accessible_task_ids(conn, user_id)
 
     query = """
-        SELECT t.id, t.task_id, t.task_name, t.task_name_ar,
+        SELECT t.id, t.task_name, t.task_name_ar,
                t.status_en, t.status_ar, t.date_of_request,
                t.requires_presentation_to_main_council,
                t.presentation_readiness, t.got_presented,
@@ -401,7 +411,7 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]
 
     if allowed_ids is not None:
         if not allowed_ids:
-            return {"message": "You do not have access to any tasks. Please contact your administrator to get access.", "data": []}
+            return {"message": "You do not have access to any tasks. Please contact your administrator to get access.", "total_count": 0, "data": []}
         conditions.append("t.id = ANY(%s)")
         params.append(allowed_ids)
 
@@ -442,7 +452,7 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]
         item["status_label"] = _status_label(item.get("status_en"))
         item["date_of_request"] = str(item["date_of_request"]) if item.get("date_of_request") else None
         result.append(item)
-    return result
+    return {"total_count": len(result), "data": result}
 
 
 def get_task_details(conn, user_id: int, task_id: int = None,
@@ -529,8 +539,8 @@ def get_task_details(conn, user_id: int, task_id: int = None,
 # RESOLUTION MANAGEMENT
 # ---------------------------------------------------------------------------
 
-def list_resolutions(conn, user_id: int, filters: dict = None) -> List[Dict[str, Any]]:
-    """List resolutions the user can access."""
+def list_resolutions(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List resolutions the user can access. Returns {"total_count": N, "data": [...]}."""
     filters = filters or {}
     allowed_ids = accessible_resolution_ids(conn, user_id)
 
@@ -548,7 +558,7 @@ def list_resolutions(conn, user_id: int, filters: dict = None) -> List[Dict[str,
 
     if allowed_ids is not None:
         if not allowed_ids:
-            return {"message": "You do not have access to any resolutions. Please contact your administrator to get access.", "data": []}
+            return {"message": "You do not have access to any resolutions. Please contact your administrator to get access.", "total_count": 0, "data": []}
         conditions.append("r.id = ANY(%s)")
         params.append(allowed_ids)
 
@@ -586,7 +596,7 @@ def list_resolutions(conn, user_id: int, filters: dict = None) -> List[Dict[str,
         item["deadline_completion"] = str(item["deadline_completion"]) if item.get("deadline_completion") else None
         item["meeting_date"] = str(item["meeting_date"]) if item.get("meeting_date") else None
         result.append(item)
-    return result
+    return {"total_count": len(result), "data": result}
 
 
 def get_resolution_details(conn, user_id: int, resolution_id: int = None,

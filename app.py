@@ -53,7 +53,7 @@ from emb_pace import PacedEmbeddings
 
 # Modular imports
 from rbac import fetch_user_profile
-from tools import build_available_tools, run_chatbot_graph
+from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
 from chart_engine import detect_chart_opportunity
 from voice_bridge import (
     get_elevenlabs_signed_url,
@@ -280,17 +280,141 @@ def pg_conn():
 # ────────────────────────────────────────────────────────────────────────────────
 # CHAT HISTORY (Redis)
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_HISTORY_MESSAGES = 20
-
+MAX_HISTORY_MESSAGES = 40
 
 def get_conversation_history(user_key: str) -> list:
-    h = redis_client.get(f"user_{user_key}_history")
-    return json.loads(h) if h else []
+    redis_key = f"user_{user_key}_history"
+
+    try:
+        h = redis_client.get(redis_key)
+
+        logger.info(
+            "[CHAT_HISTORY][GET] key=%s exists=%s",
+            redis_key,
+            h is not None
+        )
+
+        if not h:
+            logger.info("[CHAT_HISTORY][GET] No history found.")
+            return []
+
+        history = json.loads(h)
+
+        logger.info(
+            "[CHAT_HISTORY][GET] Loaded %d messages",
+            len(history)
+        )
+
+        logger.info(
+            "[CHAT_HISTORY][GET] History=%s",
+            history
+        )
+
+        return history
+
+    except Exception as e:
+        logger.error(
+            "[CHAT_HISTORY][GET] Failed for key=%s: %s",
+            redis_key,
+            e,
+            exc_info=True
+        )
+        return []
 
 
 def save_conversation_history(user_key: str, history: list):
-    trimmed = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
-    redis_client.set(f"user_{user_key}_history", json.dumps(trimmed), ex=3600)
+    redis_key = f"user_{user_key}_history"
+
+    try:
+        trimmed = (
+            history[-MAX_HISTORY_MESSAGES:]
+            if len(history) > MAX_HISTORY_MESSAGES
+            else history
+        )
+
+        redis_client.set(
+            redis_key,
+            json.dumps(trimmed, ensure_ascii=False),
+            ex=3600
+        )
+
+        logger.info(
+            "[CHAT_HISTORY][SAVE] key=%s messages=%d",
+            redis_key,
+            len(trimmed)
+        )
+
+        logger.info(
+            "[CHAT_HISTORY][SAVE] History=%s",
+            trimmed
+        )
+
+    except Exception as e:
+        logger.error(
+            "[CHAT_HISTORY][SAVE] Failed for key=%s: %s",
+            redis_key,
+            e,
+            exc_info=True
+        )
+
+#def get_conversation_history(user_key: str) -> list:
+#    h = redis_client.get(f"user_{user_key}_history")
+#    return json.loads(h) if h else []
+
+
+#def save_conversation_history(user_key: str, history: list):
+#    trimmed = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
+#    redis_client.set(f"user_{user_key}_history", json.dumps(trimmed), ex=3600)
+
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+_WHITESPACE_RE = re.compile(r"[ \t]+")
+
+
+def _strip_html_for_history(text: str) -> str:
+    """
+    Strip HTML markup before persisting an assistant turn to Redis history.
+
+    We store/replay conversation history verbatim into future LLM calls (see
+    run_chatbot_graph), so a raw HTML table (<table><tr><th>...) costs real
+    tokens on every follow-up turn for pure formatting with no extra meaning,
+    and any malformed/dangling tags in a stored response get replayed back to
+    the model as if they were its own prior output. Stripping tags here keeps
+    the actual data (names, numbers, values) available for the model to
+    resolve follow-ups like "put them in bullets" against, without the
+    markup overhead or corruption risk. The original HTML is still streamed
+    to the client unchanged — only what gets persisted/replayed changes.
+    """
+    if not text:
+        return text
+    stripped = _HTML_TAG_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", stripped).strip()
+
+
+def _wants_bullets(query: str) -> bool:
+    """True if the user explicitly asked for bullet points instead of the
+    default table. In that case the deterministic table must NOT be
+    attached — ANSWER_SYSTEM_PROMPT tells the model to render the full data
+    as bullets itself instead, and attaching the table too would duplicate
+    the data in two formats in the same response."""
+    q = query.lower()
+    return any(w in q for w in ("bullet", "in points", "point form", "point-form"))
+
+
+_COUNT_PHRASES = ("how many", "how much", "count of", "total number of", "number of")
+_LISTING_PHRASES = ("list", "show me", "give me all", "display", "table")
+
+
+def _wants_count_only(query: str) -> bool:
+    """True if the user asked a pure count question ("how many projects are
+    there?") rather than a listing request. In that case no table should be
+    attached at all — list_*'s total_count field lets the model answer with
+    the exact number directly, and showing the full data table for a
+    question that never asked to see the data would be noise, not help."""
+    q = query.lower()
+    if any(p in q for p in _LISTING_PHRASES):
+        return False  # an explicit listing request always wins
+    return any(p in q for p in _COUNT_PHRASES)
+
 
 def _strip_html_incremental(chunk: str, pending_tag: str) -> tuple[str, str]:
     """
@@ -498,9 +622,9 @@ async def handle_query(
             assistant_response = error_msg
             yield error_msg
 
-        # Save conversation history
+        # Save conversation history (plain-text — see _strip_html_for_history)
         conversation_history.append(
-            {"role": "assistant", "content": assistant_response}
+            {"role": "assistant", "content": _strip_html_for_history(assistant_response)}
         )
         save_conversation_history(history_key, conversation_history)
 
@@ -513,17 +637,40 @@ async def handle_query(
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
 
+        # Deterministic data HTML (see render_tool_result_html in tools.py) —
+        # placed ahead of the model's own <p> summary so the complete,
+        # correctly-tagged data always reaches the client regardless of what
+        # the model wrote. assistant_response itself (used for history above)
+        # stays untouched — only what's actually sent to the client changes.
+        # Skipped when a chart already covers this data, when the user asked
+        # for bullets instead, or when it's a pure count question — in each
+        # case the model's own response carries the answer, and attaching
+        # the table too would either duplicate the data or show an entire
+        # table nobody asked to see just to answer "how many".
+        data_html = ""
+        try:
+            if (
+                tool_results_for_chart
+                and not chart_data
+                and not _wants_bullets(query)
+                and not _wants_count_only(query)
+            ):
+                data_html = render_tool_result_html(tool_results_for_chart)
+        except Exception as e:
+            logger.error(f"Tool result HTML render error: {e}")
+        final_html = f"{data_html}{assistant_response}"
+
         # Send the final <replace> payload
         if assistant_response:
             if chart_data:
                 final_payload = json.dumps(
-                    {"html": assistant_response, "chart_data": chart_data},
+                    {"html": final_html, "chart_data": chart_data},
                     ensure_ascii=False,
                     default=str,
                 )
                 yield f"<replace>{final_payload}</replace>"
             else:
-                yield f"<replace>{assistant_response}</replace>"
+                yield f"<replace>{final_html}</replace>"
 
     return StreamingResponse(generate(), media_type="text/html")
 
@@ -721,7 +868,7 @@ async def websocket_chat(ws: WebSocket):
                     await ws.send_json({"type": "error", "message": "Token missing user_id"})
                     continue
             except (jwt.ExpiredSignatureError, jwt.InvalidTokenError) as e:
-                await ws.send_json({"type": "error", "message": f"Auth failed: {e}"})
+                await ws.send_json({"type": "error", "status_code": 401, "message": f"Auth failed: {e}"})
                 continue
 
             query = (data.get("query") or "").strip()
@@ -799,9 +946,9 @@ async def websocket_chat(ws: WebSocket):
                     if plain:
                         await ws.send_json({"type": "chunk", "content": plain})
 
-            # Save history
+            # Save history (plain-text — see _strip_html_for_history)
             conversation_history.append(
-                {"role": "assistant", "content": assistant_response}
+                {"role": "assistant", "content": _strip_html_for_history(assistant_response)}
             )
             save_conversation_history(history_key, conversation_history)
 
@@ -814,10 +961,29 @@ async def websocket_chat(ws: WebSocket):
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
 
+            # Deterministic data HTML (see render_tool_result_html in
+            # tools.py) — placed ahead of the model's own <p> summary, same
+            # as the REST endpoint. Skipped for chart/bullet/count-only
+            # requests, same reasoning as the REST endpoint.
+            # assistant_response itself (used for history above) stays
+            # untouched.
+            data_html = ""
+            try:
+                if (
+                    tool_results_for_chart
+                    and not chart_data
+                    and not _wants_bullets(query)
+                    and not _wants_count_only(query)
+                ):
+                    data_html = render_tool_result_html(tool_results_for_chart)
+            except Exception as e:
+                logger.error(f"WS tool result HTML render error: {e}")
+            final_html = f"{data_html}{assistant_response}"
+
             # Send final result
             await ws.send_json({
                 "type": "done",
-                "html": assistant_response,
+                "html": final_html,
                 "chart_data": json.loads(
                     json.dumps(chart_data, default=str, ensure_ascii=False)
                 ) if chart_data else None,
