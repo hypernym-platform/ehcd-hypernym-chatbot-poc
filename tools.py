@@ -61,6 +61,23 @@ TOOL_DEFINITIONS = [
                                             "type": "string",
                                             "description": "Filter by project_manager name (partial match)",
                                         },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Only projects whose start date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Only projects whose end date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or before'.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Set to 'latest' whenever the user asks for the latest/most recent/newest project(s) — sorts by start date, most recent first. Omit for the default order.",
+                        "enum": ["latest"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of projects to return. Set this to match the count the user asked for, e.g. 'the 3 latest projects' -> limit=3, 'the latest project' (singular) -> limit=1. Omit to return all matching projects — never omit it when the user named a specific number or asked for a single one.",
+                    },
                 },
                 "required": [],
             },
@@ -167,6 +184,14 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Filter tasks requiring main council presentation",
                     },
+                    "request_date": {
+                        "type": "string",
+                        "description": "Only tasks whose request date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'.",
+                    },
+                    "advisor": {
+                        "type": "string",
+                        "description": "Filter by advisor name assigned to the task (partial match)",
+                    },
                 },
                 "required": [],
             },
@@ -240,7 +265,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "resolution_id": {
                         "type": "integer",
-                        "description": "Resolution database ID",
+                        "description": "The resolution's tracking ID (the resolution_id field shown in list_resolutions results, e.g. 76924319) — not an internal database row number.",
                     },
                     "resolution_topic": {
                         "type": "string",
@@ -534,11 +559,17 @@ Tool selection rules:
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains.
 5. If the question does NOT need any tools (greetings, general knowledge, casual conversation) → respond with a short text answer.
-6. If tool results are already present in the conversation from previous call and they contain enough data to answer the question, do NOT call more tools — just respond with a short text so the answer node can format the full response.
-7. When the current question refers to a previous request using words such as
+6. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
 use the conversation history to identify what the user is referring to.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
+9. Whenever the question asks for a chart, graph, or visualization of an entity
+(projects, SG offices, tasks, resolutions, education stats) — even if it names
+no specific field, e.g. "generate a chart of tasks" — you MUST call the
+matching list/get/query tool for that entity before responding, exactly as
+rule 1 says for structured data. A chart cannot be drawn from data you never
+fetched. Never skip the tool call just because the request sounds like it's
+only asking for a picture.
 User information:
 - Name: {user_name}
 - Role: {user_role}

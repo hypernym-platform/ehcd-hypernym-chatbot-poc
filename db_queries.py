@@ -109,9 +109,27 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         conditions.append("u.full_name_en ILIKE %s")
         params.append(f"%{filters['project_manager']}%")
 
+    if filters.get("start_date"):
+        conditions.append("p.start_date::date = %s")
+        params.append(filters["start_date"])
+
+    if filters.get("end_date"):
+        conditions.append("p.end_date::date = %s")
+        params.append(filters["end_date"])
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY p.id DESC"
+
+    # "latest" means most recently startedwhat a user means by "the latest project" (e.g. a project entered into
+    # the system today with a start date next month isn't "the latest").
+    if filters.get("sort_by") == "latest":
+        query += " ORDER BY p.start_date DESC NULLS LAST"
+    else:
+        query += " ORDER BY p.id DESC"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(query, params)
@@ -389,7 +407,7 @@ def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
 # ---------------------------------------------------------------------------
 
 def list_tasks(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
-    """List tasks the user can access. Returns {"total_count": N, "data": [...]}."""
+    """List tasks the user can access with optional filters. Returns {"total_count": N, "data": [...]}."""
     filters = filters or {}
     allowed_ids = accessible_task_ids(conn, user_id)
 
@@ -433,6 +451,17 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     if filters.get("requires_presentation") is not None:
         conditions.append("t.requires_presentation_to_main_council = %s")
         params.append(filters["requires_presentation"])
+
+    if filters.get("request_date"):
+        conditions.append("t.date_of_request::date = %s")
+        params.append(filters["request_date"])
+
+    if filters.get("advisor"):
+        conditions.append("""t.id IN (
+            SELECT task_id FROM task_management_taskadvisor
+            WHERE name_en ILIKE %s OR name_ar ILIKE %s
+        )""")
+        params.extend([f"%{filters['advisor']}%", f"%{filters['advisor']}%"])
 
     # Filter by subtask (top-level tasks only if requested)
     if filters.get("top_level_only"):
@@ -521,7 +550,7 @@ def get_task_details(conn, user_id: int, task_id: int = None,
 
         # Subtasks
         cur.execute("""
-            SELECT id, task_id, task_name, task_name_ar, status_en, status_ar,
+            SELECT id, task_name, task_name_ar, status_en, status_ar,
                    date_of_request, status_detail_en
             FROM task_management_task WHERE subtask_id = %s ORDER BY id
         """, (tid,))
@@ -613,7 +642,7 @@ def get_resolution_details(conn, user_id: int, resolution_id: int = None,
                 LEFT JOIN user_management_user u ON u.id = r.resolution_owner_id
                 LEFT JOIN project_management_projectentity e ON e.id = r.responsible_entity_id
                 LEFT JOIN user_management_user cb ON cb.id = r.created_by_id
-                WHERE r.id = %s
+                WHERE r.resolution_id = %s
             """, (resolution_id,))
         elif resolution_topic:
             cur.execute("""

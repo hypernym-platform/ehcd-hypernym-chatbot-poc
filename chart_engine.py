@@ -22,6 +22,23 @@ BROWN_COLORS = [
 ]
 
 
+def is_chart_request(query: str) -> bool:
+    """
+    True if the query's own wording asks for a chart/graph, independent of
+    whether chartable data actually exists. Shared with app.py so it can
+    tell when the model's response claims a chart is coming but
+    detect_chart_opportunity ended up unable to build one (e.g. the
+    requested field doesn't exist for that entity, like a task's "budget")
+    — the model has no way to know that in advance, since chart detection
+    runs after its response is already generated.
+    """
+    query_lower = query.lower()
+    return any(
+        w in query_lower
+        for w in ["chart", "graph", "visualiz", "diagram", "compare budget", "pie", "bar chart"]
+    )
+
+
 def detect_chart_opportunity(
     query: str,
     tool_results: List[Dict],
@@ -33,13 +50,7 @@ def detect_chart_opportunity(
     """
     query_lower = query.lower()
 
-    # Check if user explicitly asks for chart/graph
-    explicit_chart = any(
-        w in query_lower
-        for w in ["chart", "graph", "visualiz", "diagram", "compare budget", "pie", "bar chart"]
-    )
-
-    if not explicit_chart:
+    if not is_chart_request(query):
         return None
 
     # Try to extract chartable data from tool results
@@ -130,30 +141,23 @@ def _extract_chart_data(
                 {"label": "Spent", "data": [b["spent"] for b in budget_items]},
                 {"label": "Remaining", "data": [b["left"] for b in budget_items]},
             ],
-            "chart_type": "bar",
         }
+
+    # The query explicitly asked for budget data, but no item had a usable
+    # budget field (e.g. the user's role lacks Budget Info access, so
+    # list_projects never attached allocated_budget/spent_budget to the
+    # results). Stop here instead of falling through to the generic
+    # fallbacks below — those would happily chart whatever OTHER numeric
+    # field survives (status codes, manager IDs, ...) as if it were the
+    # requested budget data, producing a real-looking but meaningless chart.
+    if "budget" in query_lower:
+        return None
 
     # Case 2: Status distribution
     if any(w in query_lower for w in ["status", "distribution", "breakdown", "pie"]):
-        status_counts = {}
-        for item in tool_results:
-            status = (
-                item.get("status_label")
-                or item.get("status_en")
-                or item.get("status")
-            )
-            if status:
-                label = str(status)
-                status_counts[label] = status_counts.get(label, 0) + 1
-
-        if len(status_counts) >= 2:
-            labels = list(status_counts.keys())
-            values = list(status_counts.values())
-            return {
-                "labels": labels,
-                "datasets": [{"label": "Count", "data": values}],
-                "chart_type": "pie",
-            }
+        status_chart = _status_distribution_chart(tool_results)
+        if status_chart:
+            return status_chart
 
     # Case 3: Homogeneous row dicts (e.g. SQL query results like
     # {"year": 2022, "total_students": 509738, "total_schools": 776}) —
@@ -190,7 +194,36 @@ def _extract_chart_data(
             "chart_type": "bar",
         }
 
-    return None
+    # Case 5: Last resort. The query asked for *a* chart of some entity list
+    # (e.g. "generate a chart of tasks") without naming any specific numeric
+    # field, and none of the cases above found one — tasks in particular
+    # have no numeric fields at all (no budget, no count column). Status is
+    # the one dimension every entity list here actually has, so fall back to
+    # a status-distribution chart instead of giving up outright.
+    return _status_distribution_chart(tool_results)
+
+
+def _status_distribution_chart(tool_results: List[Dict]) -> Optional[Dict]:
+    """Count items by status field and return chart_data, or None if fewer
+    than 2 distinct statuses are present (nothing meaningful to compare)."""
+    status_counts = {}
+    for item in tool_results:
+        status = (
+            item.get("status_label")
+            or item.get("status_en")
+            or item.get("status")
+        )
+        if status:
+            label = str(status)
+            status_counts[label] = status_counts.get(label, 0) + 1
+
+    if len(status_counts) < 2:
+        return None
+
+    return {
+        "labels": list(status_counts.keys()),
+        "datasets": [{"label": "Count", "data": list(status_counts.values())}],
+    }
 
 
 def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
@@ -214,8 +247,16 @@ def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
 
     EXCLUDE = {"id", "task_id", "resolution_id"}
 
-    # Prefer a conventionally-named category column for the x-axis.
-    preferred_label_cols = ["year", "label", "name", "category", "region", "period", "sector"]
+    # Prefer a conventionally-named category column for the x-axis. Entity
+    # "name" fields come first — without this, the generic fallback below
+    # picks whichever non-numeric column sorts alphabetically first, which
+    # for tasks/offices/resolutions is usually "category_name" (a shared,
+    # repeated value across rows), not the field that actually identifies
+    # each individual record (e.g. task_name).
+    preferred_label_cols = [
+        "task_name", "project_name_en", "sg_office_name_en", "resolution_topic_en",
+        "year", "label", "name", "category", "region", "period", "sector",
+    ]
     label_col = next((c for c in preferred_label_cols if c in common_keys), None)
 
     # Otherwise pick the first column that isn't purely numeric across all rows.
