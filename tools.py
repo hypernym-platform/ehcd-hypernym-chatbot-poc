@@ -918,8 +918,17 @@ def answer_node(state: ChatState) -> dict:
                 chunk_queue.put(text)
     except Exception as e:
         logger.error(f"OpenAI streaming error in answer node: {e}")
-        full_text = "I encountered an error processing your request. Please try again."
-        chunk_queue.put(full_text)
+        # Only substitute the generic error text when NOTHING streamed yet.
+        # A transient mid-stream drop (more likely on longer chart-summary
+        # responses) can happen after real content already went out chunk
+        # by chunk — pushing the error text the same way here would just
+        # glue it onto the end of that real text with no separator, reading
+        # as one garbled sentence. Once partial content is out, retracting
+        # it isn't possible, so the honest move is to end the stream as-is
+        # rather than visibly append a confusing second message.
+        if not full_text:
+            full_text = "I encountered an error processing your request. Please try again."
+            chunk_queue.put(full_text)
 
     chunk_queue.put(None)  # Sentinel: end of stream
     return {"final_response": full_text}

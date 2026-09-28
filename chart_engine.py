@@ -68,7 +68,7 @@ def detect_chart_opportunity(
     # Generate Plotly config (data + layout, no hardcoded container ID)
     plotly_config = _build_plotly_config(chart_type, labels, datasets)
 
-    return {
+    result = {
         "chart_type": chart_type,
         "plotly_data": plotly_config["data"],
         "plotly_layout": plotly_config["layout"],
@@ -77,6 +77,9 @@ def detect_chart_opportunity(
             "labels": labels[:20],
         },
     }
+    if chart_data.get("no_budget_entities_present"):
+        result["no_budget_entities_present"] = True
+    return result
 
 
 def _extract_chart_data(
@@ -134,6 +137,15 @@ def _extract_chart_data(
 
     if budget_items:
         labels = [b["name"] for b in budget_items]
+        # Tasks and council affairs (resolutions) have no budget field in
+        # this schema at all, so if the tool data mixed them in with
+        # projects/SG offices, they were silently skipped above — flag that
+        # here so the caller can add a plain note instead of leaving the
+        # model's text implying full coverage.
+        has_no_budget_entity = any(
+            (item.get("task_name") or item.get("resolution_topic_en"))
+            for item in tool_results
+        )
         return {
             "labels": labels,
             "datasets": [
@@ -141,6 +153,7 @@ def _extract_chart_data(
                 {"label": "Spent", "data": [b["spent"] for b in budget_items]},
                 {"label": "Remaining", "data": [b["left"] for b in budget_items]},
             ],
+            "no_budget_entities_present": has_no_budget_entity,
         }
 
     # The query explicitly asked for budget data, but no item had a usable

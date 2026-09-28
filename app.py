@@ -609,6 +609,16 @@ async def handle_query(
                 "for it wasn't found. It may not exist for what you asked "
                 "about, or there wasn't enough of it to compare.</p>"
             )
+        elif chart_data and chart_data.get("no_budget_entities_present"):
+            # Tasks and council affairs (resolutions) have no budget field
+            # in this schema at all, so a budget chart that mixed them in
+            # with projects/SG offices only covers the latter. Append a
+            # plain note rather than touching the model's own text.
+            assistant_response += (
+                "<p>Note: tasks and council affairs do not have any "
+                "allocated budget data in the system, so they aren't "
+                "included in this chart.</p>"
+            )
 
         # Deterministic data HTML (see render_tool_result_html in tools.py) —
         # placed ahead of the model's own <p> summary so the complete,
@@ -779,6 +789,12 @@ async def websocket_chat(ws: WebSocket):
                     "<p>I couldn't generate a chart for this — the data needed "
                     "for it wasn't found. It may not exist for what you asked "
                     "about, or there wasn't enough of it to compare.</p>"
+                )
+            elif chart_data and chart_data.get("no_budget_entities_present"):
+                assistant_response += (
+                    "<p>Note: tasks and council affairs do not have any "
+                    "allocated budget data in the system, so they aren't "
+                    "included in this chart.</p>"
                 )
 
             # Deterministic data HTML (see render_tool_result_html in
