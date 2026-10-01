@@ -137,6 +137,69 @@ def _table_has_column(conn, table_name: str, column_name: str) -> bool:
     return result
 
 
+def accessible_project_ids(conn, user_id: int) -> Optional[List[int]]:
+    """Return list of project IDs the user can see. None means all.
+    Mirrors accessible_sg_office_ids: project_management_teammember has no
+    user_id column today, so team-member access falls back to matching the
+    member's stored name against the user's own full_name_en — fragile
+    (typos, duplicate names) but it's what the equivalent SG-office code
+    already does in production, and upgrades automatically if a user_id
+    column is ever added to this table."""
+    if _is_admin_or_super(conn, user_id):
+        return None
+    with conn.cursor() as cur:
+        if _table_has_column(conn, "project_management_teammember", "user_id"):
+            cur.execute("""
+                SELECT id FROM project_management_project WHERE project_manager_id = %s
+                UNION
+                SELECT project_id
+                FROM project_management_teammember
+                WHERE user_id = %s
+            """, (user_id, user_id))
+        else:
+            cur.execute("""
+                SELECT id FROM project_management_project WHERE project_manager_id = %s
+                UNION
+                SELECT project_id
+                FROM project_management_teammember
+                WHERE name_en IN (
+                    SELECT full_name_en FROM user_management_user WHERE id = %s
+                )
+            """, (user_id, user_id))
+        return [r[0] for r in cur.fetchall()]
+
+
+def user_can_access_project(conn, user_id: int, project_id: int) -> bool:
+    if _is_admin_or_super(conn, user_id):
+        return True
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM project_management_project
+            WHERE id = %s AND project_manager_id = %s
+            LIMIT 1
+        """, (project_id, user_id))
+        if cur.fetchone():
+            return True
+        if _table_has_column(conn, "project_management_teammember", "user_id"):
+            cur.execute("""
+                SELECT 1 FROM project_management_teammember
+                WHERE project_id = %s AND user_id = %s
+                LIMIT 1
+            """, (project_id, user_id))
+        else:
+            cur.execute("""
+                SELECT 1 FROM project_management_teammember
+                WHERE project_id = %s
+                  AND name_en IN (
+                      SELECT full_name_en FROM user_management_user WHERE id = %s
+                  )
+                LIMIT 1
+            """, (project_id, user_id))
+        if cur.fetchone():
+            return True
+    return False
+
+
 def accessible_sg_office_ids(conn, user_id: int) -> Optional[List[int]]:
     """Return list of sg_office IDs the user can see. None means all."""
     if _is_admin_or_super(conn, user_id):

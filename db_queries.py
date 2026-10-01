@@ -13,9 +13,11 @@ from rbac import (
     is_superadmin,
     db_has_feature,
     FeatureID,
+    accessible_project_ids,
     accessible_sg_office_ids,
     accessible_task_ids,
     accessible_resolution_ids,
+    user_can_access_project,
     user_can_access_sg_office,
     user_can_access_task,
     user_can_access_resolution,
@@ -77,20 +79,16 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     conditions, params = [], []
 
     if not all_projects:
-        # Manager: only projects they manage
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM project_management_project WHERE project_manager_id = %s ORDER BY id",
-                (user_id,),
-            )
-            managed_ids = [r[0] for r in cur.fetchall()]
-        if not managed_ids:
+        # Manager or team member: only projects they manage or are listed
+        # on the team for (see rbac.accessible_project_ids)
+        accessible_ids = accessible_project_ids(conn, user_id)
+        if not accessible_ids:
             return {
                 "total_count": 0,
                 "projects": []
             }
         conditions.append("p.id = ANY(%s)")
-        params.append(managed_ids)
+        params.append(accessible_ids)
 
     if filters.get("status"):
         status_val = filters["status"]
@@ -214,9 +212,9 @@ def get_project_details(conn, user_id: int, project_id: int = None,
 
         pid = project["id"]
 
-        # Access check for non-admin
+        # Access check for non-admin — manager or team member
         if not all_projects:
-            if project.get("project_manager_id") != user_id:
+            if not user_can_access_project(conn, user_id, pid):
                 return {"error": "Access denied to this project"}
 
         result = {
