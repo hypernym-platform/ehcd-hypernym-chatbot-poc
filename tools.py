@@ -69,6 +69,10 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Only projects whose end date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or before'.",
                     },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "Set to true when the user asks which projects have passed their due date / are overdue / are past deadline. Compares each project's end date to today's date in the database — do not try to work this out yourself from a plain project list.",
+                    },
                     "sort_by": {
                         "type": "string",
                         "description": "Set to 'latest' whenever the user asks for the latest/most recent/newest project(s) — sorts by start date, most recent first. Omit for the default order.",

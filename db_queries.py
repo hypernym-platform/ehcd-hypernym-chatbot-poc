@@ -115,11 +115,20 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         conditions.append("p.end_date::date = %s")
         params.append(filters["end_date"])
 
+    if filters.get("overdue"):
+        # Deterministic end_date-vs-today comparison in SQL — without this,
+        # the model was left to eyeball "has this project's due date
+        # passed?" from the raw project list itself, and got it wrong (it
+        # flagged a project ending 2027-08-31 as overdue on 2026-10-01).
+        conditions.append("p.end_date::date < CURRENT_DATE")
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
 
-    # "latest" means most recently startedwhat a user means by "the latest project" (e.g. a project entered into
-    # the system today with a start date next month isn't "the latest").
+    # "latest" means most recently started — p.id DESC (the default)
+    # reflects insertion order, which doesn't match what a user means by
+    # "the latest project" (e.g. a project entered into the system today
+    # with a start date next month isn't "the latest").
     if filters.get("sort_by") == "latest":
         query += " ORDER BY p.start_date DESC NULLS LAST"
     else:
