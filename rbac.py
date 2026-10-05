@@ -15,13 +15,20 @@ DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
 
 
 class FeatureID:
-    USER_MANAGEMENT = 3
-    BUDGET_INFO     = 4
-    EDUCATION_DASH  = 5
-    ALL_PROJECTS    = 6
-    NOTES           = 7
-    PROJECT_DOCS    = 8
-    AI_CHATBOT      = 9
+    USER_MANAGEMENT    = 3
+    BUDGET_INFO        = 4
+    EDUCATION_DASH     = 5
+    ALL_PROJECTS       = 6
+    NOTES              = 7
+    PROJECT_DOCS       = 8
+    AI_CHATBOT         = 9
+    SG_OFFICE_INTERNAL = 10  # Internal Directions tab (email/memos/weekly
+                             # actions) — viewable by H.E., Shamma, and
+                             # Theyab per the SG Office internal workflow
+                             # spec. Grant via role_and_access_role_features
+                             # same as any other feature; no DB row exists
+                             # for it yet, so no one has access until one is
+                             # added.
 
 
 def is_superadmin(conn, user_id: int) -> bool:
@@ -104,6 +111,14 @@ def has_notes(conn, user_id: int) -> bool:
 
 def has_user_management(conn, user_id: int) -> bool:
     return db_has_feature(conn, user_id, FeatureID.USER_MANAGEMENT)
+
+
+def has_sg_office_internal_access(conn, user_id: int) -> bool:
+    """H.E., Shamma, and Theyab all see the Internal Directions tab (email
+    correspondence, memos, weekly actions) — a flat view/no-view gate, not
+    ownership-based like projects/tasks/resolutions, since all three named
+    roles see the same shared data."""
+    return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_INTERNAL)
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +359,8 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
 
     if not row:
         return {k: False for k in ["superadmin", "all_projects", "budget",
-                                    "user_management", "notes", "education", "project_docs"]}
+                                    "user_management", "notes", "education", "project_docs",
+                                    "sg_office_internal"]}
 
     sa = bool(row[0])
     feature_ids = set(row[1] or [])
@@ -356,4 +372,5 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
         "notes": sa or FeatureID.NOTES in feature_ids,
         "education": sa or FeatureID.EDUCATION_DASH in feature_ids,
         "project_docs": sa or FeatureID.PROJECT_DOCS in feature_ids,
+        "sg_office_internal": sa or FeatureID.SG_OFFICE_INTERNAL in feature_ids,
     }
