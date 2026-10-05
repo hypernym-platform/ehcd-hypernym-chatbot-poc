@@ -365,6 +365,14 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Only meetings scheduled on exactly this date (YYYY-MM-DD).",
                     },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings scheduled today' — compares against today's date in the database, don't compute today's date yourself.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings this week' — computed server-side as the current Monday-Sunday week, don't compute the date range yourself.",
+                    },
                     "scheduled_after": {
                         "type": "string",
                         "description": "Only meetings scheduled on or after this date.",
@@ -379,7 +387,11 @@ TOOL_DEFINITIONS = [
                     },
                     "older_than_days": {
                         "type": "integer",
-                        "description": "Only requests created more than this many days ago — use for 'stalled'/'waiting too long' style questions instead of computing a date yourself.",
+                        "description": "Only requests created more than this many days ago. For 'stalled' specifically, prefer the dedicated `stalled` filter instead.",
+                    },
+                    "stalled": {
+                        "type": "boolean",
+                        "description": "Set true for 'stalled meetings' — requests still New or Under Review (nothing confirmed, no response yet) that have been sitting for a few days. Computed server-side, don't try to express this via status+older_than_days yourself.",
                     },
                     "participant": {
                         "type": "string",

@@ -25,10 +25,16 @@ class FeatureID:
     SG_OFFICE_INTERNAL = 10  # Internal Directions tab (email/memos/weekly
                              # actions) — viewable by H.E., Shamma, and
                              # Theyab per the SG Office internal workflow
-                             # spec. Grant via role_and_access_role_features
-                             # same as any other feature; no DB row exists
-                             # for it yet, so no one has access until one is
-                             # added.
+                             # spec.
+    SG_OFFICE_EXTERNAL = 11  # External Meetings/Visitors/Facilities tab.
+                             # Neither of these two has a row in
+                             # role_and_access_feature / role_and_access_role_features
+                             # in prod yet (confirmed 2026-10: catalog only
+                             # has ids 1-9) — grant via that table like any
+                             # other feature once these roles are defined;
+                             # until then db_has_feature() always returns
+                             # False for them, which is exactly why neither
+                             # gate is actually called yet (see db_queries.py).
 
 
 def is_superadmin(conn, user_id: int) -> bool:
@@ -119,6 +125,12 @@ def has_sg_office_internal_access(conn, user_id: int) -> bool:
     ownership-based like projects/tasks/resolutions, since all three named
     roles see the same shared data."""
     return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_INTERNAL)
+
+
+def has_sg_office_external_access(conn, user_id: int) -> bool:
+    """H.E., Shamma, and Theyab all see the External Meetings/Visitors/
+    Facilities tab — same flat view/no-view gate as the internal one."""
+    return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_EXTERNAL)
 
 
 # ---------------------------------------------------------------------------

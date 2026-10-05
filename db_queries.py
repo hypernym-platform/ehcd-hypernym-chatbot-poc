@@ -21,9 +21,8 @@ from rbac import (
     user_can_access_sg_office,
     user_can_access_task,
     user_can_access_resolution,
-    # has_sg_office_internal_access,  # TEMPORARILY unused — see note above
-    # list_sg_office_emails/get_sg_office_email_details; re-enable once
-    # H.E./Shamma/Theyab roles actually exist.
+    has_sg_office_internal_access,
+    has_sg_office_external_access,
 )
 
 # ---------------------------------------------------------------------------
@@ -456,19 +455,26 @@ def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
 # ---------------------------------------------------------------------------
 # SG OFFICE — INTERNAL DIRECTIONS (email correspondence)
 #
-# mailbox tables (sg_office_email / sg_office_emailthread / sg_office_emailattachment) —
-# internal-tab spec describes (H.E. direction, assigned owner, deadline, status). 
-# "awaiting H.E.direction", "overdue directions", "waiting for a response", "due this
-# week", "assigned to X" — all of those describe the not-yet-built workflow
-# layer, not the raw email. What IS real and queryable: the AI-generated
-# `summary` column on both sg_office_email and sg_office_emailthread (the
-# module's existing AI summary feature) — ask the model to summarize/read
-# it directly off a fetched email or thread, no separate tool needed.
+# Read-only for now: the DB only has the raw synced-mailbox tables
+# (sg_office_email / sg_office_emailthread / sg_office_emailattachment) —
+# there's no table/column yet for the workflow layer the internal-tab spec
+# describes (H.E. direction, assigned owner, deadline, status). Questions
+# like "awaiting H.E. direction", "overdue directions", "waiting for a
+# response", "due this week", "assigned to X" all describe that not-yet-
+# built workflow layer, not the raw email. What IS real and queryable: the
+# AI-generated `summary` column on both sg_office_email and
+# sg_office_emailthread (the module's existing AI summary feature) — ask
+# the model to summarize/read it directly off a fetched email or thread, no
+# separate tool needed.
+#
 # TEMPORARY: rbac.has_sg_office_internal_access() exists and is NOT called
-# here — per explicit instruction, the real H.E./Shamma/Theyab accounts and
-# roles don't exist yet, so access is unrestricted (same as every other
-# authenticated chatbot user) until those roles are actually assigned. Wire
-# the gate back in before this reaches prod — see rbac.has_sg_office_internal_access.
+# here. Confirmed directly against prod (2026-10): role_and_access_feature
+# only has ids 1-9, nothing for SG_OFFICE_INTERNAL (10) — no role has it
+# assigned, so calling the gate right now would block everyone except
+# superadmins, not just restrict to H.E./Shamma/Theyab as intended. Per
+# explicit instruction, access stays open to every authenticated chatbot
+# user until a real role is granted that feature in role_and_access_role_features
+# — wire the gate back in then; see rbac.has_sg_office_internal_access.
 # ---------------------------------------------------------------------------
 
 def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
@@ -666,8 +672,11 @@ def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
 # limited by missing schema the way the email ones are.
 #
 # TEMPORARY: same as Internal Directions — unrestricted access, no RBAC gate
-# called here, per explicit instruction (real role assignments don't exist
-# yet). Wire in an access check before this reaches prod.
+# called here. Confirmed directly against prod (2026-10): role_and_access_feature
+# only has ids 1-9, nothing for SG_OFFICE_EXTERNAL (11) — no role has it
+# assigned, so calling rbac.has_sg_office_external_access() right now would
+# block everyone except superadmins. Wire it in once a real role is granted
+# that feature in role_and_access_role_features.
 # ---------------------------------------------------------------------------
 
 def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
@@ -769,6 +778,18 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         conditions.append("m.scheduled_date = %s")
         params.append(filters["scheduled_on"])
 
+    if filters.get("scheduled_today"):
+        # Deterministic — don't make the model compute "today" itself.
+        conditions.append("m.scheduled_date = CURRENT_DATE")
+
+    if filters.get("scheduled_this_week"):
+        # ISO week (Monday-Sunday) containing today, computed in SQL so the
+        # model never has to work out week boundaries itself.
+        conditions.append(
+            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
+            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+        )
+
     if filters.get("created_after"):
         conditions.append("m.created_at::date >= %s")
         params.append(filters["created_after"])
@@ -776,6 +797,15 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
     if filters.get("older_than_days"):
         conditions.append("m.created_at::date < (CURRENT_DATE - (%s || ' days')::interval)")
         params.append(filters["older_than_days"])
+
+    if filters.get("stalled"):
+        # "Stalled" per the Theyab workspace spec = still New/Under Review
+        # (nothing confirmed, no response) and sitting for a while — 3 days
+        # is this function's own default for "a while"; pass older_than_days
+        # instead for a custom threshold on an unconfirmed request.
+        conditions.append(
+            "m.status IN (1, 2) AND m.created_at::date < (CURRENT_DATE - INTERVAL '3 days')"
+        )
 
     if filters.get("participant"):
         clause, p = _multi_word_ilike("u.full_name_en", filters["participant"])
