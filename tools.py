@@ -63,11 +63,27 @@ TOOL_DEFINITIONS = [
                                         },
                     "start_date": {
                         "type": "string",
-                        "description": "Only projects whose start date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'.",
+                        "description": "Only projects whose start date is EXACTLY this full date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'. If the user only named a month and/or year ('starting in September', 'started in 2026') and not a specific day, use start_month/start_year instead — do NOT guess a day here, it will almost never match a real row.",
                     },
                     "end_date": {
                         "type": "string",
-                        "description": "Only projects whose end date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or before'.",
+                        "description": "Only projects whose end date is EXACTLY this full date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or before'. If the user only named a month and/or year, use end_month/end_year instead — do NOT guess a day here.",
+                    },
+                    "start_month": {
+                        "type": "integer",
+                        "description": "Only projects whose start date falls in this month (1-12), regardless of day/year — use for 'projects starting in September' style questions.",
+                    },
+                    "start_year": {
+                        "type": "integer",
+                        "description": "Only projects whose start date falls in this year, regardless of month/day.",
+                    },
+                    "end_month": {
+                        "type": "integer",
+                        "description": "Only projects whose end date falls in this month (1-12), regardless of day/year.",
+                    },
+                    "end_year": {
+                        "type": "integer",
+                        "description": "Only projects whose end date falls in this year, regardless of month/day.",
                     },
                     "overdue": {
                         "type": "boolean",
@@ -561,11 +577,29 @@ Tool selection rules:
 1. For structured data (projects, SG offices, tasks, resolutions) → use the list/get tools.
 2. For education statistics → use query_education_data (generate a SQLite SELECT query).
 3. For policy questions → use search_policy.
-4. You may call multiple tools if the question spans multiple domains.
+4. You may call multiple tools if the question spans multiple domains. This
+also applies WITHIN one entity: if the question names more than one disjoint
+criteria set for the SAME entity, call that same list tool MULTIPLE TIMES,
+once per criteria set — each call's filters are INDEPENDENT of the others,
+so only include a filter in a given call if it was actually asked for THAT
+group. Example: "delayed projects, ongoing projects with start date of
+September" needs two separate calls — one with status set to delayed and
+nothing else, and one with status set to in_progress and start_month set to
+9. The delayed call must NOT also get start_month, since that filter only
+applies to the "ongoing" group. Never let a filter from one named group leak
+into a different group's call, and never drop one of the groups just
+because it doesn't fit in a single call.
 5. If the question does NOT need any tools (greetings, general knowledge, casual conversation) → respond with a short text answer.
 6. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
-use the conversation history to identify what the user is referring to.
+use the conversation history to identify what the user is referring to. This
+is about resolving WHAT the user means, never about reusing a PAST ANSWER —
+if the current question asks for data (a list, count, chart, lookup), always
+call the tool(s) fresh and answer from that real result, even if the exact
+same question was already asked and answered earlier in this conversation.
+A prior answer in the history could have been wrong, or the underlying data
+could have changed since — never just repeat an earlier answer verbatim
+instead of re-querying.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 9. Whenever the question asks for a chart, graph, or visualization of an entity
 (projects, SG offices, tasks, resolutions, education stats) — even if it names

@@ -115,6 +115,28 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         conditions.append("p.end_date::date = %s")
         params.append(filters["end_date"])
 
+    # Month/year-only asks ("projects starting in September") have no exact
+    # day to match — forcing them through start_date's exact-equality check
+    # means the model has to guess a specific day, which almost never lands
+    # on a real row (e.g. real September starts here are the 11th/13th/25th/
+    # 30th, not the 1st) and silently returns zero results. These compare
+    # only the parts actually being asked about.
+    if filters.get("start_month"):
+        conditions.append("EXTRACT(MONTH FROM p.start_date) = %s")
+        params.append(filters["start_month"])
+
+    if filters.get("start_year"):
+        conditions.append("EXTRACT(YEAR FROM p.start_date) = %s")
+        params.append(filters["start_year"])
+
+    if filters.get("end_month"):
+        conditions.append("EXTRACT(MONTH FROM p.end_date) = %s")
+        params.append(filters["end_month"])
+
+    if filters.get("end_year"):
+        conditions.append("EXTRACT(YEAR FROM p.end_date) = %s")
+        params.append(filters["end_year"])
+
     if filters.get("overdue"):
         # Deterministic end_date-vs-today comparison in SQL — without this,
         # the model was left to eyeball "has this project's due date
