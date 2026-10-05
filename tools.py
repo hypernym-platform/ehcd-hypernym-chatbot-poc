@@ -1569,9 +1569,6 @@ def answer_node(state: ChatState) -> dict:
                 chunk_queue.put(text)
     except Exception as e:
         logger.error(f"OpenAI streaming error in answer node: {e}")
-        full_text = "I encountered an error processing your request. Please try again."
-        chunk_queue.put(full_text)
-    logger.info(f"[TIMING] answer_node total generation: {time.time() - _t0:.2f}s")
         # Only substitute the generic error text when NOTHING streamed yet.
         # A transient mid-stream drop (more likely on longer chart-summary
         # responses) can happen after real content already went out chunk
@@ -1583,6 +1580,7 @@ def answer_node(state: ChatState) -> dict:
         if not full_text:
             full_text = "I encountered an error processing your request. Please try again."
             chunk_queue.put(full_text)
+    logger.info(f"[TIMING] answer_node total generation: {time.time() - _t0:.2f}s")
 
     chunk_queue.put(None)  # Sentinel: end of stream
 
