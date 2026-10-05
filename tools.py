@@ -27,6 +27,12 @@ from db_queries import (
     get_task_details,
     list_resolutions,
     get_resolution_details,
+    list_sg_office_emails,
+    get_sg_office_email_details,
+    list_sg_office_meetings,
+    get_sg_office_meeting_details,
+    list_sg_office_meeting_facilities,
+    list_sg_office_meeting_visitors,
 )
 from edu_pg import execute_education_sql, EDU_SCHEMA_FOR_TOOL
 
@@ -63,6 +69,27 @@ TOOL_DEFINITIONS = [
                                             "type": "string",
                                             "description": "Filter by project_manager name (partial match)",
                                         },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Only projects whose start date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Only projects whose end date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or before'.",
+                    },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "Set to true when the user asks which projects have passed their due date / are overdue / are past deadline. Compares each project's end date to today's date in the database — do not try to work this out yourself from a plain project list.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Set to 'latest' whenever the user asks for the latest/most recent/newest project(s) — sorts by start date, most recent first. Omit for the default order.",
+                        "enum": ["latest"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of projects to return. Set this to match the count the user asked for, e.g. 'the 3 latest projects' -> limit=3, 'the latest project' (singular) -> limit=1. Omit to return all matching projects — never omit it when the user named a specific number or asked for a single one.",
+                    },
                 },
                 "required": [],
             },
@@ -147,6 +174,368 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "list_sg_office_emails",
+            "description": (
+                "List internal SG Office email correspondence (the Internal "
+                "Directions mailbox managed for H.E., Shamma, and Theyab). "
+                "Use when the user asks about SG Office emails, "
+                "correspondence, inbox, unread messages, or internal "
+                "directions received. Each email includes an AI-generated "
+                "`summary` field already — read it directly to answer "
+                "'summarize this' or 'what is this about' questions, no "
+                "separate summarization step needed. NOTE: there is no "
+                "field yet for H.E. direction, assigned owner, deadline, or "
+                "workflow status (that layer isn't built yet) — don't "
+                "invent an answer for 'awaiting H.E. direction', 'overdue "
+                "directions', 'assigned to X', or 'due this week'; say "
+                "plainly that this isn't tracked yet instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "is_read": {
+                        "type": "boolean",
+                        "description": "Filter to only read (true) or only unread (false) emails.",
+                    },
+                    "is_draft": {
+                        "type": "boolean",
+                        "description": "Filter to only drafts (true) or only sent/received messages (false).",
+                    },
+                    "flagged": {
+                        "type": "boolean",
+                        "description": "Filter to only Outlook-flagged emails (true) or only unflagged (false). The closest existing signal to 'needs attention' — combine with is_read for a fuller picture.",
+                    },
+                    "sender": {
+                        "type": "string",
+                        "description": "Filter by sender name or email (partial match)",
+                    },
+                    "recipient": {
+                        "type": "string",
+                        "description": "Filter by a name/email appearing in the To or CC recipients (partial match)",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Filter by subject text (partial match)",
+                    },
+                    "body_contains": {
+                        "type": "string",
+                        "description": "Filter by text appearing in the email body or its AI summary (partial match) — use for 'emails about X' style questions.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Filter by Outlook category tag (partial match)",
+                    },
+                    "importance": {
+                        "type": "string",
+                        "description": "Filter by importance level",
+                        "enum": ["low", "normal", "high"],
+                    },
+                    "has_attachments": {
+                        "type": "boolean",
+                        "description": "Filter to only emails that do/don't have attachments.",
+                    },
+                    "thread_id": {
+                        "type": "integer",
+                        "description": "Only emails belonging to this specific thread/conversation.",
+                    },
+                    "mailbox_owner": {
+                        "type": "string",
+                        "description": "Filter by the mailbox owner's name (partial match) — use if the user asks whose mailbox an email is in.",
+                    },
+                    "received_after": {
+                        "type": "string",
+                        "description": "Only emails received on or after this date (YYYY-MM-DD or MM-DD-YYYY).",
+                    },
+                    "received_before": {
+                        "type": "string",
+                        "description": "Only emails received on or before this date (YYYY-MM-DD or MM-DD-YYYY).",
+                    },
+                    "older_than_days": {
+                        "type": "integer",
+                        "description": "Only emails received more than this many days ago — use for 'open for more than N days' / 'older than a week' style questions instead of computing a date yourself.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Set to 'oldest' for oldest-received-first. Omit (default) for newest-first.",
+                        "enum": ["oldest"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of emails to return, e.g. 'the 5 latest emails' -> limit=5. Omit to return all matching emails.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sg_office_email_details",
+            "description": (
+                "Get the full content of a specific SG Office email, or an "
+                "entire email thread/conversation with all its messages "
+                "(or just the latest message with latest_only). Use when "
+                "the user asks to read/see the full content of a specific "
+                "email, wants the whole conversation on a topic, or asks "
+                "'what's the latest response/reply on this'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "integer",
+                        "description": "Database ID of a single email to retrieve.",
+                    },
+                    "thread_id": {
+                        "type": "integer",
+                        "description": "Database ID of an email thread/conversation to retrieve.",
+                    },
+                    "latest_only": {
+                        "type": "boolean",
+                        "description": "With thread_id, return only the most recent message in the thread instead of all of them. Use for 'what's the latest response/update on this thread'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meetings",
+            "description": (
+                "List external SG Office meeting/visit requests (Theyab's "
+                "Meetings & Visits board — organizations/visitors requesting "
+                "to meet SG Office leadership). Use for questions about "
+                "meeting requests, visits, visitor meetings, upcoming "
+                "meetings, or their status/priority/coordinator."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status. 'upcoming' means Confirmed or Rescheduled combined (matches the UI's 'Upcoming' count).",
+                        "enum": ["new", "under_review", "confirmed", "completed", "rescheduled", "cancelled", "upcoming"],
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "request_type": {
+                        "type": "string",
+                        "description": "Filter by request type. Only 'meeting' and 'official_visit' and 'facility_visit' are confirmed values in this system.",
+                        "enum": ["meeting", "official_visit", "facility_visit"],
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the INDIVIDUAL PERSON's name who requested the meeting, e.g. 'Ali Hassan Al Jaberi' — not the organization/company name (use `organization` for that). If the user's phrasing names a company/foundation/ministry/entity rather than a person, use `organization` instead.",
+                    },
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the requesting organization/company/entity name, e.g. 'Emirates Foundation' or 'Ministry of Economy' — not the individual person's name (use `requester` for that). If unsure which the user means and they named something that sounds like an entity rather than a person, prefer this field, or pass both.",
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Filter by requester email (partial match)",
+                    },
+                    "purpose_contains": {
+                        "type": "string",
+                        "description": "Filter by text in the purpose/notes (partial match) — use for 'meetings about X'.",
+                    },
+                    "coordinator": {
+                        "type": "string",
+                        "description": "Filter by the assigned coordinator's name (partial match)",
+                    },
+                    "created_by": {
+                        "type": "string",
+                        "description": "Filter by who created the request (partial match)",
+                    },
+                    "visitor_email_status": {
+                        "type": "string",
+                        "enum": ["sent", "not_sent"],
+                    },
+                    "is_confirmed": {
+                        "type": "boolean",
+                        "description": "Filter to only requests that have (true) or haven't (false) been formally confirmed.",
+                    },
+                    "notify_stakeholders": {
+                        "type": "boolean",
+                    },
+                    "scheduled_on": {
+                        "type": "string",
+                        "description": "Only meetings scheduled on exactly this date (YYYY-MM-DD).",
+                    },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings scheduled today' — compares against today's date in the database, don't compute today's date yourself.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings this week' — computed server-side as the current Monday-Sunday week, don't compute the date range yourself.",
+                    },
+                    "scheduled_after": {
+                        "type": "string",
+                        "description": "Only meetings scheduled on or after this date.",
+                    },
+                    "scheduled_before": {
+                        "type": "string",
+                        "description": "Only meetings scheduled on or before this date.",
+                    },
+                    "created_after": {
+                        "type": "string",
+                        "description": "Only requests created on or after this date.",
+                    },
+                    "older_than_days": {
+                        "type": "integer",
+                        "description": "Only requests created more than this many days ago. For 'stalled' specifically, prefer the dedicated `stalled` filter instead.",
+                    },
+                    "stalled": {
+                        "type": "boolean",
+                        "description": "Set true for 'stalled meetings' — requests still New or Under Review (nothing confirmed, no response yet) that have been sitting for a few days. Computed server-side, don't try to express this via status+older_than_days yourself.",
+                    },
+                    "participant": {
+                        "type": "string",
+                        "description": "Filter to meetings where this person (by name, partial match) is a listed participant.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["oldest"],
+                        "description": "Set to 'oldest' for oldest-first. Omit (default) for newest-first.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of meetings to return.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sg_office_meeting_details",
+            "description": (
+                "Get full detail for one specific meeting/visit request: "
+                "requester/schedule/venue info, participants, facility prep "
+                "tasks, visitor readiness, the post-meeting outcome (notes, "
+                "follow-up, who completed it) if the meeting already "
+                "happened, and the full status-change audit trail. Use "
+                "whenever the user asks about ONE specific meeting by name/"
+                "requester/organization, or asks for its 'readiness', "
+                "'facilities', 'participants', 'outcome', or 'audit trail'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Database ID of the meeting request. If you only have a requester/organization name, call list_sg_office_meetings first and use the exact `id` field of the matching row from its results — if multiple rows match, pick the one whose requester/organization/purpose text actually matches what the user described, don't just take the first one. NEVER invent or guess an id that didn't appear in a real tool result.",
+                    },
+                },
+                "required": ["meeting_request_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meeting_facilities",
+            "description": (
+                "Cross-meeting facility-preparation tracker — e.g. 'which "
+                "facility requests are unassigned', 'what facility prep is "
+                "overdue', 'show facility tasks assigned to X'. Spans all "
+                "meetings at once, unlike get_sg_office_meeting_details "
+                "which is scoped to one meeting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Only 'not_confirmed' is a confirmed value in this system.",
+                        "enum": ["not_confirmed"],
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "unassigned": {
+                        "type": "boolean",
+                        "description": "Filter to only facility tasks with no one assigned (true) or with someone assigned (false).",
+                    },
+                    "assigned_to": {
+                        "type": "string",
+                        "description": "Filter by assignee name (partial match)",
+                    },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "Set true for facility tasks whose due date has passed and aren't yet confirmed — computed server-side against today's date, don't compute it yourself.",
+                    },
+                    "due_before": {
+                        "type": "string",
+                        "description": "Only facility tasks due on or before this date.",
+                    },
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Only facility tasks for this one meeting.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meeting_visitors",
+            "description": (
+                "Cross-meeting visitor readiness tracker — e.g. 'which "
+                "visitors haven't arrived', 'whose readiness is not "
+                "confirmed', 'did the visitor email fail for anyone'. Spans "
+                "all meetings at once, unlike get_sg_office_meeting_details "
+                "which is scoped to one meeting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "readiness_status": {
+                        "type": "string",
+                        "description": "Only 'not_confirmed' is a confirmed value in this system.",
+                        "enum": ["not_confirmed"],
+                    },
+                    "arrived": {
+                        "type": "boolean",
+                        "description": "Filter to only visitors who have (true) or haven't (false) been marked arrived.",
+                    },
+                    "email_failed": {
+                        "type": "boolean",
+                        "description": "Filter to visitors whose visitor-info email failed to send.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Filter by visitor name (partial match)",
+                    },
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Only visitors for this one meeting.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_tasks",
             "description": (
                 "List task management items. Use when user asks about tasks, "
@@ -168,6 +557,14 @@ TOOL_DEFINITIONS = [
                     "requires_presentation": {
                         "type": "boolean",
                         "description": "Filter tasks requiring main council presentation",
+                    },
+                    "request_date": {
+                        "type": "string",
+                        "description": "Only tasks whose request date is EXACTLY this date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'.",
+                    },
+                    "advisor": {
+                        "type": "string",
+                        "description": "Filter by advisor name assigned to the task (partial match)",
                     },
                 },
                 "required": [],
@@ -242,7 +639,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "resolution_id": {
                         "type": "integer",
-                        "description": "Resolution database ID",
+                        "description": "The resolution's tracking ID (the resolution_id field shown in list_resolutions results, e.g. 76924319) — not an internal database row number.",
                     },
                     "resolution_topic": {
                         "type": "string",
@@ -480,6 +877,26 @@ def execute_tool(
                 sg_office_id=arguments.get("sg_office_id"),
                 sg_office_name=arguments.get("sg_office_name"),
             )
+        elif tool_name == "list_sg_office_emails":
+            result = list_sg_office_emails(conn, user_id, filters=arguments)
+        elif tool_name == "get_sg_office_email_details":
+            result = get_sg_office_email_details(
+                conn, user_id,
+                email_id=arguments.get("email_id"),
+                thread_id=arguments.get("thread_id"),
+                latest_only=bool(arguments.get("latest_only")),
+            )
+        elif tool_name == "list_sg_office_meetings":
+            result = list_sg_office_meetings(conn, user_id, filters=arguments)
+        elif tool_name == "get_sg_office_meeting_details":
+            result = get_sg_office_meeting_details(
+                conn, user_id,
+                meeting_request_id=arguments.get("meeting_request_id"),
+            )
+        elif tool_name == "list_sg_office_meeting_facilities":
+            result = list_sg_office_meeting_facilities(conn, user_id, filters=arguments)
+        elif tool_name == "list_sg_office_meeting_visitors":
+            result = list_sg_office_meeting_visitors(conn, user_id, filters=arguments)
         elif tool_name == "list_tasks":
             result = list_tasks(conn, user_id, filters=arguments)
         elif tool_name == "get_task_details":
@@ -650,6 +1067,17 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
         TOOL_DEFS_BY_NAME["list_resolutions"],
         TOOL_DEFS_BY_NAME["get_resolution_details"],
         TOOL_DEFS_BY_NAME["search_policy"],
+        # TEMPORARY: unconditional, not gated behind flags.get("sg_office_internal")
+        # — the real H.E./Shamma/Theyab accounts/roles don't exist yet, so
+        # per explicit instruction everyone gets access for now. Gate this
+        # behind flags.get("sg_office_internal") once those roles exist —
+        # see rbac.has_sg_office_internal_access (already written, unused).
+        TOOL_DEFS_BY_NAME["list_sg_office_emails"],
+        TOOL_DEFS_BY_NAME["get_sg_office_email_details"],
+        TOOL_DEFS_BY_NAME["list_sg_office_meetings"],
+        TOOL_DEFS_BY_NAME["get_sg_office_meeting_details"],
+        TOOL_DEFS_BY_NAME["list_sg_office_meeting_facilities"],
+        TOOL_DEFS_BY_NAME["list_sg_office_meeting_visitors"],
     ]
 
     if flags.get("education"):
@@ -667,16 +1095,32 @@ ROUTER_SYSTEM_PROMPT = """You are a tool routing assistant for the Education, Hu
 Your ONLY job is to decide which tools to call based on the user's question. Do NOT answer the question yourself.
 
 Tool selection rules:
-1. For structured data (projects, SG offices, tasks, resolutions) → use the list/get tools.
+1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities) → use the list/get tools.
 2. For education statistics → use query_education_data (generate a SQLite SELECT query).
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains.
 5. If the question does NOT need any tools (greetings, general knowledge, casual conversation) → respond with a short text answer.
-6. If tool results are already present in the conversation from previous call and they contain enough data to answer the question, do NOT call more tools — just respond with a short text so the answer node can format the full response.
-7. When the current question refers to a previous request using words such as
+6. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
 use the conversation history to identify what the user is referring to.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
+9. Whenever the question asks for a chart, graph, or visualization of an entity
+(projects, SG offices, tasks, resolutions, education stats) — even if it names
+no specific field, e.g. "generate a chart of tasks" — you MUST call the
+matching list/get/query tool for that entity before responding, exactly as
+rule 1 says for structured data. A chart cannot be drawn from data you never
+fetched. Never skip the tool call just because the request sounds like it's
+only asking for a picture.
+10. When a "get details" tool needs a database id (project_id, task_id,
+resolution_id, email_id, thread_id, meeting_request_id, etc.) and the user
+only gave you a name/description, call ONLY the matching "list" tool in this
+turn — do NOT also call the "get details" tool in the same turn, since you
+cannot know the real id until you see the list results. Wait for the next
+round, read the real id off the row that actually matches what the user
+described (if several rows match, pick the one whose details — name/org/
+subject/purpose — genuinely match, never just the first one), and call
+"get details" with that id then. Never invent or guess an id that didn't
+literally appear in a tool result.
 User information:
 - Name: {user_name}
 - Role: {user_role}
@@ -1128,6 +1572,17 @@ def answer_node(state: ChatState) -> dict:
         full_text = "I encountered an error processing your request. Please try again."
         chunk_queue.put(full_text)
     logger.info(f"[TIMING] answer_node total generation: {time.time() - _t0:.2f}s")
+        # Only substitute the generic error text when NOTHING streamed yet.
+        # A transient mid-stream drop (more likely on longer chart-summary
+        # responses) can happen after real content already went out chunk
+        # by chunk — pushing the error text the same way here would just
+        # glue it onto the end of that real text with no separator, reading
+        # as one garbled sentence. Once partial content is out, retracting
+        # it isn't possible, so the honest move is to end the stream as-is
+        # rather than visibly append a confusing second message.
+        if not full_text:
+            full_text = "I encountered an error processing your request. Please try again."
+            chunk_queue.put(full_text)
 
     chunk_queue.put(None)  # Sentinel: end of stream
 

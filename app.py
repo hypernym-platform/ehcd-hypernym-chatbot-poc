@@ -62,6 +62,7 @@ from voice_bridge import (
     VoiceBridgeError,
     VOICE_SESSION_TOKEN_TTL_SECONDS,
 )
+from chart_engine import detect_chart_opportunity, is_chart_request
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG & LOGGING
@@ -637,6 +638,30 @@ async def handle_query(
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
 
+        # The model always assumes a chart will be attached whenever the
+        # query sounds chart-like (per ANSWER_SYSTEM_PROMPT's CHARTS
+        # section) — it has no way to know chart detection, which runs
+        # after its response is already generated, ended up finding nothing
+        # chartable (e.g. the requested field doesn't exist for that entity,
+        # like a task's "budget"). Without this, the model's text falsely
+        # claims a chart is coming when none will ever show up.
+        if is_chart_request(query) and not chart_data:
+            assistant_response = (
+                "<p>I couldn't generate a chart for this — the data needed "
+                "for it wasn't found. It may not exist for what you asked "
+                "about, or there wasn't enough of it to compare.</p>"
+            )
+        elif chart_data and chart_data.get("no_budget_entities_present"):
+            # Tasks and council affairs (resolutions) have no budget field
+            # in this schema at all, so a budget chart that mixed them in
+            # with projects/SG offices only covers the latter. Append a
+            # plain note rather than touching the model's own text.
+            assistant_response += (
+                "<p>Note: tasks and council affairs do not have any "
+                "allocated budget data in the system, so they aren't "
+                "included in this chart.</p>"
+            )
+
         # Deterministic data HTML (see render_tool_result_html in tools.py) —
         # placed ahead of the model's own <p> summary so the complete,
         # correctly-tagged data always reaches the client regardless of what
@@ -960,6 +985,21 @@ async def websocket_chat(ws: WebSocket):
                 )
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
+
+            # Same honest-fallback reasoning as the REST endpoint — see the
+            # comment there.
+            if is_chart_request(query) and not chart_data:
+                assistant_response = (
+                    "<p>I couldn't generate a chart for this — the data needed "
+                    "for it wasn't found. It may not exist for what you asked "
+                    "about, or there wasn't enough of it to compare.</p>"
+                )
+            elif chart_data and chart_data.get("no_budget_entities_present"):
+                assistant_response += (
+                    "<p>Note: tasks and council affairs do not have any "
+                    "allocated budget data in the system, so they aren't "
+                    "included in this chart.</p>"
+                )
 
             # Deterministic data HTML (see render_tool_result_html in
             # tools.py) — placed ahead of the model's own <p> summary, same

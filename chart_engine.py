@@ -9,17 +9,44 @@ from typing import Any, Dict, List, Optional
 
 # Brown color palette as specified
 BROWN_COLORS = [
-    "#8B4513",  # SaddleBrown
-    "#A0522D",  # Sienna
-    "#CD853F",  # Peru
-    "#DEB887",  # BurlyWood
-    "#D2691E",  # Chocolate
-    "#BC8F8F",  # RosyBrown
-    "#F4A460",  # SandyBrown
-    "#DAA520",  # GoldenRod
-    "#B8860B",  # DarkGoldenRod
-    "#D2B48C",  # Tan
+    "#EFE7C5",  # Sunlight
+    "#ECECE5",  # Linen
+    "#A7997C",  # Taupe
+    "#7D8C7F",  # Mangrove
+    "#917050",  # Earth
+    "#B4B99E",  # Muted Green
+    "#000000",  # Black
 ]
+
+#BROWN_COLORS = [
+#    "#8B4513",  # SaddleBrown
+#    "#A0522D",  # Sienna
+#    "#CD853F",  # Peru
+#    "#DEB887",  # BurlyWood
+#    "#D2691E",  # Chocolate
+#    "#BC8F8F",  # RosyBrown
+#    "#F4A460",  # SandyBrown
+#    "#DAA520",  # GoldenRod
+#    "#B8860B",  # DarkGoldenRod
+#    "#D2B48C",  # Tan
+#]
+
+
+def is_chart_request(query: str) -> bool:
+    """
+    True if the query's own wording asks for a chart/graph, independent of
+    whether chartable data actually exists. Shared with app.py so it can
+    tell when the model's response claims a chart is coming but
+    detect_chart_opportunity ended up unable to build one (e.g. the
+    requested field doesn't exist for that entity, like a task's "budget")
+    — the model has no way to know that in advance, since chart detection
+    runs after its response is already generated.
+    """
+    query_lower = query.lower()
+    return any(
+        w in query_lower
+        for w in ["chart", "graph", "visualiz", "diagram", "compare budget", "pie", "bar chart"]
+    )
 
 
 def detect_chart_opportunity(
@@ -33,14 +60,19 @@ def detect_chart_opportunity(
     """
     query_lower = query.lower()
 
-    # Check if user explicitly asks for chart/graph
-    explicit_chart = any(
-        w in query_lower
-        for w in ["chart", "graph", "visualiz", "diagram", "compare budget", "pie", "bar chart"]
-    )
-
-    if not explicit_chart:
+    if not is_chart_request(query):
         return None
+
+    # Most specific case first: a query naming BOTH a single budget metric
+    # (e.g. "spent") AND a grouping dimension (e.g. "by department") needs
+    # one trace per group, each covering only its own projects — a shape
+    # the shared labels/datasets pipeline below (one flat series per metric,
+    # all projects on one shared x-axis) can't produce. Handled separately
+    # and returns its own complete payload; falls through to the normal
+    # cases if the query isn't this specific or the grouped data is empty.
+    grouped_chart = _extract_grouped_budget_chart(query_lower, tool_results)
+    if grouped_chart:
+        return grouped_chart
 
     # Try to extract chartable data from tool results
     chart_data = _extract_chart_data(query_lower, tool_results)
@@ -57,7 +89,7 @@ def detect_chart_opportunity(
     # Generate Plotly config (data + layout, no hardcoded container ID)
     plotly_config = _build_plotly_config(chart_type, labels, datasets)
 
-    return {
+    result = {
         "chart_type": chart_type,
         "plotly_data": plotly_config["data"],
         "plotly_layout": plotly_config["layout"],
@@ -65,6 +97,227 @@ def detect_chart_opportunity(
             "total_items": len(labels),
             "labels": labels[:20],
         },
+    }
+    if chart_data.get("no_budget_entities_present"):
+        result["no_budget_entities_present"] = True
+    return result
+
+
+_METRIC_KEYWORDS = [
+    (["spent", "expenditure", "expense"], "spent_budget", "Spent Budget"),
+    (["remaining", "unused", "budget left"], "budget_left", "Remaining Budget"),
+    (["allocated", "allocation"], "allocated_budget", "Allocated Budget"),
+]
+
+
+def _detect_budget_metrics(query_lower: str) -> List[tuple]:
+    """Returns [(field_name, display_label), ...] for every budget metric
+    the query names — e.g. "spent vs allocated" returns both. Empty if the
+    query doesn't name any specific one (e.g. just "budget" generally),
+    which leaves the existing all-three-metrics comparison to handle it."""
+    return [
+        (field, label)
+        for keywords, field, label in _METRIC_KEYWORDS
+        if any(k in query_lower for k in keywords)
+    ]
+
+
+_GROUP_KEYWORDS = [
+    (["department", "category", "sector"], "category"),
+    (["manager"], "manager"),
+    (["status"], "status"),
+]
+
+
+def _detect_group_field(query_lower: str) -> Optional[str]:
+    """Returns a group KEY (not a literal column name) since the right
+    field differs by entity shape — e.g. status is "status_label" on SG
+    offices but "status_en" on projects. _group_value() below resolves it
+    per item. "Department"/"sector" aren't real columns; projects and SG
+    offices only have category_name, and that's what users mean by either."""
+    for keywords, group_key in _GROUP_KEYWORDS:
+        if any(k in query_lower for k in keywords):
+            return group_key
+    return None
+
+
+def _group_value(item: Dict, group_key: str) -> Optional[str]:
+    if group_key == "category":
+        return item.get("category_name")
+    if group_key == "manager":
+        return item.get("manager_name")
+    if group_key == "status":
+        return item.get("status_label") or item.get("status_en") or item.get("status")
+    return None
+
+
+def _extract_grouped_budget_chart(
+    query_lower: str, tool_results: List[Dict]
+) -> Optional[Dict]:
+    """
+    Handle queries naming a budget metric (or several, e.g. "spent vs
+    allocated") together with a grouping dimension (category/department,
+    manager, or status), e.g. "line chart of budget spent on each project
+    segmented by department". Returns the complete chart payload directly.
+
+    Single metric -> one trace per group, each plotting only the projects
+    in that group (keeps per-project detail — good for spotting which
+    project drives a group's total).
+    Multiple metrics -> one trace per METRIC instead, x-axis is the groups
+    themselves, values summed per group (comparing metrics side by side
+    across groups is the more readable shape once there's more than one
+    number per group; per-project-by-metric would be metrics × projects
+    traces, unreadable past a handful of projects).
+    """
+    if not tool_results:
+        return None
+
+    metrics = _detect_budget_metrics(query_lower)
+    group_key = _detect_group_field(query_lower)
+    if not metrics or not group_key:
+        return None
+
+    chart_type = _infer_chart_type(query_lower, [])
+    dashed = any(w in query_lower for w in ["dotted", "dashed"])
+
+    layout = {
+        "title": "",
+        "paper_bgcolor": "rgba(0,0,0,0)",
+        "plot_bgcolor": "rgba(0,0,0,0)",
+        "font": {"family": "Arial, sans-serif", "size": 12},
+        "legend": {"orientation": "h", "y": -0.2},
+    }
+
+    if len(metrics) == 1:
+        metric_field, metric_label = metrics[0]
+        rows = []
+        for item in tool_results:
+            name = item.get("project_name_en") or item.get("sg_office_name_en")
+            val = _to_float(item.get(metric_field))
+            if name and val is not None:
+                group = str(_group_value(item, group_key) or "Uncategorized")
+                rows.append((name, group, val))
+
+        if not rows:
+            return None
+
+        grouped: Dict[str, List] = {}
+        for name, group, val in rows:
+            grouped.setdefault(group, []).append((name, val))
+
+        if chart_type == "pie":
+            # A pie has no x-axis / per-project concept — sum per group.
+            pie_labels = list(grouped.keys())
+            pie_values = [sum(v for _, v in items) for items in grouped.values()]
+            traces = [{
+                "labels": pie_labels,
+                "values": pie_values,
+                "type": "pie",
+                "marker": {"colors": BROWN_COLORS[:len(pie_labels)]},
+                "name": metric_label,
+            }]
+        else:
+            traces = []
+            for i, (group_name, items) in enumerate(grouped.items()):
+                color = BROWN_COLORS[i % len(BROWN_COLORS)]
+                x_values = [n for n, _ in items]
+                y_values = [v for _, v in items]
+                if chart_type == "line":
+                    line_style = {"color": color}
+                    if dashed:
+                        line_style["dash"] = "dot"
+                    traces.append({
+                        "x": x_values, "y": y_values,
+                        "type": "scatter", "mode": "lines+markers",
+                        "name": group_name, "line": line_style,
+                    })
+                else:
+                    traces.append({
+                        "x": x_values, "y": y_values,
+                        "type": "bar", "name": group_name,
+                        "marker": {"color": color},
+                    })
+            layout["xaxis"] = {"title": "Project"}
+            layout["yaxis"] = {"title": metric_label}
+            if chart_type == "bar":
+                layout["barmode"] = "group"
+
+        all_labels = [name for name, _, _ in rows]
+        audit = {
+            "total_items": len(rows),
+            "labels": all_labels[:20],
+            "metric_fields": [metric_field],
+            "group_field": group_key,
+            "groups": list(grouped.keys()),
+        }
+    else:
+        # Multiple metrics: aggregate to one total per group per metric.
+        group_totals: Dict[str, Dict[str, float]] = {}
+        for item in tool_results:
+            if not (item.get("project_name_en") or item.get("sg_office_name_en")):
+                continue
+            group = str(_group_value(item, group_key) or "Uncategorized")
+            for metric_field, _ in metrics:
+                val = _to_float(item.get(metric_field))
+                if val is not None:
+                    bucket = group_totals.setdefault(group, {})
+                    bucket[metric_field] = bucket.get(metric_field, 0) + val
+
+        if not group_totals:
+            return None
+
+        group_names = list(group_totals.keys())
+
+        if chart_type == "pie":
+            # Pie can only show one metric's proportions — use the first
+            # named one rather than trying to merge several into one ring.
+            metric_field, metric_label = metrics[0]
+            pie_values = [group_totals[g].get(metric_field, 0) for g in group_names]
+            traces = [{
+                "labels": group_names,
+                "values": pie_values,
+                "type": "pie",
+                "marker": {"colors": BROWN_COLORS[:len(group_names)]},
+                "name": metric_label,
+            }]
+        else:
+            traces = []
+            for i, (metric_field, metric_label) in enumerate(metrics):
+                color = BROWN_COLORS[i % len(BROWN_COLORS)]
+                y_values = [group_totals[g].get(metric_field, 0) for g in group_names]
+                if chart_type == "line":
+                    line_style = {"color": color}
+                    if dashed:
+                        line_style["dash"] = "dot"
+                    traces.append({
+                        "x": group_names, "y": y_values,
+                        "type": "scatter", "mode": "lines+markers",
+                        "name": metric_label, "line": line_style,
+                    })
+                else:
+                    traces.append({
+                        "x": group_names, "y": y_values,
+                        "type": "bar", "name": metric_label,
+                        "marker": {"color": color},
+                    })
+            layout["xaxis"] = {"title": group_key.title()}
+            layout["yaxis"] = {"title": "Budget"}
+            if chart_type == "bar":
+                layout["barmode"] = "group"
+
+        audit = {
+            "total_items": len(group_names),
+            "labels": group_names[:20],
+            "metric_fields": [f for f, _ in metrics],
+            "group_field": group_key,
+            "groups": group_names,
+        }
+
+    return {
+        "chart_type": chart_type,
+        "plotly_data": traces,
+        "plotly_layout": layout,
+        "audit": audit,
     }
 
 
@@ -123,6 +376,15 @@ def _extract_chart_data(
 
     if budget_items:
         labels = [b["name"] for b in budget_items]
+        # Tasks and council affairs (resolutions) have no budget field in
+        # this schema at all, so if the tool data mixed them in with
+        # projects/SG offices, they were silently skipped above — flag that
+        # here so the caller can add a plain note instead of leaving the
+        # model's text implying full coverage.
+        has_no_budget_entity = any(
+            (item.get("task_name") or item.get("resolution_topic_en"))
+            for item in tool_results
+        )
         return {
             "labels": labels,
             "datasets": [
@@ -130,30 +392,24 @@ def _extract_chart_data(
                 {"label": "Spent", "data": [b["spent"] for b in budget_items]},
                 {"label": "Remaining", "data": [b["left"] for b in budget_items]},
             ],
-            "chart_type": "bar",
+            "no_budget_entities_present": has_no_budget_entity,
         }
+
+    # The query explicitly asked for budget data, but no item had a usable
+    # budget field (e.g. the user's role lacks Budget Info access, so
+    # list_projects never attached allocated_budget/spent_budget to the
+    # results). Stop here instead of falling through to the generic
+    # fallbacks below — those would happily chart whatever OTHER numeric
+    # field survives (status codes, manager IDs, ...) as if it were the
+    # requested budget data, producing a real-looking but meaningless chart.
+    if "budget" in query_lower:
+        return None
 
     # Case 2: Status distribution
     if any(w in query_lower for w in ["status", "distribution", "breakdown", "pie"]):
-        status_counts = {}
-        for item in tool_results:
-            status = (
-                item.get("status_label")
-                or item.get("status_en")
-                or item.get("status")
-            )
-            if status:
-                label = str(status)
-                status_counts[label] = status_counts.get(label, 0) + 1
-
-        if len(status_counts) >= 2:
-            labels = list(status_counts.keys())
-            values = list(status_counts.values())
-            return {
-                "labels": labels,
-                "datasets": [{"label": "Count", "data": values}],
-                "chart_type": "pie",
-            }
+        status_chart = _status_distribution_chart(tool_results)
+        if status_chart:
+            return status_chart
 
     # Case 3: Homogeneous row dicts (e.g. SQL query results like
     # {"year": 2022, "total_students": 509738, "total_schools": 776}) —
@@ -190,7 +446,36 @@ def _extract_chart_data(
             "chart_type": "bar",
         }
 
-    return None
+    # Case 5: Last resort. The query asked for *a* chart of some entity list
+    # (e.g. "generate a chart of tasks") without naming any specific numeric
+    # field, and none of the cases above found one — tasks in particular
+    # have no numeric fields at all (no budget, no count column). Status is
+    # the one dimension every entity list here actually has, so fall back to
+    # a status-distribution chart instead of giving up outright.
+    return _status_distribution_chart(tool_results)
+
+
+def _status_distribution_chart(tool_results: List[Dict]) -> Optional[Dict]:
+    """Count items by status field and return chart_data, or None if fewer
+    than 2 distinct statuses are present (nothing meaningful to compare)."""
+    status_counts = {}
+    for item in tool_results:
+        status = (
+            item.get("status_label")
+            or item.get("status_en")
+            or item.get("status")
+        )
+        if status:
+            label = str(status)
+            status_counts[label] = status_counts.get(label, 0) + 1
+
+    if len(status_counts) < 2:
+        return None
+
+    return {
+        "labels": list(status_counts.keys()),
+        "datasets": [{"label": "Count", "data": list(status_counts.values())}],
+    }
 
 
 def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
@@ -214,8 +499,16 @@ def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
 
     EXCLUDE = {"id", "task_id", "resolution_id"}
 
-    # Prefer a conventionally-named category column for the x-axis.
-    preferred_label_cols = ["year", "label", "name", "category", "region", "period", "sector"]
+    # Prefer a conventionally-named category column for the x-axis. Entity
+    # "name" fields come first — without this, the generic fallback below
+    # picks whichever non-numeric column sorts alphabetically first, which
+    # for tasks/offices/resolutions is usually "category_name" (a shared,
+    # repeated value across rows), not the field that actually identifies
+    # each individual record (e.g. task_name).
+    preferred_label_cols = [
+        "task_name", "project_name_en", "sg_office_name_en", "resolution_topic_en",
+        "year", "label", "name", "category", "region", "period", "sector",
+    ]
     label_col = next((c for c in preferred_label_cols if c in common_keys), None)
 
     # Otherwise pick the first column that isn't purely numeric across all rows.

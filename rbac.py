@@ -15,13 +15,26 @@ DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
 
 
 class FeatureID:
-    USER_MANAGEMENT = 3
-    BUDGET_INFO     = 4
-    EDUCATION_DASH  = 5
-    ALL_PROJECTS    = 6
-    NOTES           = 7
-    PROJECT_DOCS    = 8
-    AI_CHATBOT      = 9
+    USER_MANAGEMENT    = 3
+    BUDGET_INFO        = 4
+    EDUCATION_DASH     = 5
+    ALL_PROJECTS       = 6
+    NOTES              = 7
+    PROJECT_DOCS       = 8
+    AI_CHATBOT         = 9
+    SG_OFFICE_INTERNAL = 10  # Internal Directions tab (email/memos/weekly
+                             # actions) — viewable by H.E., Shamma, and
+                             # Theyab per the SG Office internal workflow
+                             # spec.
+    SG_OFFICE_EXTERNAL = 11  # External Meetings/Visitors/Facilities tab.
+                             # Neither of these two has a row in
+                             # role_and_access_feature / role_and_access_role_features
+                             # in prod yet (confirmed 2026-10: catalog only
+                             # has ids 1-9) — grant via that table like any
+                             # other feature once these roles are defined;
+                             # until then db_has_feature() always returns
+                             # False for them, which is exactly why neither
+                             # gate is actually called yet (see db_queries.py).
 
 
 def is_superadmin(conn, user_id: int) -> bool:
@@ -106,6 +119,20 @@ def has_user_management(conn, user_id: int) -> bool:
     return db_has_feature(conn, user_id, FeatureID.USER_MANAGEMENT)
 
 
+def has_sg_office_internal_access(conn, user_id: int) -> bool:
+    """H.E., Shamma, and Theyab all see the Internal Directions tab (email
+    correspondence, memos, weekly actions) — a flat view/no-view gate, not
+    ownership-based like projects/tasks/resolutions, since all three named
+    roles see the same shared data."""
+    return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_INTERNAL)
+
+
+def has_sg_office_external_access(conn, user_id: int) -> bool:
+    """H.E., Shamma, and Theyab all see the External Meetings/Visitors/
+    Facilities tab — same flat view/no-view gate as the internal one."""
+    return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_EXTERNAL)
+
+
 # ---------------------------------------------------------------------------
 # Ownership-based access helpers for new modules
 # ---------------------------------------------------------------------------
@@ -135,6 +162,69 @@ def _table_has_column(conn, table_name: str, column_name: str) -> bool:
         result = cur.fetchone() is not None
     _column_check_cache[cache_key] = result
     return result
+
+
+def accessible_project_ids(conn, user_id: int) -> Optional[List[int]]:
+    """Return list of project IDs the user can see. None means all.
+    Mirrors accessible_sg_office_ids: project_management_teammember has no
+    user_id column today, so team-member access falls back to matching the
+    member's stored name against the user's own full_name_en — fragile
+    (typos, duplicate names) but it's what the equivalent SG-office code
+    already does in production, and upgrades automatically if a user_id
+    column is ever added to this table."""
+    if _is_admin_or_super(conn, user_id):
+        return None
+    with conn.cursor() as cur:
+        if _table_has_column(conn, "project_management_teammember", "user_id"):
+            cur.execute("""
+                SELECT id FROM project_management_project WHERE project_manager_id = %s
+                UNION
+                SELECT project_id
+                FROM project_management_teammember
+                WHERE user_id = %s
+            """, (user_id, user_id))
+        else:
+            cur.execute("""
+                SELECT id FROM project_management_project WHERE project_manager_id = %s
+                UNION
+                SELECT project_id
+                FROM project_management_teammember
+                WHERE name_en IN (
+                    SELECT full_name_en FROM user_management_user WHERE id = %s
+                )
+            """, (user_id, user_id))
+        return [r[0] for r in cur.fetchall()]
+
+
+def user_can_access_project(conn, user_id: int, project_id: int) -> bool:
+    if _is_admin_or_super(conn, user_id):
+        return True
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM project_management_project
+            WHERE id = %s AND project_manager_id = %s
+            LIMIT 1
+        """, (project_id, user_id))
+        if cur.fetchone():
+            return True
+        if _table_has_column(conn, "project_management_teammember", "user_id"):
+            cur.execute("""
+                SELECT 1 FROM project_management_teammember
+                WHERE project_id = %s AND user_id = %s
+                LIMIT 1
+            """, (project_id, user_id))
+        else:
+            cur.execute("""
+                SELECT 1 FROM project_management_teammember
+                WHERE project_id = %s
+                  AND name_en IN (
+                      SELECT full_name_en FROM user_management_user WHERE id = %s
+                  )
+                LIMIT 1
+            """, (project_id, user_id))
+        if cur.fetchone():
+            return True
+    return False
 
 
 def accessible_sg_office_ids(conn, user_id: int) -> Optional[List[int]]:
@@ -281,7 +371,8 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
 
     if not row:
         return {k: False for k in ["superadmin", "all_projects", "budget",
-                                    "user_management", "notes", "education", "project_docs"]}
+                                    "user_management", "notes", "education", "project_docs",
+                                    "sg_office_internal"]}
 
     sa = bool(row[0])
     feature_ids = set(row[1] or [])
@@ -293,4 +384,5 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
         "notes": sa or FeatureID.NOTES in feature_ids,
         "education": sa or FeatureID.EDUCATION_DASH in feature_ids,
         "project_docs": sa or FeatureID.PROJECT_DOCS in feature_ids,
+        "sg_office_internal": sa or FeatureID.SG_OFFICE_INTERNAL in feature_ids,
     }
