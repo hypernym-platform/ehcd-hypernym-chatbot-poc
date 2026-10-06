@@ -21,6 +21,8 @@ from rbac import (
     user_can_access_sg_office,
     user_can_access_task,
     user_can_access_resolution,
+    has_sg_office_internal_access,
+    has_sg_office_external_access,
 )
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,47 @@ STATUS_MAP_AR = {
     3: "متأخر",
     4: "معلّق",
 }
+
+# SG Office external meetings — these integer codes aren't backed by a
+# lookup table in the DB, so each mapping below was cross-verified against
+# real UI screenshots joined back to their DB rows by requester/org name
+# (not guessed). Where a code never appeared in an available screenshot,
+# it's left out deliberately — _meeting_status_label() etc. fall back to
+# "Status N" for anything not in these maps rather than invent a label.
+MEETING_STATUS_MAP = {
+    1: "New", 2: "Under Review", 3: "Confirmed",
+    4: "Completed", 5: "Rescheduled", 6: "Cancelled",
+}
+# "Upcoming" (shown as its own summary count in the UI) = Confirmed + Rescheduled.
+MEETING_UPCOMING_STATUSES = [3, 5]
+MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
+MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 4: "Facility Visit"}  # 3 unconfirmed
+VISITOR_EMAIL_STATUS_MAP = {1: "Not Sent", 2: "Sent"}
+READINESS_STATUS_MAP = {1: "Not Confirmed"}  # 2, 3 unconfirmed
+FACILITY_STATUS_MAP = {1: "Not Confirmed"}  # 2, 3 unconfirmed
+FACILITY_TYPE_MAP = {5: "Room"}  # 1, 2, 3, 4 unconfirmed
+
+
+def _label(val, mapping: dict, prefix: str) -> str:
+    if val is None:
+        return None
+    return mapping.get(val, f"{prefix} {val}")
+
+
+def _multi_word_ilike(column: str, text: str):
+    """Build an (SQL fragment, params) pair that matches a column against
+    EVERY word in `text`, in any order — e.g. searching "Emirates Foundation
+    Youth Volunteering" still matches "Emirates Foundation — Youth
+    Volunteering Programme" even though the em dash breaks a plain
+    single-substring ILIKE. Used for free-text name/org/subject filters
+    where a user's natural-language phrasing won't exactly match the DB's
+    punctuation/spacing."""
+    words = [w for w in text.split() if w]
+    if not words:
+        return "TRUE", []
+    clauses = [f"{column} ILIKE %s" for _ in words]
+    params = [f"%{w}%" for w in words]
+    return "(" + " AND ".join(clauses) + ")", params
 
 
 def _status_label(val) -> str:
@@ -429,6 +472,637 @@ def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
                 result["office"][key] = _fmt_jsonb(val)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# SG OFFICE — INTERNAL DIRECTIONS (email correspondence)
+#
+# Read-only for now: the DB only has the raw synced-mailbox tables
+# (sg_office_email / sg_office_emailthread / sg_office_emailattachment) —
+# there's no table/column yet for the workflow layer the internal-tab spec
+# describes (H.E. direction, assigned owner, deadline, status). Questions
+# like "awaiting H.E. direction", "overdue directions", "waiting for a
+# response", "due this week", "assigned to X" all describe that not-yet-
+# built workflow layer, not the raw email. What IS real and queryable: the
+# AI-generated `summary` column on both sg_office_email and
+# sg_office_emailthread (the module's existing AI summary feature) — ask
+# the model to summarize/read it directly off a fetched email or thread, no
+# separate tool needed.
+#
+# TEMPORARY: rbac.has_sg_office_internal_access() exists and is NOT called
+# here. Confirmed directly against prod (2026-10): role_and_access_feature
+# only has ids 1-9, nothing for SG_OFFICE_INTERNAL (10) — no role has it
+# assigned, so calling the gate right now would block everyone except
+# superadmins, not just restrict to H.E./Shamma/Theyab as intended. Per
+# explicit instruction, access stays open to every authenticated chatbot
+# user until a real role is granted that feature in role_and_access_role_features
+# — wire the gate back in then; see rbac.has_sg_office_internal_access.
+# ---------------------------------------------------------------------------
+
+def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List SG Office internal email correspondence. Returns {"total_count": N, "data": [...]}."""
+    filters = filters or {}
+
+    # Excludes body_content deliberately — it's raw (often HTML) email body
+    # and can be large; 29 matched rows with it included produced a ~1.6M
+    # character tool result (~400K tokens), blowing past the model's
+    # context window outright. summary/body_preview (both short, bounded
+    # fields) are kept for scanning a list; get_sg_office_email_details
+    # returns full body_content for one specific email/thread once the
+    # list has narrowed down which one.
+    query = """
+        SELECT e.id, e.message_id, e.internet_message_id, e.subject, e.body_preview,
+               e.summary, e.sender_name, e.sender_email, e.to_recipients, e.cc_recipients,
+               e.bcc_recipients, e.reply_to, e.importance, e.has_attachments, e.is_read,
+               e.is_draft, e.categories, e.flag, e.web_link, e.received_datetime,
+               e.sent_datetime, e.thread_id, e.created_at, e.updated_at,
+               u.full_name_en AS mailbox_owner_name
+        FROM sg_office_email e
+        LEFT JOIN user_management_user u ON u.id = e.mailbox_owner_id
+    """
+    conditions, params = [], []
+
+    if filters.get("is_read") is not None:
+        conditions.append("e.is_read = %s")
+        params.append(filters["is_read"])
+
+    if filters.get("is_draft") is not None:
+        conditions.append("e.is_draft = %s")
+        params.append(filters["is_draft"])
+
+    if filters.get("flagged") is not None:
+        if filters["flagged"]:
+            conditions.append("e.flag->>'flagStatus' = 'flagged'")
+        else:
+            conditions.append("(e.flag->>'flagStatus' IS DISTINCT FROM 'flagged')")
+
+    if filters.get("sender"):
+        c1, p1 = _multi_word_ilike("e.sender_name", filters["sender"])
+        c2, p2 = _multi_word_ilike("e.sender_email", filters["sender"])
+        conditions.append(f"({c1} OR {c2})")
+        params.extend(p1 + p2)
+
+    if filters.get("recipient"):
+        c1, p1 = _multi_word_ilike("e.to_recipients::text", filters["recipient"])
+        c2, p2 = _multi_word_ilike("e.cc_recipients::text", filters["recipient"])
+        conditions.append(f"({c1} OR {c2})")
+        params.extend(p1 + p2)
+
+    if filters.get("subject"):
+        clause, p = _multi_word_ilike("e.subject", filters["subject"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("body_contains"):
+        c1, p1 = _multi_word_ilike("e.body_preview", filters["body_contains"])
+        c2, p2 = _multi_word_ilike("e.body_content", filters["body_contains"])
+        c3, p3 = _multi_word_ilike("e.summary", filters["body_contains"])
+        conditions.append(f"({c1} OR {c2} OR {c3})")
+        params.extend(p1 + p2 + p3)
+
+    if filters.get("category"):
+        conditions.append("e.categories::text ILIKE %s")
+        params.append(f"%{filters['category']}%")
+
+    if filters.get("importance"):
+        conditions.append("e.importance = %s")
+        params.append(filters["importance"])
+
+    if filters.get("has_attachments") is not None:
+        conditions.append("e.has_attachments = %s")
+        params.append(filters["has_attachments"])
+
+    if filters.get("thread_id"):
+        conditions.append("e.thread_id = %s")
+        params.append(filters["thread_id"])
+
+    if filters.get("mailbox_owner"):
+        clause, p = _multi_word_ilike("u.full_name_en", filters["mailbox_owner"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("received_after"):
+        conditions.append("e.received_datetime::date >= %s")
+        params.append(filters["received_after"])
+
+    if filters.get("received_before"):
+        conditions.append("e.received_datetime::date <= %s")
+        params.append(filters["received_before"])
+
+    if filters.get("older_than_days"):
+        # Deterministic "open for more than N days" / "older than a week"
+        # comparison in SQL — same reasoning as the projects `overdue`
+        # filter: don't make the model do its own date math against
+        # today's date, it gets it wrong.
+        conditions.append("e.received_datetime::date < (CURRENT_DATE - (%s || ' days')::interval)")
+        params.append(filters["older_than_days"])
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    if filters.get("sort_by") == "oldest":
+        query += " ORDER BY e.received_datetime ASC"
+    else:
+        query += " ORDER BY e.received_datetime DESC"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    return {"total_count": len(rows), "data": [dict(r) for r in rows]}
+
+
+def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
+                                thread_id: int = None, latest_only: bool = False) -> Dict[str, Any]:
+    """Get a single email (with its attachments), or a full thread — every
+    message in it with its own attachments, or just the latest message in
+    the thread if latest_only is set (answers "what's the latest response
+    on this?" without the model having to scan the whole thread itself)."""
+    if not email_id and not thread_id:
+        return {"error": "email_id or thread_id is required"}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if email_id:
+            cur.execute("""
+                SELECT e.*, u.full_name_en AS mailbox_owner_name
+                FROM sg_office_email e
+                LEFT JOIN user_management_user u ON u.id = e.mailbox_owner_id
+                WHERE e.id = %s
+            """, (email_id,))
+            email = cur.fetchone()
+            if not email:
+                return {"error": "Email not found"}
+            result = {"email": dict(email)}
+            attachment_email_ids = [email["id"]]
+        else:
+            cur.execute("SELECT * FROM sg_office_emailthread WHERE id = %s", (thread_id,))
+            thread = cur.fetchone()
+            if not thread:
+                return {"error": "Thread not found"}
+            order = "DESC" if latest_only else "ASC"
+            limit_clause = "LIMIT 1" if latest_only else ""
+            cur.execute(f"""
+                SELECT e.*, u.full_name_en AS mailbox_owner_name
+                FROM sg_office_email e
+                LEFT JOIN user_management_user u ON u.id = e.mailbox_owner_id
+                WHERE e.thread_id = %s
+                ORDER BY e.received_datetime {order}
+                {limit_clause}
+            """, (thread_id,))
+            messages = [dict(r) for r in cur.fetchall()]
+            if latest_only:
+                result = {"thread": dict(thread), "latest_message": messages[0] if messages else None}
+                attachment_email_ids = [messages[0]["id"]] if messages else []
+            else:
+                result = {"thread": dict(thread), "messages": messages}
+                attachment_email_ids = [m["id"] for m in messages]
+
+        if attachment_email_ids:
+            cur.execute("""
+                SELECT id, email_id, attachment_id, file_name, content_type, size, is_inline, blob_url
+                FROM sg_office_emailattachment WHERE email_id = ANY(%s)
+            """, (attachment_email_ids,))
+            attachments = [dict(r) for r in cur.fetchall()]
+            if email_id:
+                result["attachments"] = attachments
+            elif latest_only:
+                result["latest_message"]["attachments"] = attachments
+            else:
+                by_email: Dict[int, list] = {}
+                for a in attachments:
+                    by_email.setdefault(a["email_id"], []).append(a)
+                for m in result["messages"]:
+                    m["attachments"] = by_email.get(m["id"], [])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SG OFFICE — EXTERNAL MEETINGS, VISITORS & FACILITIES (Theyab's workspace)
+#
+# Six tables: sg_office_meetingrequest (core), sg_office_meetingrequest_participants
+# (M2M to users), sg_office_meetingrequestfacility (prep tasks),
+# sg_office_meetingrequestvisitor (readiness), sg_office_meetingoutcome
+# (post-meeting notes), sg_office_meetingrequeststatushistory (the Audit
+# Trail shown in the UI). All six are real and populated — unlike Internal
+# Directions, this module HAS its full workflow schema (status, priority,
+# assignees, deadlines all exist as real columns), so filters here aren't
+# limited by missing schema the way the email ones are.
+#
+# TEMPORARY: same as Internal Directions — unrestricted access, no RBAC gate
+# called here. Confirmed directly against prod (2026-10): role_and_access_feature
+# only has ids 1-9, nothing for SG_OFFICE_EXTERNAL (11) — no role has it
+# assigned, so calling rbac.has_sg_office_external_access() right now would
+# block everyone except superadmins. Wire it in once a real role is granted
+# that feature in role_and_access_role_features.
+# ---------------------------------------------------------------------------
+
+def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List external meeting/visit requests. Returns {"total_count": N, "data": [...]}."""
+    filters = filters or {}
+
+    query = """
+        SELECT m.*,
+               co.full_name_en AS coordinator_name,
+               cb.full_name_en AS created_by_name,
+               cf.full_name_en AS confirmed_by_name
+        FROM sg_office_meetingrequest m
+        LEFT JOIN user_management_user co ON co.id = m.coordinator_id
+        LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
+        LEFT JOIN user_management_user cf ON cf.id = m.confirmed_by_id
+    """
+    conditions, params = [], []
+
+    if filters.get("status"):
+        status_val = str(filters["status"]).lower().replace("_", " ")
+        reverse_map = {v.lower(): k for k, v in MEETING_STATUS_MAP.items()}
+        if status_val == "upcoming":
+            conditions.append("m.status = ANY(%s)")
+            params.append(MEETING_UPCOMING_STATUSES)
+        elif status_val in reverse_map:
+            conditions.append("m.status = %s")
+            params.append(reverse_map[status_val])
+
+    if filters.get("priority"):
+        reverse_map = {v.lower(): k for k, v in MEETING_PRIORITY_MAP.items()}
+        p = reverse_map.get(str(filters["priority"]).lower())
+        if p:
+            conditions.append("m.priority = %s")
+            params.append(p)
+
+    if filters.get("request_type"):
+        reverse_map = {v.lower(): k for k, v in MEETING_REQUEST_TYPE_MAP.items()}
+        rt = reverse_map.get(str(filters["request_type"]).lower().replace("_", " "))
+        if rt:
+            conditions.append("m.request_type = %s")
+            params.append(rt)
+
+    if filters.get("requester"):
+        clause, p = _multi_word_ilike("m.requester", filters["requester"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("organization"):
+        clause, p = _multi_word_ilike("m.organization", filters["organization"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("email"):
+        conditions.append("m.email ILIKE %s")
+        params.append(f"%{filters['email']}%")
+
+    if filters.get("purpose_contains"):
+        clause1, p1 = _multi_word_ilike("m.purpose", filters["purpose_contains"])
+        clause2, p2 = _multi_word_ilike("m.notes", filters["purpose_contains"])
+        conditions.append(f"({clause1} OR {clause2})")
+        params.extend(p1 + p2)
+
+    if filters.get("coordinator"):
+        clause, p = _multi_word_ilike("co.full_name_en", filters["coordinator"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("created_by"):
+        clause, p = _multi_word_ilike("cb.full_name_en", filters["created_by"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("visitor_email_status"):
+        reverse_map = {v.lower(): k for k, v in VISITOR_EMAIL_STATUS_MAP.items()}
+        ves = reverse_map.get(str(filters["visitor_email_status"]).lower().replace("_", " "))
+        if ves:
+            conditions.append("m.visitor_email_status = %s")
+            params.append(ves)
+
+    if filters.get("is_confirmed") is not None:
+        if filters["is_confirmed"]:
+            conditions.append("m.confirmed_at IS NOT NULL")
+        else:
+            conditions.append("m.confirmed_at IS NULL")
+
+    if filters.get("notify_stakeholders") is not None:
+        conditions.append("m.notify_stakeholders = %s")
+        params.append(filters["notify_stakeholders"])
+
+    if filters.get("scheduled_after"):
+        conditions.append("m.scheduled_date >= %s")
+        params.append(filters["scheduled_after"])
+
+    if filters.get("scheduled_before"):
+        conditions.append("m.scheduled_date <= %s")
+        params.append(filters["scheduled_before"])
+
+    if filters.get("scheduled_on"):
+        conditions.append("m.scheduled_date = %s")
+        params.append(filters["scheduled_on"])
+
+    if filters.get("scheduled_today"):
+        # Deterministic — don't make the model compute "today" itself.
+        conditions.append("m.scheduled_date = CURRENT_DATE")
+
+    if filters.get("scheduled_this_week"):
+        # ISO week (Monday-Sunday) containing today, computed in SQL so the
+        # model never has to work out week boundaries itself.
+        conditions.append(
+            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
+            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+        )
+
+    if filters.get("created_after"):
+        conditions.append("m.created_at::date >= %s")
+        params.append(filters["created_after"])
+
+    if filters.get("older_than_days"):
+        conditions.append("m.created_at::date < (CURRENT_DATE - (%s || ' days')::interval)")
+        params.append(filters["older_than_days"])
+
+    if filters.get("stalled"):
+        # "Stalled" per the Theyab workspace spec = still New/Under Review
+        # (nothing confirmed, no response) and sitting for a while — 3 days
+        # is this function's own default for "a while"; pass older_than_days
+        # instead for a custom threshold on an unconfirmed request.
+        conditions.append(
+            "m.status IN (1, 2) AND m.created_at::date < (CURRENT_DATE - INTERVAL '3 days')"
+        )
+
+    if filters.get("participant"):
+        clause, p = _multi_word_ilike("u.full_name_en", filters["participant"])
+        conditions.append(f"""m.id IN (
+            SELECT mp.meetingrequest_id FROM sg_office_meetingrequest_participants mp
+            JOIN user_management_user u ON u.id = mp.user_id
+            WHERE {clause}
+        )""")
+        params.extend(p)
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    if filters.get("sort_by") == "oldest":
+        query += " ORDER BY m.created_at ASC"
+    else:
+        query += " ORDER BY m.created_at DESC"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["status_label"] = _label(item.get("status"), MEETING_STATUS_MAP, "Status")
+        item["priority_label"] = _label(item.get("priority"), MEETING_PRIORITY_MAP, "Priority")
+        item["request_type_label"] = _label(item.get("request_type"), MEETING_REQUEST_TYPE_MAP, "Type")
+        item["visitor_email_status_label"] = _label(
+            item.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
+
+
+def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -> Dict[str, Any]:
+    """Full detail for one meeting/visit request: the request itself,
+    participants, facility prep tasks, visitor readiness, the post-meeting
+    outcome (if any), and the full status-change audit trail."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT m.*,
+                   co.full_name_en AS coordinator_name,
+                   cb.full_name_en AS created_by_name,
+                   cf.full_name_en AS confirmed_by_name
+            FROM sg_office_meetingrequest m
+            LEFT JOIN user_management_user co ON co.id = m.coordinator_id
+            LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
+            LEFT JOIN user_management_user cf ON cf.id = m.confirmed_by_id
+            WHERE m.id = %s
+        """, (meeting_request_id,))
+        meeting = cur.fetchone()
+        if not meeting:
+            return {"error": "Meeting request not found"}
+
+        meeting = dict(meeting)
+        meeting["status_label"] = _label(meeting.get("status"), MEETING_STATUS_MAP, "Status")
+        meeting["priority_label"] = _label(meeting.get("priority"), MEETING_PRIORITY_MAP, "Priority")
+        meeting["request_type_label"] = _label(meeting.get("request_type"), MEETING_REQUEST_TYPE_MAP, "Type")
+        meeting["visitor_email_status_label"] = _label(
+            meeting.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
+
+        cur.execute("""
+            SELECT u.id, u.full_name_en, u.full_name_ar, u.email, u.designation
+            FROM sg_office_meetingrequest_participants mp
+            JOIN user_management_user u ON u.id = mp.user_id
+            WHERE mp.meetingrequest_id = %s
+        """, (meeting_request_id,))
+        participants = [dict(r) for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT f.*, a.full_name_en AS assigned_to_name, u.full_name_en AS updated_by_name
+            FROM sg_office_meetingrequestfacility f
+            LEFT JOIN user_management_user a ON a.id = f.assigned_to_id
+            LEFT JOIN user_management_user u ON u.id = f.updated_by_id
+            WHERE f.meeting_request_id = %s
+            ORDER BY f.id
+        """, (meeting_request_id,))
+        facilities = []
+        for r in cur.fetchall():
+            f = dict(r)
+            f["status_label"] = _label(f.get("status"), FACILITY_STATUS_MAP, "Status")
+            f["priority_label"] = _label(f.get("priority"), MEETING_PRIORITY_MAP, "Priority")
+            f["facility_label"] = _label(f.get("facility"), FACILITY_TYPE_MAP, "Facility")
+            facilities.append(f)
+
+        cur.execute("""
+            SELECT v.*, ru.full_name_en AS readiness_updated_by_name,
+                   am.full_name_en AS arrival_marked_by_name
+            FROM sg_office_meetingrequestvisitor v
+            LEFT JOIN user_management_user ru ON ru.id = v.readiness_updated_by_id
+            LEFT JOIN user_management_user am ON am.id = v.arrival_marked_by_id
+            WHERE v.meeting_request_id = %s
+            ORDER BY v.id
+        """, (meeting_request_id,))
+        visitors = []
+        for r in cur.fetchall():
+            v = dict(r)
+            v["readiness_status_label"] = _label(v.get("readiness_status"), READINESS_STATUS_MAP, "Status")
+            v["arrived"] = v.get("arrived_at") is not None
+            visitors.append(v)
+
+        cur.execute("""
+            SELECT o.*, cb.full_name_en AS completed_by_name
+            FROM sg_office_meetingoutcome o
+            LEFT JOIN user_management_user cb ON cb.id = o.completed_by_id
+            WHERE o.meeting_request_id = %s
+        """, (meeting_request_id,))
+        outcome_row = cur.fetchone()
+        outcome = dict(outcome_row) if outcome_row else None
+
+        cur.execute("""
+            SELECT h.*, u.full_name_en AS changed_by_name
+            FROM sg_office_meetingrequeststatushistory h
+            LEFT JOIN user_management_user u ON u.id = h.changed_by_id
+            WHERE h.meeting_request_id = %s
+            ORDER BY h.changed_at
+        """, (meeting_request_id,))
+        audit_trail = []
+        for r in cur.fetchall():
+            h = dict(r)
+            h["from_status_label"] = _label(h.get("from_status"), MEETING_STATUS_MAP, "Status")
+            h["to_status_label"] = _label(h.get("to_status"), MEETING_STATUS_MAP, "Status")
+            audit_trail.append(h)
+
+    return {
+        "meeting": meeting,
+        "participants": participants,
+        "facilities": facilities,
+        "visitors": visitors,
+        "outcome": outcome,
+        "audit_trail": audit_trail,
+    }
+
+
+def list_sg_office_meeting_facilities(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """Cross-meeting facility-prep tracker (Theyab's 'Preparation' board) —
+    e.g. 'which facility requests are unassigned', 'what's overdue for prep'.
+    Returns {"total_count": N, "data": [...]}."""
+    filters = filters or {}
+
+    query = """
+        SELECT f.*, m.requester, m.organization, m.scheduled_date, m.status AS meeting_status,
+               a.full_name_en AS assigned_to_name, u.full_name_en AS updated_by_name
+        FROM sg_office_meetingrequestfacility f
+        JOIN sg_office_meetingrequest m ON m.id = f.meeting_request_id
+        LEFT JOIN user_management_user a ON a.id = f.assigned_to_id
+        LEFT JOIN user_management_user u ON u.id = f.updated_by_id
+    """
+    conditions, params = [], []
+
+    if filters.get("status"):
+        reverse_map = {v.lower(): k for k, v in FACILITY_STATUS_MAP.items()}
+        s = reverse_map.get(str(filters["status"]).lower().replace("_", " "))
+        if s:
+            conditions.append("f.status = %s")
+            params.append(s)
+
+    if filters.get("priority"):
+        reverse_map = {v.lower(): k for k, v in MEETING_PRIORITY_MAP.items()}
+        p = reverse_map.get(str(filters["priority"]).lower())
+        if p:
+            conditions.append("f.priority = %s")
+            params.append(p)
+
+    if filters.get("unassigned") is not None:
+        if filters["unassigned"]:
+            conditions.append("f.assigned_to_id IS NULL")
+        else:
+            conditions.append("f.assigned_to_id IS NOT NULL")
+
+    if filters.get("assigned_to"):
+        clause, p = _multi_word_ilike("a.full_name_en", filters["assigned_to"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("overdue"):
+        conditions.append("f.due_at IS NOT NULL AND f.due_at < NOW() AND f.status != 1")
+
+    if filters.get("due_before"):
+        conditions.append("f.due_at::date <= %s")
+        params.append(filters["due_before"])
+
+    if filters.get("meeting_request_id"):
+        conditions.append("f.meeting_request_id = %s")
+        params.append(filters["meeting_request_id"])
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY f.due_at NULLS LAST, f.id"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["status_label"] = _label(item.get("status"), FACILITY_STATUS_MAP, "Status")
+        item["priority_label"] = _label(item.get("priority"), MEETING_PRIORITY_MAP, "Priority")
+        item["facility_label"] = _label(item.get("facility"), FACILITY_TYPE_MAP, "Facility")
+        item["meeting_status_label"] = _label(item.get("meeting_status"), MEETING_STATUS_MAP, "Status")
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
+
+
+def list_sg_office_meeting_visitors(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """Cross-meeting visitor readiness tracker (Theyab's readiness board) —
+    e.g. 'which visitors haven't arrived', 'whose readiness isn't confirmed'.
+    Returns {"total_count": N, "data": [...]}."""
+    filters = filters or {}
+
+    query = """
+        SELECT v.*, m.requester, m.organization, m.scheduled_date, m.status AS meeting_status
+        FROM sg_office_meetingrequestvisitor v
+        JOIN sg_office_meetingrequest m ON m.id = v.meeting_request_id
+    """
+    conditions, params = [], []
+
+    if filters.get("readiness_status"):
+        reverse_map = {v.lower(): k for k, v in READINESS_STATUS_MAP.items()}
+        rs = reverse_map.get(str(filters["readiness_status"]).lower().replace("_", " "))
+        if rs:
+            conditions.append("v.readiness_status = %s")
+            params.append(rs)
+
+    if filters.get("arrived") is not None:
+        if filters["arrived"]:
+            conditions.append("v.arrived_at IS NOT NULL")
+        else:
+            conditions.append("v.arrived_at IS NULL")
+
+    if filters.get("email_failed") is not None:
+        conditions.append("v.email_failed = %s")
+        params.append(filters["email_failed"])
+
+    if filters.get("name"):
+        clause, p = _multi_word_ilike("v.name", filters["name"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("meeting_request_id"):
+        conditions.append("v.meeting_request_id = %s")
+        params.append(filters["meeting_request_id"])
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY m.scheduled_date NULLS LAST, v.id"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["readiness_status_label"] = _label(item.get("readiness_status"), READINESS_STATUS_MAP, "Status")
+        item["meeting_status_label"] = _label(item.get("meeting_status"), MEETING_STATUS_MAP, "Status")
+        item["arrived"] = item.get("arrived_at") is not None
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
 
 
 # ---------------------------------------------------------------------------
