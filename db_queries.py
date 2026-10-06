@@ -55,11 +55,48 @@ MEETING_STATUS_MAP = {
 # "Upcoming" (shown as its own summary count in the UI) = Confirmed + Rescheduled.
 MEETING_UPCOMING_STATUSES = [3, 5]
 MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
-MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 4: "Facility Visit"}  # 3 unconfirmed
+MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 3: "Delegation Visit", 4: "Facility Visit"}
 VISITOR_EMAIL_STATUS_MAP = {1: "Not Sent", 2: "Sent"}
 READINESS_STATUS_MAP = {1: "Not Confirmed"}  # 2, 3 unconfirmed
-FACILITY_STATUS_MAP = {1: "Not Confirmed"}  # 2, 3 unconfirmed
-FACILITY_TYPE_MAP = {5: "Room"}  # 1, 2, 3, 4 unconfirmed
+FACILITY_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 unconfirmed
+FACILITY_TYPE_MAP = {
+    5: "Room", 2: "Parking", 1: "Security Access",
+    4: "Access Pass", 3: "Hospitality",
+}
+VENUE_MAP = {
+    1: "Leadership Office - Meeting Room 1",
+    2: "Leadership Office - Meeting Room 2",
+    3: "Main Auditorium",
+    4: "Reception Hall",
+}
+
+# DirectionItem enums — from the real source (common/enums.py), not
+# cross-referenced guesses like the meeting ones above.
+DIRECTION_ITEM_TYPE_MAP = {1: "Email Correspondence", 2: "Memo", 3: "Weekly Action"}
+DIRECTION_CODE_PREFIX = {1: "SG", 2: "MEM", 3: "WA"}
+DIRECTION_STATUS_MAP = {
+    1: "Draft", 2: "New", 3: "Under Review", 4: "Awaiting H.E. Direction",
+    5: "In Progress", 6: "Response Sent", 7: "Closed", 8: "Completed", 9: "Cancelled",
+}
+DIRECTION_FINISHED_STATUSES = (7, 8, 9)
+DIRECTION_PRE_ASSIGNMENT_STATUSES = (2, 3, 4)
+REQUIRED_DECISION_MAP = {
+    1: "Approval", 2: "Signature", 3: "Nomination", 4: "Review and Endorsement",
+    5: "Confirm Action Owners", 6: "Direction", 7: "For Information",
+}
+DIRECTION_OUTCOME_MAP = {
+    1: "Approved", 2: "Approved with Amendments", 3: "Rejected",
+    4: "Noted", 5: "More Information Requested",
+}
+CORRESPONDENCE_DIRECTION_MAP = {1: "Incoming", 2: "Outgoing"}
+REMINDER_UNIT_MAP = {1: "Hours", 2: "Days"}
+DIRECTION_EVENT_TYPE_MAP = {
+    1: "Received", 2: "Summarized", 3: "AI Review Confirmed", 4: "Submitted for H.E. Direction",
+    5: "Direction Recorded", 6: "Assigned", 7: "Reminder Sent", 8: "Escalated", 9: "Updated",
+    10: "Note Added", 11: "Response Sent", 12: "Closed", 13: "Completed", 14: "Cancelled",
+    15: "Reopened", 16: "Registered", 17: "Attachment Added", 18: "Attachment Removed",
+    19: "Record Linked", 20: "Record Unlinked",
+}
 
 
 def _label(val, mapping: dict, prefix: str) -> str:
@@ -659,6 +696,292 @@ def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
     return result
 
 
+# SG OFFICE — DIRECTION ITEMS (Email/Memo/Weekly Action unified workflow)
+# TEMPORARY: unrestricted access, same reasoning as the rest of this file.
+
+def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List Internal Direction items (emails/memos/weekly actions).
+    Returns {"total_count": N, "data": [...]}."""
+    filters = filters or {}
+
+    query = """
+        SELECT d.*,
+               o.full_name_en AS owner_name,
+               cb.full_name_en AS created_by_name,
+               drb.full_name_en AS direction_recorded_by_name,
+               clb.full_name_en AS closed_by_name
+        FROM sg_office_directionitem d
+        LEFT JOIN user_management_user o ON o.id = d.owner_id
+        LEFT JOIN user_management_user cb ON cb.id = d.created_by_id
+        LEFT JOIN user_management_user drb ON drb.id = d.direction_recorded_by_id
+        LEFT JOIN user_management_user clb ON clb.id = d.closed_by_id
+    """
+    conditions, params = [], []
+
+    if filters.get("item_type"):
+        reverse_map = {v.lower().replace(" ", "_"): k for k, v in DIRECTION_ITEM_TYPE_MAP.items()}
+        it = reverse_map.get(str(filters["item_type"]).lower().replace(" ", "_"))
+        if it:
+            conditions.append("d.item_type = %s")
+            params.append(it)
+
+    if filters.get("code"):
+        conditions.append("d.code = %s")
+        params.append(filters["code"])
+
+    if filters.get("status"):
+        reverse_map = {v.lower(): k for k, v in DIRECTION_STATUS_MAP.items()}
+        s = reverse_map.get(str(filters["status"]).lower().replace("_", " "))
+        if s:
+            conditions.append("d.status = %s")
+            params.append(s)
+
+    if filters.get("priority"):
+        reverse_map = {v.lower(): k for k, v in MEETING_PRIORITY_MAP.items()}
+        p = reverse_map.get(str(filters["priority"]).lower())
+        if p:
+            conditions.append("d.priority = %s")
+            params.append(p)
+
+    if filters.get("required_decision"):
+        reverse_map = {v.lower(): k for k, v in REQUIRED_DECISION_MAP.items()}
+        rd = reverse_map.get(str(filters["required_decision"]).lower().replace("_", " "))
+        if rd:
+            conditions.append("d.required_decision = %s")
+            params.append(rd)
+
+    if filters.get("direction_outcome"):
+        reverse_map = {v.lower(): k for k, v in DIRECTION_OUTCOME_MAP.items()}
+        do = reverse_map.get(str(filters["direction_outcome"]).lower().replace("_", " "))
+        if do:
+            conditions.append("d.direction_outcome = %s")
+            params.append(do)
+
+    if filters.get("correspondence_direction"):
+        reverse_map = {v.lower(): k for k, v in CORRESPONDENCE_DIRECTION_MAP.items()}
+        cd = reverse_map.get(str(filters["correspondence_direction"]).lower())
+        if cd:
+            conditions.append("d.correspondence_direction = %s")
+            params.append(cd)
+
+    if filters.get("cc_council_affairs") is not None:
+        conditions.append("d.cc_council_affairs = %s")
+        params.append(filters["cc_council_affairs"])
+
+    if filters.get("subject_contains"):
+        c1, p1 = _multi_word_ilike("d.subject", filters["subject_contains"])
+        c2, p2 = _multi_word_ilike("d.description", filters["subject_contains"])
+        c3, p3 = _multi_word_ilike("d.notes", filters["subject_contains"])
+        conditions.append(f"({c1} OR {c2} OR {c3})")
+        params.extend(p1 + p2 + p3)
+
+    if filters.get("owner"):
+        clause, p = _multi_word_ilike("o.full_name_en", filters["owner"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("created_by"):
+        clause, p = _multi_word_ilike("cb.full_name_en", filters["created_by"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("sender_name"):
+        clause, p = _multi_word_ilike("d.sender_name", filters["sender_name"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("sender_unit"):
+        clause, p = _multi_word_ilike("d.sender_unit", filters["sender_unit"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("recipient_name"):
+        clause, p = _multi_word_ilike("d.recipient_name", filters["recipient_name"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("reference"):
+        conditions.append("d.reference ILIKE %s")
+        params.append(f"%{filters['reference']}%")
+
+    if filters.get("source_meeting"):
+        clause, p = _multi_word_ilike("d.source_meeting", filters["source_meeting"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("date_received_after"):
+        conditions.append("d.date_received::date >= %s")
+        params.append(filters["date_received_after"])
+
+    if filters.get("meeting_date_on"):
+        conditions.append("d.meeting_date = %s")
+        params.append(filters["meeting_date_on"])
+
+    if filters.get("deadline_before"):
+        conditions.append("d.deadline <= %s")
+        params.append(filters["deadline_before"])
+
+    if filters.get("deadline_after"):
+        conditions.append("d.deadline >= %s")
+        params.append(filters["deadline_after"])
+
+    if filters.get("overdue"):
+        # Deadline passed and the item isn't in a finished state yet.
+        conditions.append(
+            f"d.deadline < CURRENT_DATE AND d.status NOT IN {DIRECTION_FINISHED_STATUSES}"
+        )
+
+    if filters.get("stalled"):
+        # Per the enum's own PRE_ASSIGNMENT_STATUSES grouping: not yet
+        # assigned/directed, and sitting for a few days.
+        conditions.append(
+            f"d.status IN {DIRECTION_PRE_ASSIGNMENT_STATUSES} "
+            "AND d.created_at::date < (CURRENT_DATE - INTERVAL '3 days')"
+        )
+
+    if filters.get("created_after"):
+        conditions.append("d.created_at::date >= %s")
+        params.append(filters["created_after"])
+
+    if filters.get("closed_after"):
+        conditions.append("d.closed_at::date >= %s")
+        params.append(filters["closed_after"])
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    if filters.get("sort_by") == "oldest":
+        query += " ORDER BY d.created_at ASC"
+    else:
+        query += " ORDER BY d.created_at DESC"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["item_type_label"] = _label(item.get("item_type"), DIRECTION_ITEM_TYPE_MAP, "Type")
+        item["status_label"] = _label(item.get("status"), DIRECTION_STATUS_MAP, "Status")
+        item["priority_label"] = _label(item.get("priority"), MEETING_PRIORITY_MAP, "Priority")
+        item["required_decision_label"] = _label(
+            item.get("required_decision"), REQUIRED_DECISION_MAP, "Decision")
+        item["direction_outcome_label"] = _label(
+            item.get("direction_outcome"), DIRECTION_OUTCOME_MAP, "Outcome")
+        item["correspondence_direction_label"] = _label(
+            item.get("correspondence_direction"), CORRESPONDENCE_DIRECTION_MAP, "Direction")
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
+
+
+def get_sg_office_direction_item_details(conn, user_id: int, item_id: int = None,
+                                         code: str = None) -> Dict[str, Any]:
+    """Full detail for one Internal Direction item: the record itself,
+    notes, attachments, the audit trail (events), and related items."""
+    if not item_id and not code:
+        return {"error": "item_id or code is required"}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if item_id:
+            cur.execute("""
+                SELECT d.*, o.full_name_en AS owner_name, cb.full_name_en AS created_by_name,
+                       drb.full_name_en AS direction_recorded_by_name, clb.full_name_en AS closed_by_name
+                FROM sg_office_directionitem d
+                LEFT JOIN user_management_user o ON o.id = d.owner_id
+                LEFT JOIN user_management_user cb ON cb.id = d.created_by_id
+                LEFT JOIN user_management_user drb ON drb.id = d.direction_recorded_by_id
+                LEFT JOIN user_management_user clb ON clb.id = d.closed_by_id
+                WHERE d.id = %s
+            """, (item_id,))
+        else:
+            cur.execute("""
+                SELECT d.*, o.full_name_en AS owner_name, cb.full_name_en AS created_by_name,
+                       drb.full_name_en AS direction_recorded_by_name, clb.full_name_en AS closed_by_name
+                FROM sg_office_directionitem d
+                LEFT JOIN user_management_user o ON o.id = d.owner_id
+                LEFT JOIN user_management_user cb ON cb.id = d.created_by_id
+                LEFT JOIN user_management_user drb ON drb.id = d.direction_recorded_by_id
+                LEFT JOIN user_management_user clb ON clb.id = d.closed_by_id
+                WHERE d.code = %s
+            """, (code,))
+        item = cur.fetchone()
+        if not item:
+            return {"error": "Direction item not found"}
+
+        item = dict(item)
+        iid = item["id"]
+        item["item_type_label"] = _label(item.get("item_type"), DIRECTION_ITEM_TYPE_MAP, "Type")
+        item["status_label"] = _label(item.get("status"), DIRECTION_STATUS_MAP, "Status")
+        item["priority_label"] = _label(item.get("priority"), MEETING_PRIORITY_MAP, "Priority")
+        item["required_decision_label"] = _label(
+            item.get("required_decision"), REQUIRED_DECISION_MAP, "Decision")
+        item["direction_outcome_label"] = _label(
+            item.get("direction_outcome"), DIRECTION_OUTCOME_MAP, "Outcome")
+        item["correspondence_direction_label"] = _label(
+            item.get("correspondence_direction"), CORRESPONDENCE_DIRECTION_MAP, "Direction")
+
+        cur.execute("""
+            SELECT n.*, a.full_name_en AS author_name
+            FROM sg_office_directionitemnote n
+            LEFT JOIN user_management_user a ON a.id = n.author_id
+            WHERE n.item_id = %s ORDER BY n.created_at
+        """, (iid,))
+        notes = [dict(r) for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT at.*, u.full_name_en AS uploaded_by_name
+            FROM sg_office_directionitemattachment at
+            LEFT JOIN user_management_user u ON u.id = at.uploaded_by_id
+            WHERE at.item_id = %s ORDER BY at.created_at
+        """, (iid,))
+        attachments = [dict(r) for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT ev.*, a.full_name_en AS actor_name
+            FROM sg_office_directionitemevent ev
+            LEFT JOIN user_management_user a ON a.id = ev.actor_id
+            WHERE ev.item_id = %s ORDER BY ev.created_at
+        """, (iid,))
+        audit_trail = []
+        for r in cur.fetchall():
+            e = dict(r)
+            e["event_type_label"] = _label(e.get("event_type"), DIRECTION_EVENT_TYPE_MAP, "Event")
+            e["from_status_label"] = _label(e.get("from_status"), DIRECTION_STATUS_MAP, "Status")
+            e["to_status_label"] = _label(e.get("to_status"), DIRECTION_STATUS_MAP, "Status")
+            audit_trail.append(e)
+
+        cur.execute("""
+            SELECT d2.id, d2.code, d2.subject, d2.item_type
+            FROM sg_office_directionitem_related_items r
+            JOIN sg_office_directionitem d2 ON d2.id = r.to_directionitem_id
+            WHERE r.from_directionitem_id = %s
+            UNION
+            SELECT d2.id, d2.code, d2.subject, d2.item_type
+            FROM sg_office_directionitem_related_items r
+            JOIN sg_office_directionitem d2 ON d2.id = r.from_directionitem_id
+            WHERE r.to_directionitem_id = %s
+        """, (iid, iid))
+        related = []
+        for r in cur.fetchall():
+            rr = dict(r)
+            rr["item_type_label"] = _label(rr.get("item_type"), DIRECTION_ITEM_TYPE_MAP, "Type")
+            related.append(rr)
+
+    return {
+        "item": item,
+        "notes": notes,
+        "attachments": attachments,
+        "audit_trail": audit_trail,
+        "related_items": related,
+    }
+
+
 # ---------------------------------------------------------------------------
 # SG OFFICE — EXTERNAL MEETINGS, VISITORS & FACILITIES (Theyab's workspace)
 #
@@ -790,6 +1113,13 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
         )
 
+    if filters.get("upcoming_only"):
+        # For "upcoming X" where X is a specific status (e.g. "upcoming
+        # confirmed") — status=upcoming alone means Confirmed+Rescheduled,
+        # not what's wanted here. This restricts to future-dated regardless
+        # of status, combine with a specific status filter above.
+        conditions.append("m.scheduled_date >= CURRENT_DATE")
+
     if filters.get("created_after"):
         conditions.append("m.created_at::date >= %s")
         params.append(filters["created_after"])
@@ -838,6 +1168,7 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         item["status_label"] = _label(item.get("status"), MEETING_STATUS_MAP, "Status")
         item["priority_label"] = _label(item.get("priority"), MEETING_PRIORITY_MAP, "Priority")
         item["request_type_label"] = _label(item.get("request_type"), MEETING_REQUEST_TYPE_MAP, "Type")
+        item["venue_label"] = _label(item.get("venue"), VENUE_MAP, "Venue")
         item["visitor_email_status_label"] = _label(
             item.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
         result.append(item)
@@ -869,6 +1200,7 @@ def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -
         meeting["status_label"] = _label(meeting.get("status"), MEETING_STATUS_MAP, "Status")
         meeting["priority_label"] = _label(meeting.get("priority"), MEETING_PRIORITY_MAP, "Priority")
         meeting["request_type_label"] = _label(meeting.get("request_type"), MEETING_REQUEST_TYPE_MAP, "Type")
+        meeting["venue_label"] = _label(meeting.get("venue"), VENUE_MAP, "Venue")
         meeting["visitor_email_status_label"] = _label(
             meeting.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
 
@@ -961,6 +1293,16 @@ def list_sg_office_meeting_facilities(conn, user_id: int, filters: dict = None) 
     """
     conditions, params = [], []
 
+    if filters.get("organization"):
+        clause, p = _multi_word_ilike("m.organization", filters["organization"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("requester"):
+        clause, p = _multi_word_ilike("m.requester", filters["requester"])
+        conditions.append(clause)
+        params.extend(p)
+
     if filters.get("status"):
         reverse_map = {v.lower(): k for k, v in FACILITY_STATUS_MAP.items()}
         s = reverse_map.get(str(filters["status"]).lower().replace("_", " "))
@@ -1033,6 +1375,16 @@ def list_sg_office_meeting_visitors(conn, user_id: int, filters: dict = None) ->
         JOIN sg_office_meetingrequest m ON m.id = v.meeting_request_id
     """
     conditions, params = [], []
+
+    if filters.get("organization"):
+        clause, p = _multi_word_ilike("m.organization", filters["organization"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("requester"):
+        clause, p = _multi_word_ilike("m.requester", filters["requester"])
+        conditions.append(clause)
+        params.extend(p)
 
     if filters.get("readiness_status"):
         reverse_map = {v.lower(): k for k, v in READINESS_STATUS_MAP.items()}
