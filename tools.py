@@ -31,6 +31,8 @@ from db_queries import (
     get_sg_office_meeting_details,
     list_sg_office_meeting_facilities,
     list_sg_office_meeting_visitors,
+    list_sg_office_direction_items,
+    get_sg_office_direction_item_details,
 )
 from edu_pg import execute_education_sql, EDU_SCHEMA_FOR_TOOL
 
@@ -317,6 +319,155 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "list_sg_office_direction_items",
+            "description": (
+                "List SG Office Internal Direction items — the tracked "
+                "workflow records Shamma manages: emails turned into a "
+                "workflow item, Memos, and Weekly Actions. Has real status/"
+                "H.E. direction/owner/deadline fields, unlike the raw "
+                "mailbox tools (list_sg_office_emails). Use for questions "
+                "about memos, weekly actions, items awaiting H.E. "
+                "direction, overdue/stalled items, or anything about the "
+                "status/owner/deadline of an internal direction item."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_type": {
+                        "type": "string",
+                        "enum": ["email_correspondence", "memo", "weekly_action"],
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Exact item code, e.g. 'MEM-026' or 'WA-032'.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["draft", "new", "under_review", "awaiting_h.e._direction",
+                                  "in_progress", "response_sent", "closed", "completed", "cancelled"],
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "required_decision": {
+                        "type": "string",
+                        "enum": ["approval", "signature", "nomination", "review_and_endorsement",
+                                  "confirm_action_owners", "direction", "for_information"],
+                    },
+                    "direction_outcome": {
+                        "type": "string",
+                        "enum": ["approved", "approved_with_amendments", "rejected",
+                                  "noted", "more_information_requested"],
+                    },
+                    "correspondence_direction": {
+                        "type": "string",
+                        "enum": ["incoming", "outgoing"],
+                    },
+                    "cc_council_affairs": {
+                        "type": "boolean",
+                    },
+                    "subject_contains": {
+                        "type": "string",
+                        "description": "Search subject/description/notes text (partial match).",
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Filter by assigned owner's name.",
+                    },
+                    "created_by": {
+                        "type": "string",
+                    },
+                    "sender_name": {
+                        "type": "string",
+                        "description": "Memo field — sender's name.",
+                    },
+                    "sender_unit": {
+                        "type": "string",
+                        "description": "Memo field — sender's unit/department.",
+                    },
+                    "recipient_name": {
+                        "type": "string",
+                        "description": "Memo field — recipient's name.",
+                    },
+                    "reference": {
+                        "type": "string",
+                        "description": "Memo field — reference number (partial match).",
+                    },
+                    "source_meeting": {
+                        "type": "string",
+                        "description": "Weekly action field — the meeting it came from.",
+                    },
+                    "date_received_after": {
+                        "type": "string",
+                        "description": "Memo field — only items received on or after this date.",
+                    },
+                    "meeting_date_on": {
+                        "type": "string",
+                        "description": "Weekly action field — exact meeting date (YYYY-MM-DD).",
+                    },
+                    "deadline_before": {
+                        "type": "string",
+                    },
+                    "deadline_after": {
+                        "type": "string",
+                    },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "Deadline passed and not yet closed/completed/cancelled — computed server-side, don't compute today's date yourself.",
+                    },
+                    "stalled": {
+                        "type": "boolean",
+                        "description": "Still New/Under Review/Awaiting H.E. Direction (nothing assigned yet) and sitting a few days — computed server-side.",
+                    },
+                    "created_after": {
+                        "type": "string",
+                    },
+                    "closed_after": {
+                        "type": "string",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["oldest"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sg_office_direction_item_details",
+            "description": (
+                "Full detail for one Internal Direction item (email/memo/"
+                "weekly action): the record, notes, attachments, audit "
+                "trail, and related items. Use for 'what did H.E. direct "
+                "on X', 'show me the audit trail for MEM-026', or any "
+                "specific item by code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "Database ID — prefer `code` if the user gave one (e.g. 'MEM-026').",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "The item's code, e.g. 'MEM-026', 'WA-032', 'SG-001'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_sg_office_meetings",
             "description": (
                 "List external SG Office meeting/visit requests (Theyab's "
@@ -330,8 +481,12 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "Filter by status. 'upcoming' means Confirmed or Rescheduled combined (matches the UI's 'Upcoming' count).",
+                        "description": "Filter by status. Use 'upcoming' ONLY when the user says just 'upcoming meetings' with no other status named — it means Confirmed OR Rescheduled combined (matches the UI's 'Upcoming' count). If the user names a SPECIFIC status too (e.g. 'upcoming confirmed meetings'), use that specific status here instead (e.g. 'confirmed') and set upcoming_only=true — do NOT use 'upcoming' here, it would silently include Rescheduled ones too.",
                         "enum": ["new", "under_review", "confirmed", "completed", "rescheduled", "cancelled", "upcoming"],
+                    },
+                    "upcoming_only": {
+                        "type": "boolean",
+                        "description": "Restrict to meetings scheduled today or later, regardless of status — combine with a specific `status` value for 'upcoming confirmed' style questions. Computed server-side, don't compute today's date yourself.",
                     },
                     "priority": {
                         "type": "string",
@@ -339,8 +494,7 @@ TOOL_DEFINITIONS = [
                     },
                     "request_type": {
                         "type": "string",
-                        "description": "Filter by request type. Only 'meeting' and 'official_visit' and 'facility_visit' are confirmed values in this system.",
-                        "enum": ["meeting", "official_visit", "facility_visit"],
+                        "enum": ["meeting", "official_visit", "delegation_visit", "facility_visit"],
                     },
                     "requester": {
                         "type": "string",
@@ -467,6 +621,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the meeting's organization name — use this directly instead of looking up meeting_request_id first.",
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the meeting's requester name.",
+                    },
                     "status": {
                         "type": "string",
                         "description": "Only 'not_confirmed' is a confirmed value in this system.",
@@ -518,6 +680,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the meeting's organization name — use this directly instead of looking up meeting_request_id first.",
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the meeting's requester name.",
+                    },
                     "readiness_status": {
                         "type": "string",
                         "description": "Only 'not_confirmed' is a confirmed value in this system.",
@@ -764,6 +934,14 @@ def execute_tool(
                 thread_id=arguments.get("thread_id"),
                 latest_only=bool(arguments.get("latest_only")),
             )
+        elif tool_name == "list_sg_office_direction_items":
+            result = list_sg_office_direction_items(conn, user_id, filters=arguments)
+        elif tool_name == "get_sg_office_direction_item_details":
+            result = get_sg_office_direction_item_details(
+                conn, user_id,
+                item_id=arguments.get("item_id"),
+                code=arguments.get("code"),
+            )
         elif tool_name == "list_sg_office_meetings":
             result = list_sg_office_meetings(conn, user_id, filters=arguments)
         elif tool_name == "get_sg_office_meeting_details":
@@ -829,6 +1007,10 @@ def _search_policy(query_text: str, policy_cfg, emb_obj, qvec=None) -> List[Dict
 
 _ID_LIKE_RE = re.compile(r"(^id$|_id$)", re.IGNORECASE)
 _ISO_DATETIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T]00:00:00(\.\d+)?(\+00:00)?$")
+_ISO_DATETIME_WITH_TIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(\.\d+)?(\+00:00)?$"
+)
+_BARE_TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})$")
 # db_queries.py computes a human-readable label alongside several raw coded
 # fields within the SAME dict (e.g. list_projects sets item["status_en"] =
 # _status_label(status) but leaves the raw numeric "status" in the same
@@ -850,12 +1032,32 @@ def _humanize_field(key: str) -> str:
     return f"{label.strip().title()}{suffix}"
 
 
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _12h(hh: str, mm: str) -> str:
+    h = int(hh)
+    period = "AM" if h < 12 else "PM"
+    h = h % 12 or 12
+    return f"{h}:{mm} {period}"
+
+
 def _format_scalar(val) -> str:
     if val in (None, ""):
         return "-"
     text = str(val)
     m = _ISO_DATETIME_RE.match(text)
-    return m.group(1) if m else text  # midnight timestamps are really just dates
+    if m:
+        return m.group(1)  # midnight timestamps are really just dates
+    m = _ISO_DATETIME_WITH_TIME_RE.match(text)
+    if m:
+        y, mo, d, hh, mm, _, _, _ = m.groups()
+        return f"{_MONTHS[int(mo) - 1]} {int(d)}, {y}, {_12h(hh, mm)}"
+    m = _BARE_TIME_RE.match(text)
+    if m:
+        hh, mm, _ = m.groups()
+        return _12h(hh, mm)
+    return text
 
 
 def _drop_fields(keys) -> set:
@@ -952,6 +1154,8 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
         # see rbac.has_sg_office_internal_access (already written, unused).
         TOOL_DEFS_BY_NAME["list_sg_office_emails"],
         TOOL_DEFS_BY_NAME["get_sg_office_email_details"],
+        TOOL_DEFS_BY_NAME["list_sg_office_direction_items"],
+        TOOL_DEFS_BY_NAME["get_sg_office_direction_item_details"],
         TOOL_DEFS_BY_NAME["list_sg_office_meetings"],
         TOOL_DEFS_BY_NAME["get_sg_office_meeting_details"],
         TOOL_DEFS_BY_NAME["list_sg_office_meeting_facilities"],
