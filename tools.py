@@ -1123,10 +1123,16 @@ def _format_scalar(val) -> str:
 
 def _drop_fields(keys) -> set:
     keys = set(keys)
-    return {
+    drop = {
         raw for raw, labels in _RAW_FIELD_SUPERSEDED_BY.items()
         if raw in keys and any(lbl in keys for lbl in labels)
     }
+    # General rule: any raw field "x" is superseded by a same-row "x_label"
+    # (the pattern _label() produces everywhere in db_queries.py) — covers
+    # priority/request_type/venue/visitor_email_status/facility/etc. without
+    # needing a hardcoded entry per field.
+    drop |= {k for k in keys if f"{k}_label" in keys}
+    return drop
 
 
 def render_tool_result_html(data: Any) -> str:
