@@ -33,6 +33,7 @@ from db_queries import (
     get_sg_office_meeting_details,
     list_sg_office_meeting_facilities,
     list_sg_office_meeting_visitors,
+    list_sg_office_meeting_outcomes,
     list_sg_office_direction_items,
     get_sg_office_direction_item_details,
 )
@@ -529,6 +530,18 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Set true for 'meetings this week' — computed server-side as the current Monday-Sunday week, don't compute the date range yourself.",
                     },
+                    "scheduled_tomorrow": {
+                        "type": "boolean",
+                        "description": "Set true for 'tomorrow's meeting(s)' — computed server-side, don't compute tomorrow's date yourself.",
+                    },
+                    "scheduled_this_month": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings this month' — computed server-side as the current calendar month, don't compute the date range yourself.",
+                    },
+                    "not_ready": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings that aren't ready yet' — at least one of its facility prep tasks isn't Confirmed. Computed server-side from the facility tracker.",
+                    },
                     "scheduled_after": {
                         "type": "string",
                         "description": "Only meetings scheduled on or after this date.",
@@ -555,8 +568,8 @@ TOOL_DEFINITIONS = [
                     },
                     "sort_by": {
                         "type": "string",
-                        "enum": ["oldest"],
-                        "description": "Set to 'oldest' for oldest-first. Omit (default) for newest-first.",
+                        "enum": ["oldest", "soonest"],
+                        "description": "'oldest' sorts by request creation date, oldest first. 'soonest' sorts by scheduled_date ascending — use for 'next upcoming meeting' style questions, combined with upcoming_only=true and limit=1. Omit (default) for newest-created-first.",
                     },
                     "limit": {
                         "type": "integer",
@@ -624,6 +637,11 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "enum": ["high", "medium", "low"],
                     },
+                    "facility": {
+                        "type": "string",
+                        "description": "Filter by facility type, e.g. 'which meetings need parking or security access'.",
+                        "enum": ["room", "parking", "security_access", "access_pass", "hospitality"],
+                    },
                     "unassigned": {
                         "type": "boolean",
                         "description": "Filter to only facility tasks with no one assigned (true) or with someone assigned (false).",
@@ -639,6 +657,14 @@ TOOL_DEFINITIONS = [
                     "due_before": {
                         "type": "string",
                         "description": "Only facility tasks due on or before this date.",
+                    },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Only facility tasks for meetings scheduled today.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Only facility tasks for meetings scheduled this (Mon-Sun) week.",
                     },
                     "meeting_request_id": {
                         "type": "integer",
@@ -691,9 +717,58 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Filter by visitor name (partial match)",
                     },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Only visitors for meetings scheduled today.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Only visitors for meetings scheduled this (Mon-Sun) week.",
+                    },
                     "meeting_request_id": {
                         "type": "integer",
                         "description": "Only visitors for this one meeting.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meeting_outcomes",
+            "description": (
+                "Cross-meeting outcomes tracker — e.g. 'which completed "
+                "meetings need a follow-up', 'what was the outcome of the "
+                "meeting with X'. Spans all meetings at once; for everything "
+                "else about one specific meeting use get_sg_office_meeting_details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the meeting's organization name.",
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the meeting's requester name.",
+                    },
+                    "follow_up_required": {
+                        "type": "boolean",
+                        "description": "Filter to outcomes flagged as needing (true) or not needing (false) a follow-up.",
+                    },
+                    "completed_after": {
+                        "type": "string",
+                        "description": "Only outcomes completed on or after this date.",
+                    },
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Only the outcome for this one meeting.",
                     },
                     "limit": {
                         "type": "integer",
@@ -1075,6 +1150,8 @@ def execute_tool(
             result = list_sg_office_meeting_facilities(conn, user_id, filters=arguments)
         elif tool_name == "list_sg_office_meeting_visitors":
             result = list_sg_office_meeting_visitors(conn, user_id, filters=arguments)
+        elif tool_name == "list_sg_office_meeting_outcomes":
+            result = list_sg_office_meeting_outcomes(conn, user_id, filters=arguments)
         elif tool_name == "list_tasks":
             result = list_tasks(conn, user_id, filters=arguments)
         elif tool_name == "get_task_details":
@@ -1282,6 +1359,7 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
         TOOL_DEFS_BY_NAME["get_sg_office_meeting_details"],
         TOOL_DEFS_BY_NAME["list_sg_office_meeting_facilities"],
         TOOL_DEFS_BY_NAME["list_sg_office_meeting_visitors"],
+        TOOL_DEFS_BY_NAME["list_sg_office_meeting_outcomes"],
     ]
 
     if flags.get("education"):
