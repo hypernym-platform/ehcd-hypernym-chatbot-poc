@@ -1135,6 +1135,21 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
         )
 
+    if filters.get("scheduled_tomorrow"):
+        conditions.append("m.scheduled_date = CURRENT_DATE + INTERVAL '1 day'")
+
+    if filters.get("scheduled_this_month"):
+        conditions.append(
+            "m.scheduled_date BETWEEN date_trunc('month', CURRENT_DATE)::date "
+            "AND (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month - 1 day')::date"
+        )
+
+    if filters.get("not_ready"):
+        # At least one facility prep task isn't Confirmed yet (status != 3).
+        conditions.append(
+            "m.id IN (SELECT f.meeting_request_id FROM sg_office_meetingrequestfacility f WHERE f.status != 3)"
+        )
+
     if filters.get("upcoming_only"):
         # For "upcoming X" where X is a specific status (e.g. "upcoming
         # confirmed") — status=upcoming alone means Confirmed+Rescheduled,
@@ -1173,6 +1188,11 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
 
     if filters.get("sort_by") == "oldest":
         query += " ORDER BY m.created_at ASC"
+    elif filters.get("sort_by") == "soonest":
+        # Soonest upcoming scheduled_date first — use for "next meeting"
+        # style questions. Combine with upcoming_only so past dates don't
+        # sort to the front.
+        query += " ORDER BY m.scheduled_date ASC NULLS LAST"
     else:
         query += " ORDER BY m.created_at DESC"
 
@@ -1339,6 +1359,13 @@ def list_sg_office_meeting_facilities(conn, user_id: int, filters: dict = None) 
             conditions.append("f.priority = %s")
             params.append(p)
 
+    if filters.get("facility"):
+        reverse_map = {v.lower(): k for k, v in FACILITY_TYPE_MAP.items()}
+        ft = reverse_map.get(str(filters["facility"]).lower().replace("_", " "))
+        if ft:
+            conditions.append("f.facility = %s")
+            params.append(ft)
+
     if filters.get("unassigned") is not None:
         if filters["unassigned"]:
             conditions.append("f.assigned_to_id IS NULL")
@@ -1356,6 +1383,15 @@ def list_sg_office_meeting_facilities(conn, user_id: int, filters: dict = None) 
     if filters.get("due_before"):
         conditions.append("f.due_at::date <= %s")
         params.append(filters["due_before"])
+
+    if filters.get("scheduled_today"):
+        conditions.append("m.scheduled_date = CURRENT_DATE")
+
+    if filters.get("scheduled_this_week"):
+        conditions.append(
+            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
+            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+        )
 
     if filters.get("meeting_request_id"):
         conditions.append("f.meeting_request_id = %s")
@@ -1430,6 +1466,15 @@ def list_sg_office_meeting_visitors(conn, user_id: int, filters: dict = None) ->
         conditions.append(clause)
         params.extend(p)
 
+    if filters.get("scheduled_today"):
+        conditions.append("m.scheduled_date = CURRENT_DATE")
+
+    if filters.get("scheduled_this_week"):
+        conditions.append(
+            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
+            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+        )
+
     if filters.get("meeting_request_id"):
         conditions.append("v.meeting_request_id = %s")
         params.append(filters["meeting_request_id"])
@@ -1452,6 +1497,63 @@ def list_sg_office_meeting_visitors(conn, user_id: int, filters: dict = None) ->
         item["readiness_status_label"] = _label(item.get("readiness_status"), READINESS_STATUS_MAP, "Status")
         item["meeting_status_label"] = _label(item.get("meeting_status"), MEETING_STATUS_MAP, "Status")
         item["arrived"] = item.get("arrived_at") is not None
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
+
+
+def list_sg_office_meeting_outcomes(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """Cross-meeting outcomes tracker — e.g. 'which completed meetings need
+    a follow-up'. Returns {"total_count": N, "data": [...]}."""
+    filters = filters or {}
+
+    query = """
+        SELECT o.*, m.requester, m.organization, m.scheduled_date, m.status AS meeting_status,
+               cb.full_name_en AS completed_by_name
+        FROM sg_office_meetingoutcome o
+        JOIN sg_office_meetingrequest m ON m.id = o.meeting_request_id
+        LEFT JOIN user_management_user cb ON cb.id = o.completed_by_id
+    """
+    conditions, params = [], []
+
+    if filters.get("organization"):
+        clause, p = _multi_word_ilike("m.organization", filters["organization"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("requester"):
+        clause, p = _multi_word_ilike("m.requester", filters["requester"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("follow_up_required") is not None:
+        conditions.append("o.follow_up_required = %s")
+        params.append(filters["follow_up_required"])
+
+    if filters.get("completed_after"):
+        conditions.append("o.date_completed >= %s")
+        params.append(filters["completed_after"])
+
+    if filters.get("meeting_request_id"):
+        conditions.append("o.meeting_request_id = %s")
+        params.append(filters["meeting_request_id"])
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY o.date_completed DESC NULLS LAST, o.id DESC"
+
+    if filters.get("limit"):
+        query += " LIMIT %s"
+        params.append(filters["limit"])
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["meeting_status_label"] = _label(item.get("meeting_status"), MEETING_STATUS_MAP, "Status")
         result.append(item)
 
     return {"total_count": len(result), "data": result}
