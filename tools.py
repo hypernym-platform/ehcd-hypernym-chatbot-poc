@@ -178,16 +178,21 @@ TOOL_DEFINITIONS = [
             "name": "list_sg_office_emails",
             "description": (
                 "List internal SG Office email correspondence — the raw "
-                "mailbox (From/Subject/To-CC/Thread/Workflow/Summary/"
-                "Received). Use when the user asks about SG Office emails, "
-                "correspondence, inbox, or unread messages. Each row's "
+                "mailbox, EVERY email regardless of workflow status (From/"
+                "Subject/To-CC/Thread/Workflow/Summary/Received). This is "
+                "what 'Email Correspondence', 'all emails', 'the inbox', "
+                "'unread messages', etc. means — USE THIS BY DEFAULT for "
+                "any question about emails in general. Each row's "
                 "`workflow_label` shows whether it's been turned into a "
-                "tracked item yet ('Not Started' vs 'In Workflow') — but "
-                "for H.E. direction, assigned owner, deadline, or status of "
-                "an item that HAS been turned into one, use "
-                "list_sg_office_direction_items instead (filter by "
-                "item_type='email_correspondence'), which has those fields; "
-                "this raw mailbox tool does not."
+                "tracked item yet ('Not Started' vs 'In Workflow'). Only "
+                "use list_sg_office_direction_items with "
+                "item_type='email_correspondence' instead when the "
+                "question is specifically about WORKFLOW fields — H.E. "
+                "direction, assigned owner, deadline, required decision — "
+                "of an email that's already been promoted into a tracked "
+                "item; that filter covers a much smaller subset (only "
+                "promoted emails), not the whole inbox, so don't use it for "
+                "a general 'show all emails' request."
             ),
             "parameters": {
                 "type": "object",
@@ -214,7 +219,15 @@ TOOL_DEFINITIONS = [
                     },
                     "subject": {
                         "type": "string",
-                        "description": "Filter by subject text (partial match)",
+                        "description": "Filter by subject text ONLY (partial match). For 'X in the subject or preview' style questions, use `keyword` instead.",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Filter by text appearing in EITHER the subject or the body preview (partial match) — use for 'search emails containing X in the subject or preview' style questions.",
+                    },
+                    "duplicate_subject": {
+                        "type": "boolean",
+                        "description": "Set true for 'show duplicate email subjects' — returns every email whose subject (exact match) is shared by more than one email. Computed server-side; don't try to spot duplicates yourself from a list.",
                     },
                     "body_contains": {
                         "type": "string",
@@ -252,6 +265,18 @@ TOOL_DEFINITIONS = [
                     "older_than_days": {
                         "type": "integer",
                         "description": "Only emails received more than this many days ago — use for 'open for more than N days' / 'older than a week' style questions instead of computing a date yourself.",
+                    },
+                    "received_today": {
+                        "type": "boolean",
+                        "description": "Set true for 'emails received today' — computed server-side in the system's local timezone, don't compute today's date yourself.",
+                    },
+                    "received_yesterday": {
+                        "type": "boolean",
+                        "description": "Set true for 'emails received yesterday' — computed server-side in the system's local timezone, don't compute yesterday's date yourself.",
+                    },
+                    "workflow_started": {
+                        "type": "boolean",
+                        "description": "Set false for 'emails with no workflow started yet' / 'not started', true for 'emails already turned into a workflow item'. Computed from whether a direction item exists for that email's thread.",
                     },
                     "sort_by": {
                         "type": "string",
@@ -578,6 +603,10 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Set true for 'meetings with incomplete visitor readiness' — at least one visitor's readiness isn't confirmed. Use THIS (not list_sg_office_meeting_visitors) when the question is about which MEETINGS aren't ready — it returns one row per meeting, not one row per visitor.",
                     },
+                    "duplicate_organization": {
+                        "type": "boolean",
+                        "description": "Set true for 'show duplicate meeting names/organizations' — returns every meeting whose organization (exact match) is shared by more than one meeting request. Computed server-side; don't try to spot duplicates yourself from a list.",
+                    },
                     "scheduled_after": {
                         "type": "string",
                         "description": "Only meetings scheduled on or after this date.",
@@ -630,7 +659,14 @@ TOOL_DEFINITIONS = [
                 "requester/schedule/venue info, participants, facility prep "
                 "tasks, visitor readiness, the post-meeting outcome (notes, "
                 "follow-up, who completed it) if the meeting already "
-                "happened, and the full status-change audit trail. Use ONLY "
+                "happened, and the full status-change audit trail. The "
+                "meeting record's `readiness_summary` field already gives "
+                "the exact 'ready/total' count (Confirmed facilities + "
+                "Confirmed visitors, out of both totals) and "
+                "`visitor_arrival_summary` gives 'arrived/total visitors' "
+                "— use those directly for 'what is the readiness status of "
+                "X' questions, don't recompute them yourself from the "
+                "facilities/visitors lists. Use ONLY "
                 "when the user actually wants 'readiness', 'facilities', "
                 "'participants', 'outcome', 'audit trail', or the meeting's "
                 "full details/'everything'. For a question about one or a "
