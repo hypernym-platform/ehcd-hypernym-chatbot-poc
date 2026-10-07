@@ -152,6 +152,7 @@ def _reorder_item(item: dict, priority_keys: tuple) -> dict:
 MEETING_DEFAULT_FIELDS = (
     "organization", "requester", "scheduled_date", "scheduled_time",
     "venue", "coordinator_name", "status", "facilities_summary",
+    "readiness_summary",
 )
 MEETING_COLUMN_ORDER = (
     "organization", "requester", "status_label", "scheduled_date",
@@ -186,13 +187,35 @@ DIRECTION_ITEM_COLUMN_ORDER = (
 # list (From/Subject/To-CC/Thread/Workflow/Summary/Received). "Thread" here
 # is just thread_id (no per-thread message/unread aggregate exists yet).
 EMAIL_DEFAULT_FIELDS = (
-    "sender_name", "subject", "to_recipients", "cc_recipients", "thread_id",
-    "workflow_label", "summary", "received_datetime",
+    "subject", "sender_name", "to_recipients_summary", "cc_recipients_summary",
+    "received_datetime",
 )
 EMAIL_COLUMN_ORDER = (
-    "sender_name", "subject", "to_recipients", "cc_recipients", "thread_id",
-    "workflow_label", "summary", "received_datetime",
+    "subject", "sender_name", "to_recipients_summary", "cc_recipients_summary",
+    "received_datetime",
 )
+
+
+def _format_recipients(recipients) -> str:
+    """Flatten the raw Graph-API-style recipient JSON
+    ([{"emailAddress": {"name": ..., "address": ...}}, ...]) into a short
+    readable "Name <email>; Name2 <email2>" string — rendering the raw
+    structure directly exploded into a huge nested sub-table per email,
+    which is what made the emails table unreadably large."""
+    if not recipients:
+        return None
+    parts = []
+    for r in recipients:
+        if not isinstance(r, dict):
+            continue
+        addr = r.get("emailAddress", r)
+        name = addr.get("name") or ""
+        email = addr.get("address") or ""
+        if name and email and name != email:
+            parts.append(f"{name} <{email}>")
+        else:
+            parts.append(name or email)
+    return "; ".join(p for p in parts if p) or None
 
 
 def _multi_word_ilike(column: str, text: str):
@@ -773,6 +796,8 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
     result = []
     for r in rows:
         item = dict(r)
+        item["to_recipients_summary"] = _format_recipients(item.get("to_recipients"))
+        item["cc_recipients_summary"] = _format_recipients(item.get("cc_recipients"))
         chosen_fields = filters.get("fields") or list(EMAIL_DEFAULT_FIELDS)
         item = _apply_fields(item, chosen_fields, always_keep=("sender_name", "subject"))
         item = _reorder_item(item, EMAIL_COLUMN_ORDER)
@@ -801,7 +826,10 @@ def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
             email = cur.fetchone()
             if not email:
                 return {"error": "Email not found"}
-            result = {"email": dict(email)}
+            email = dict(email)
+            email["to_recipients"] = _format_recipients(email.get("to_recipients"))
+            email["cc_recipients"] = _format_recipients(email.get("cc_recipients"))
+            result = {"email": email}
             attachment_email_ids = [email["id"]]
         else:
             cur.execute("SELECT * FROM sg_office_emailthread WHERE id = %s", (thread_id,))
@@ -819,6 +847,9 @@ def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
                 {limit_clause}
             """, (thread_id,))
             messages = [dict(r) for r in cur.fetchall()]
+            for m in messages:
+                m["to_recipients"] = _format_recipients(m.get("to_recipients"))
+                m["cc_recipients"] = _format_recipients(m.get("cc_recipients"))
             if latest_only:
                 result = {"thread": dict(thread), "latest_message": messages[0] if messages else None}
                 attachment_email_ids = [messages[0]["id"]] if messages else []
@@ -1170,7 +1201,15 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
                cf.full_name_en AS confirmed_by_name,
                (SELECT ARRAY_AGG(DISTINCT f.facility ORDER BY f.facility)
                 FROM sg_office_meetingrequestfacility f
-                WHERE f.meeting_request_id = m.id) AS facility_codes
+                WHERE f.meeting_request_id = m.id) AS facility_codes,
+               (SELECT COUNT(*) FROM sg_office_meetingrequestfacility f
+                WHERE f.meeting_request_id = m.id) AS facilities_total,
+               (SELECT COUNT(*) FROM sg_office_meetingrequestfacility f
+                WHERE f.meeting_request_id = m.id AND f.status = 3) AS facilities_ready,
+               (SELECT COUNT(*) FROM sg_office_meetingrequestvisitor v
+                WHERE v.meeting_request_id = m.id) AS visitors_total,
+               (SELECT COUNT(*) FROM sg_office_meetingrequestvisitor v
+                WHERE v.meeting_request_id = m.id AND v.readiness_status = 3) AS visitors_ready
         FROM sg_office_meetingrequest m
         LEFT JOIN user_management_user co ON co.id = m.coordinator_id
         LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
@@ -1385,6 +1424,15 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             ", ".join(_label(c, FACILITY_TYPE_MAP, "Facility") for c in facility_codes)
             if facility_codes else None
         )
+        # Same "ready/total" formula as get_sg_office_meeting_details's
+        # readiness_summary (Confirmed facilities + Confirmed visitors, out
+        # of both totals) — exposed here too so a list of meetings (e.g.
+        # "meetings with pending facility requests") can show each one's
+        # readiness at a glance instead of needing a drill-down per meeting.
+        f_total, f_ready = item.pop("facilities_total", 0) or 0, item.pop("facilities_ready", 0) or 0
+        v_total, v_ready = item.pop("visitors_total", 0) or 0, item.pop("visitors_ready", 0) or 0
+        total = f_total + v_total
+        item["readiness_summary"] = f"{f_ready + v_ready}/{total}" if total else None
         chosen_fields = filters.get("fields") or list(MEETING_DEFAULT_FIELDS)
         item = _apply_fields(item, chosen_fields, always_keep=("requester", "organization", "scheduled_date"))
         item = _reorder_item(item, MEETING_COLUMN_ORDER)

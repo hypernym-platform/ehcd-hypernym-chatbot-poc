@@ -1263,6 +1263,22 @@ def render_tool_result_html(data: Any) -> str:
             return render_tool_result_html(data[0])
         dict_items = [d for d in data if isinstance(d, dict)]
         if dict_items and len(dict_items) == len(data):
+            # A single user turn can call more than one tool (e.g. a
+            # meeting lookup AND that meeting's visitor list), and their
+            # results all land in the same flat list here. Those have
+            # DIFFERENT shapes (different key sets) — grouping by the exact
+            # key-set signature first keeps each entity type in its own
+            # table. Without this, the single-table path below would
+            # intersect ALL items' keys down to only the handful every
+            # shape happens to share (e.g. just organization/requester/
+            # scheduled_date for a meeting+visitor mix), silently
+            # discarding almost every actually-useful field.
+            signatures = {frozenset(d.keys()) for d in dict_items}
+            if len(signatures) > 1:
+                groups = {}
+                for d in dict_items:
+                    groups.setdefault(frozenset(d.keys()), []).append(d)
+                return "".join(render_tool_result_html(g) for g in groups.values())
             # Homogeneous list of records (e.g. 23 projects) — one real
             # table, one row per record, columns = the fields they share.
             common_keys = set.intersection(*(set(d.keys()) for d in dict_items))
@@ -1377,6 +1393,13 @@ Tool selection rules:
 6. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
 use the conversation history to identify what the user is referring to.
+7. Conversation history is ONLY for resolving references like that — never a
+substitute for calling the tool again. If the current question needs
+structured data (rule 1), ALWAYS call the matching tool fresh this turn,
+even if an earlier turn asked something that looks the same — the
+underlying data can change between turns (a record was added/edited since),
+so a past tool result may now be stale. Never skip a tool call just because
+conversation history already seems to contain the answer.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 9. Whenever the question asks for a chart, graph, or visualization of an entity
 (projects, SG offices, tasks, resolutions, education stats) — even if it names
@@ -1408,7 +1431,7 @@ messages before the current user message below — read them directly.
 
 ANSWER_SYSTEM_PROMPT = """You are an expert advisor for the Education, Human Development, and Community Development Council (EHCD).
 
-If tool results are present in the conversation, use ONLY that data to answer the user's question.
+If tool results are present in the conversation, use ONLY that data to answer the user's question — specifically the tool results from THIS turn (the most recent ones), never an older tool result from an earlier turn even if it looks like it answers the same question; the data can have changed since then, and this turn's fresh tool call is always the authoritative one.
 If no tool results are present (greetings, general conversation), respond naturally and helpfully.
 
 CONVERSATIONAL CONTEXT RULES:
