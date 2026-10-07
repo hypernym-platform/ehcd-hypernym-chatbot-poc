@@ -193,19 +193,17 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "list_sg_office_emails",
             "description": (
-                "List internal SG Office email correspondence (the Internal "
-                "Directions mailbox managed for H.E., Shamma, and Theyab). "
-                "Use when the user asks about SG Office emails, "
-                "correspondence, inbox, unread messages, or internal "
-                "directions received. Each email includes an AI-generated "
-                "`summary` field already — read it directly to answer "
-                "'summarize this' or 'what is this about' questions, no "
-                "separate summarization step needed. NOTE: there is no "
-                "field yet for H.E. direction, assigned owner, deadline, or "
-                "workflow status (that layer isn't built yet) — don't "
-                "invent an answer for 'awaiting H.E. direction', 'overdue "
-                "directions', 'assigned to X', or 'due this week'; say "
-                "plainly that this isn't tracked yet instead."
+                "List internal SG Office email correspondence — the raw "
+                "mailbox (From/Subject/To-CC/Thread/Workflow/Summary/"
+                "Received). Use when the user asks about SG Office emails, "
+                "correspondence, inbox, or unread messages. Each row's "
+                "`workflow_label` shows whether it's been turned into a "
+                "tracked item yet ('Not Started' vs 'In Workflow') — but "
+                "for H.E. direction, assigned owner, deadline, or status of "
+                "an item that HAS been turned into one, use "
+                "list_sg_office_direction_items instead (filter by "
+                "item_type='email_correspondence'), which has those fields; "
+                "this raw mailbox tool does not."
             ),
             "parameters": {
                 "type": "object",
@@ -276,6 +274,11 @@ TOOL_DEFINITIONS = [
                         "description": "Set to 'oldest' for oldest-received-first. Omit (default) for newest-first.",
                         "enum": ["oldest"],
                     },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Set this when the user asked about only one or a few specific attributes (e.g. ['summary'], ['has_attachments']) — the result will include only those fields plus sender/subject for context, instead of the default view. Omit entirely for the default From/Subject/To-CC/Thread/Workflow/Summary/Received view.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Max number of emails to return, e.g. 'the 5 latest emails' -> limit=5. Omit to return all matching emails.",
@@ -329,7 +332,16 @@ TOOL_DEFINITIONS = [
                 "mailbox tools (list_sg_office_emails). Use for questions "
                 "about memos, weekly actions, items awaiting H.E. "
                 "direction, overdue/stalled items, or anything about the "
-                "status/owner/deadline of an internal direction item."
+                "status/owner/deadline of an internal direction item. "
+                "PREFER THIS over get_sg_office_direction_item_details "
+                "(with `code` set to the exact item) whenever the user asks "
+                "about ONE OR A FEW specific attributes of a specific item "
+                "(e.g. 'what is the status of MEM-011', 'what's the "
+                "deadline for WA-012') — pass those attribute names in "
+                "`fields` to get back a short, focused answer instead of "
+                "the full record. Only use get_sg_office_direction_item_details "
+                "when notes, attachments, the audit trail, related items, "
+                "or the item's full details are actually wanted."
             ),
             "parameters": {
                 "type": "object",
@@ -431,6 +443,11 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "enum": ["oldest"],
                     },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Set this ONLY to narrow further than the default — e.g. ['status'] to answer just 'what's the status of X'. Omitting `fields` already returns a short curated set (code/subject/sender/decision/owner/deadline/status for memos; code/subject/source meeting/owner/deadline/priority/status/reminder for weekly actions), matching the real Memo Register / Weekly Actions pages — NOT the full ~50-field record, so you don't need `fields` just to avoid a large table.",
+                    },
                     "limit": {
                         "type": "integer",
                     },
@@ -446,9 +463,13 @@ TOOL_DEFINITIONS = [
             "description": (
                 "Full detail for one Internal Direction item (email/memo/"
                 "weekly action): the record, notes, attachments, audit "
-                "trail, and related items. Use for 'what did H.E. direct "
-                "on X', 'show me the audit trail for MEM-026', or any "
-                "specific item by code."
+                "trail, and related items. Use ONLY when the user actually "
+                "wants notes, attachments, the audit/status history, "
+                "related items, or the item's full details/'everything'. "
+                "For a question about one or a few specific attributes "
+                "(status, deadline, owner, priority, etc.) use "
+                "list_sg_office_direction_items with `code` and `fields` "
+                "instead — it returns a much shorter, focused answer."
             ),
             "parameters": {
                 "type": "object",
@@ -475,7 +496,15 @@ TOOL_DEFINITIONS = [
                 "Meetings & Visits board — organizations/visitors requesting "
                 "to meet SG Office leadership). Use for questions about "
                 "meeting requests, visits, visitor meetings, upcoming "
-                "meetings, or their status/priority/coordinator."
+                "meetings, or their status/priority/coordinator. PREFER "
+                "THIS over get_sg_office_meeting_details whenever the user "
+                "asks about ONE OR A FEW specific attributes of one meeting "
+                "(e.g. 'when is the meeting with X', 'what's the status of "
+                "the meeting with Y') — filter by requester/organization "
+                "and pass those attribute names in `fields` for a short, "
+                "focused answer. Only use get_sg_office_meeting_details when "
+                "participants, facilities, visitors, the outcome, the audit "
+                "trail, or the meeting's full details are actually wanted."
             ),
             "parameters": {
                 "type": "object",
@@ -548,13 +577,22 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Set true for 'tomorrow's meeting(s)' — computed server-side, don't compute tomorrow's date yourself.",
                     },
+                    "scheduled_on_weekday": {
+                        "type": "string",
+                        "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+                        "description": "Set for 'which meeting is on Tuesday' style questions — matches any upcoming meeting falling on that weekday, computed server-side. NEVER work out which calendar date a weekday falls on yourself and use scheduled_on with it — you will get it wrong.",
+                    },
                     "scheduled_this_month": {
                         "type": "boolean",
                         "description": "Set true for 'meetings this month' — computed server-side as the current calendar month, don't compute the date range yourself.",
                     },
                     "not_ready": {
                         "type": "boolean",
-                        "description": "Set true for 'meetings that aren't ready yet' — at least one of its facility prep tasks isn't Confirmed. Computed server-side from the facility tracker.",
+                        "description": "Set true for 'meetings that aren't ready yet' or 'meetings with pending facility requests' — at least one of its facility prep tasks isn't Confirmed. Computed server-side from the facility tracker. Each result row's `facilities_summary` field already lists which facility types (Room, Parking, etc.) were requested for that meeting — don't call list_sg_office_meeting_facilities just to see what facilities a meeting needs.",
+                    },
+                    "visitors_not_ready": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings with incomplete visitor readiness' — at least one visitor's readiness isn't confirmed. Use THIS (not list_sg_office_meeting_visitors) when the question is about which MEETINGS aren't ready — it returns one row per meeting, not one row per visitor.",
                     },
                     "scheduled_after": {
                         "type": "string",
@@ -585,6 +623,11 @@ TOOL_DEFINITIONS = [
                         "enum": ["oldest", "soonest"],
                         "description": "'oldest' sorts by request creation date, oldest first. 'soonest' sorts by scheduled_date ascending — use for 'next upcoming meeting' style questions, combined with upcoming_only=true and limit=1. Omit (default) for newest-created-first.",
                     },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Set this ONLY to narrow further than the default — e.g. ['email'] to answer just 'what's the requester's email for X'. Omitting `fields` already returns a short curated set (organization/requester/status/date/time/venue/coordinator), matching the real Meeting Requests page — NOT the full ~25-field record, so you don't need `fields` just to avoid a large table.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Max number of meetings to return.",
@@ -603,10 +646,14 @@ TOOL_DEFINITIONS = [
                 "requester/schedule/venue info, participants, facility prep "
                 "tasks, visitor readiness, the post-meeting outcome (notes, "
                 "follow-up, who completed it) if the meeting already "
-                "happened, and the full status-change audit trail. Use "
-                "whenever the user asks about ONE specific meeting by name/"
-                "requester/organization, or asks for its 'readiness', "
-                "'facilities', 'participants', 'outcome', or 'audit trail'."
+                "happened, and the full status-change audit trail. Use ONLY "
+                "when the user actually wants 'readiness', 'facilities', "
+                "'participants', 'outcome', 'audit trail', or the meeting's "
+                "full details/'everything'. For a question about one or a "
+                "few specific attributes (status, date, venue, etc.) use "
+                "list_sg_office_meetings with a requester/organization "
+                "filter and `fields` instead — it returns a much shorter, "
+                "focused answer."
             ),
             "parameters": {
                 "type": "object",
@@ -625,11 +672,16 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "list_sg_office_meeting_facilities",
             "description": (
-                "Cross-meeting facility-preparation tracker — e.g. 'which "
-                "facility requests are unassigned', 'what facility prep is "
-                "overdue', 'show facility tasks assigned to X'. Spans all "
-                "meetings at once, unlike get_sg_office_meeting_details "
-                "which is scoped to one meeting."
+                "Cross-meeting facility-preparation tracker, one row per "
+                "FACILITY TASK — e.g. 'which facility tasks are "
+                "unassigned', 'what facility prep is overdue', 'show "
+                "facility tasks assigned to X'. If the question is about "
+                "which MEETINGS have pending/incomplete facility requests "
+                "(not which individual tasks), use list_sg_office_meetings "
+                "with not_ready=true instead — it returns one row per "
+                "meeting (with a facilities_summary column listing what was "
+                "requested), not one per facility, and won't repeat the "
+                "same meeting once per facility."
             ),
             "parameters": {
                 "type": "object",
@@ -697,11 +749,15 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "list_sg_office_meeting_visitors",
             "description": (
-                "Cross-meeting visitor readiness tracker — e.g. 'which "
-                "visitors haven't arrived', 'whose readiness is not "
-                "confirmed', 'did the visitor email fail for anyone'. Spans "
-                "all meetings at once, unlike get_sg_office_meeting_details "
-                "which is scoped to one meeting."
+                "Cross-meeting visitor tracker, one row per VISITOR — e.g. "
+                "'which visitors haven't arrived', 'whose readiness is not "
+                "confirmed', 'did the visitor email fail for anyone'. If "
+                "the question is about which MEETINGS have incomplete "
+                "visitor readiness (not which visitors), use "
+                "list_sg_office_meetings with visitors_not_ready=true "
+                "instead — it returns one row per meeting, not one per "
+                "visitor, and won't overcount/miscount how many meetings "
+                "are affected."
             ),
             "parameters": {
                 "type": "object",
@@ -1151,6 +1207,17 @@ def _drop_fields(keys) -> set:
     return drop
 
 
+def _is_detail_wrapper(d: dict) -> bool:
+    """True for a get_*_details-shaped dict: every top-level value is itself
+    a dict or list (no plain scalar fields), with at least one non-empty
+    dict-valued key to serve as the primary record."""
+    if not d or not isinstance(d, dict):
+        return False
+    if any(v is not None and not isinstance(v, (dict, list)) for v in d.values()):
+        return False
+    return any(isinstance(v, dict) and v for v in d.values())
+
+
 def render_tool_result_html(data: Any) -> str:
     """Recursively render any JSON-shaped tool result as an HTML table."""
     # SQL-style {"columns": [...], "rows": [[...], ...]} wrapper
@@ -1168,6 +1235,12 @@ def render_tool_result_html(data: Any) -> str:
     if isinstance(data, list):
         if not data:
             return "<p>No results found.</p>"
+        if len(data) == 1 and isinstance(data[0], dict) and _is_detail_wrapper(data[0]):
+            # A get_*_details result (e.g. {"item": {...}, "notes": [...],
+            # "attachments": [...]}) lands here wrapped in a 1-item list —
+            # unwrap it so it renders as one flat record + labeled sections
+            # instead of one row whose columns are each a nested sub-table.
+            return render_tool_result_html(data[0])
         dict_items = [d for d in data if isinstance(d, dict)]
         if dict_items and len(dict_items) == len(data):
             # Homogeneous list of records (e.g. 23 projects) — one real
@@ -1196,6 +1269,21 @@ def render_tool_result_html(data: Any) -> str:
         return f"<table>{rows}</table>"
 
     if isinstance(data, dict):
+        if _is_detail_wrapper(data):
+            # get_*_details shape: one primary record plus several
+            # list/dict-valued sections (notes, attachments, audit_trail,
+            # participants, facilities, outcome, ...). Render the primary
+            # record as one flat table, then each non-empty section as its
+            # own clearly labeled table below — not nested inside one cell.
+            primary_key = next((k for k, v in data.items() if isinstance(v, dict) and v), None)
+            parts = [render_tool_result_html(data[primary_key])]
+            for key, val in data.items():
+                if key == primary_key or not val:
+                    continue
+                parts.append(f"<h4>{html.escape(_humanize_field(key))}</h4>")
+                parts.append(render_tool_result_html(val))
+            return "".join(parts)
+
         keys = data.keys()
         drop = _drop_fields(keys)
         rows = []

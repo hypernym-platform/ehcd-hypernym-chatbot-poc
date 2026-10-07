@@ -4,6 +4,7 @@ Projects, SG Offices, Task Management, Resolution Management.
 """
 
 import json
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -105,6 +106,77 @@ def _label(val, mapping: dict, prefix: str) -> str:
     return mapping.get(val, f"{prefix} {val}")
 
 
+def _apply_fields(item: dict, fields, always_keep=()) -> dict:
+    """Trim a result dict to just the requested fields — plus each one's
+    resolved _label counterpart and a few always-kept identity fields — when
+    the caller only asked about specific attributes. Returns the item
+    unchanged when fields is empty, so full-detail callers are unaffected."""
+    if not fields:
+        return item
+    keep = set(always_keep) | set(fields) | {f"{f}_label" for f in fields}
+    return {k: v for k, v in item.items() if k in keep}
+
+
+def _reorder_item(item: dict, priority_keys: tuple) -> dict:
+    """Return item with priority_keys placed first, in the given order
+    (skipping any not present), followed by all remaining keys in their
+    original order — controls the column order a table renders in."""
+    ordered = {k: item[k] for k in priority_keys if k in item}
+    ordered.update((k, v) for k, v in item.items() if k not in ordered)
+    return ordered
+
+
+# Curated default view for meeting tables — mirrors the real frontend's
+# "Meeting Requests" list page (Meeting/Requester/When & Where/Coordinator/
+# Status) rather than dumping every column. Base names so _apply_fields
+# auto-includes each one's resolved _label; still fully overridable via an
+# explicit `fields` request for anything not in this default set.
+MEETING_DEFAULT_FIELDS = (
+    "organization", "requester", "scheduled_date", "scheduled_time",
+    "venue", "coordinator_name", "status", "facilities_summary",
+)
+MEETING_COLUMN_ORDER = (
+    "organization", "requester", "status_label", "scheduled_date",
+    "scheduled_time", "venue_label", "priority_label", "coordinator_name",
+    "facilities_summary",
+)
+
+# Curated default views for direction items — mirror the real frontend's
+# Memo Register / Weekly Meeting Actions list pages. Memo and Weekly Action
+# show different columns there, so the default is picked per-item from its
+# own item_type; email_correspondence (and any unrecognized type) falls
+# back to a generic set. Base names so _apply_fields auto-includes each
+# one's resolved _label.
+DIRECTION_ITEM_DEFAULT_FIELDS = {
+    2: ("code", "date_received", "sender_name", "subject", "required_decision",
+        "he_direction", "owner_name", "deadline", "status", "closed_at"),  # memo
+    3: ("code", "subject", "source_meeting", "meeting_date", "owner_name",
+        "deadline", "priority", "status", "reminder_label", "updated_at"),  # weekly_action
+}
+DIRECTION_ITEM_DEFAULT_FIELDS_GENERIC = (
+    "code", "item_type_label", "subject", "sender_name", "date_received",
+    "owner_name", "deadline", "status",
+)
+DIRECTION_ITEM_COLUMN_ORDER = (
+    "code", "subject", "date_received", "sender_name", "source_meeting",
+    "meeting_date", "required_decision_label", "he_direction", "owner_name",
+    "deadline", "priority_label", "status_label", "reminder_label",
+    "closed_at", "updated_at",
+)
+
+# Curated default view for the raw inbox — mirrors the frontend's email
+# list (From/Subject/To-CC/Thread/Workflow/Summary/Received). "Thread" here
+# is just thread_id (no per-thread message/unread aggregate exists yet).
+EMAIL_DEFAULT_FIELDS = (
+    "sender_name", "subject", "to_recipients", "cc_recipients", "thread_id",
+    "workflow_label", "summary", "received_datetime",
+)
+EMAIL_COLUMN_ORDER = (
+    "sender_name", "subject", "to_recipients", "cc_recipients", "thread_id",
+    "workflow_label", "summary", "received_datetime",
+)
+
+
 def _multi_word_ilike(column: str, text: str):
     """Build an (SQL fragment, params) pair that matches a column against
     EVERY word in `text`, in any order — e.g. searching "Emirates Foundation
@@ -113,7 +185,18 @@ def _multi_word_ilike(column: str, text: str):
     single-substring ILIKE. Used for free-text name/org/subject filters
     where a user's natural-language phrasing won't exactly match the DB's
     punctuation/spacing."""
-    words = [w for w in text.split() if w]
+    # Strip leading/trailing punctuation from each word (quotes, brackets,
+    # trailing periods/colons, a standalone "-"/"–"/"—") before matching —
+    # it adds no matching signal and is exactly how this breaks: a token
+    # like "[FW:" (user wrapped a subject in brackets/quotes) or a plain
+    # "-" where the DB has an en dash "–" never appears as a literal
+    # substring in the real text, silently zeroing out an otherwise-correct
+    # match on every other word once ANDed together.
+    words = []
+    for w in text.split():
+        stripped = re.sub(r"^\W+|\W+$", "", w, flags=re.UNICODE)
+        if stripped:
+            words.append(stripped)
     if not words:
         return "TRUE", []
     clauses = [f"{column} ILIKE %s" for _ in words]
@@ -553,7 +636,10 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
                e.bcc_recipients, e.reply_to, e.importance, e.has_attachments, e.is_read,
                e.is_draft, e.categories, e.flag, e.web_link, e.received_datetime,
                e.sent_datetime, e.thread_id, e.created_at, e.updated_at,
-               u.full_name_en AS mailbox_owner_name
+               u.full_name_en AS mailbox_owner_name,
+               CASE WHEN EXISTS(
+                   SELECT 1 FROM sg_office_directionitem d WHERE d.thread_id = e.thread_id
+               ) THEN 'In Workflow' ELSE 'Not Started' END AS workflow_label
         FROM sg_office_email e
         LEFT JOIN user_management_user u ON u.id = e.mailbox_owner_id
     """
@@ -650,7 +736,15 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
         cur.execute(query, params)
         rows = cur.fetchall()
 
-    return {"total_count": len(rows), "data": [dict(r) for r in rows]}
+    result = []
+    for r in rows:
+        item = dict(r)
+        chosen_fields = filters.get("fields") or list(EMAIL_DEFAULT_FIELDS)
+        item = _apply_fields(item, chosen_fields, always_keep=("sender_name", "subject"))
+        item = _reorder_item(item, EMAIL_COLUMN_ORDER)
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
 
 
 def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
@@ -897,6 +991,13 @@ def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> 
             item.get("direction_outcome"), DIRECTION_OUTCOME_MAP, "Outcome")
         item["correspondence_direction_label"] = _label(
             item.get("correspondence_direction"), CORRESPONDENCE_DIRECTION_MAP, "Direction")
+        if item.get("reminder_value") and item.get("reminder_unit"):
+            unit = _label(item.get("reminder_unit"), REMINDER_UNIT_MAP, "")
+            item["reminder_label"] = f"Every {item['reminder_value']} {unit}"
+        chosen_fields = filters.get("fields") or list(
+            DIRECTION_ITEM_DEFAULT_FIELDS.get(item.get("item_type"), DIRECTION_ITEM_DEFAULT_FIELDS_GENERIC))
+        item = _apply_fields(item, chosen_fields, always_keep=("code", "subject", "item_type_label"))
+        item = _reorder_item(item, DIRECTION_ITEM_COLUMN_ORDER)
         result.append(item)
 
     return {"total_count": len(result), "data": result}
@@ -1032,7 +1133,10 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         SELECT m.*,
                co.full_name_en AS coordinator_name,
                cb.full_name_en AS created_by_name,
-               cf.full_name_en AS confirmed_by_name
+               cf.full_name_en AS confirmed_by_name,
+               (SELECT ARRAY_AGG(DISTINCT f.facility ORDER BY f.facility)
+                FROM sg_office_meetingrequestfacility f
+                WHERE f.meeting_request_id = m.id) AS facility_codes
         FROM sg_office_meetingrequest m
         LEFT JOIN user_management_user co ON co.id = m.coordinator_id
         LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
@@ -1150,6 +1254,26 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             "m.id IN (SELECT f.meeting_request_id FROM sg_office_meetingrequestfacility f WHERE f.status != 3)"
         )
 
+    if filters.get("visitors_not_ready"):
+        # At least one visitor's readiness isn't confirmed (status = 1 —
+        # the only value this system confirms means "Not Confirmed"). This
+        # is MEETING-level (one row per meeting), unlike
+        # list_sg_office_meeting_visitors which is one row per visitor —
+        # use this for "which MEETINGS have incomplete visitor readiness".
+        conditions.append(
+            "m.id IN (SELECT v.meeting_request_id FROM sg_office_meetingrequestvisitor v WHERE v.readiness_status = 1)"
+        )
+
+    if filters.get("scheduled_on_weekday"):
+        # ISODOW computed in SQL — never let the model work out which
+        # calendar date a weekday name falls on, it gets this wrong.
+        weekday_map = {"monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4,
+                       "friday": 5, "saturday": 6, "sunday": 7}
+        dow = weekday_map.get(str(filters["scheduled_on_weekday"]).lower())
+        if dow:
+            conditions.append("EXTRACT(ISODOW FROM m.scheduled_date) = %s AND m.scheduled_date >= CURRENT_DATE")
+            params.append(dow)
+
     if filters.get("upcoming_only"):
         # For "upcoming X" where X is a specific status (e.g. "upcoming
         # confirmed") — status=upcoming alone means Confirmed+Rescheduled,
@@ -1213,6 +1337,14 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         item["venue_label"] = _label(item.get("venue"), VENUE_MAP, "Venue")
         item["visitor_email_status_label"] = _label(
             item.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
+        facility_codes = item.pop("facility_codes", None) or []
+        item["facilities_summary"] = (
+            ", ".join(_label(c, FACILITY_TYPE_MAP, "Facility") for c in facility_codes)
+            if facility_codes else None
+        )
+        chosen_fields = filters.get("fields") or list(MEETING_DEFAULT_FIELDS)
+        item = _apply_fields(item, chosen_fields, always_keep=("requester", "organization", "scheduled_date"))
+        item = _reorder_item(item, MEETING_COLUMN_ORDER)
         result.append(item)
 
     return {"total_count": len(result), "data": result}
@@ -1245,6 +1377,14 @@ def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -
         meeting["venue_label"] = _label(meeting.get("venue"), VENUE_MAP, "Venue")
         meeting["visitor_email_status_label"] = _label(
             meeting.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
+        # Full-detail view still uses the curated set as its base record —
+        # the nested sections below (participants/facilities/visitors/
+        # outcome/audit_trail) are where the deeper, specifically-asked-for
+        # detail actually lives.
+        meeting = _apply_fields(
+            meeting, list(MEETING_DEFAULT_FIELDS) + ["purpose", "request_type", "duration_minutes"],
+            always_keep=("requester", "organization", "scheduled_date"))
+        meeting = _reorder_item(meeting, MEETING_COLUMN_ORDER)
 
         cur.execute("""
             SELECT u.id, u.full_name_en, u.full_name_ar, u.email, u.designation

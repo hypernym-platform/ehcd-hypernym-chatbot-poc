@@ -32,6 +32,9 @@ BROWN_COLORS = [
 #]
 
 
+_CHART_WORD_RE = re.compile(r"\b(chart|graphs?|visualiz\w*|diagram\w*|pie)\b", re.IGNORECASE)
+
+
 def is_chart_request(query: str) -> bool:
     """
     True if the query's own wording asks for a chart/graph, independent of
@@ -41,12 +44,16 @@ def is_chart_request(query: str) -> bool:
     requested field doesn't exist for that entity, like a task's "budget")
     — the model has no way to know that in advance, since chart detection
     runs after its response is already generated.
+
+    Uses word-boundary matching, not plain substring — a naive `"pie" in
+    query` check previously fired on any word containing "pie" as a
+    substring, e.g. "recipients" ("reci-PIE-nts"), turning an ordinary
+    retrieval question into a false chart request.
     """
     query_lower = query.lower()
-    return any(
-        w in query_lower
-        for w in ["chart", "graph", "visualiz", "diagram", "compare budget", "pie", "bar chart"]
-    )
+    if _CHART_WORD_RE.search(query_lower):
+        return True
+    return "compare budget" in query_lower
 
 
 def detect_chart_opportunity(
@@ -462,6 +469,11 @@ def _status_distribution_chart(tool_results: List[Dict]) -> Optional[Dict]:
     for item in tool_results:
         status = (
             item.get("status_label")
+            # Visitor readiness rows have no "status_label" field — their
+            # distribution-worthy field is readiness_status_label instead —
+            # without this, a "visitor readiness status" chart request fell
+            # through to the generic numeric fallback and plotted IDs.
+            or item.get("readiness_status_label")
             or item.get("status_en")
             or item.get("status")
         )
