@@ -58,7 +58,7 @@ MEETING_UPCOMING_STATUSES = [3, 5]
 MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
 MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 3: "Delegation Visit", 4: "Facility Visit"}
 VISITOR_EMAIL_STATUS_MAP = {1: "Not Sent", 2: "Sent"}
-READINESS_STATUS_MAP = {1: "Not Confirmed"}  # 2, 3 unconfirmed
+READINESS_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 still unconfirmed
 FACILITY_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 unconfirmed
 FACILITY_TYPE_MAP = {
     5: "Room", 2: "Parking", 1: "Security Access",
@@ -100,6 +100,24 @@ DIRECTION_EVENT_TYPE_MAP = {
 }
 
 
+# This system is UAE-based (EHCD, Abu Dhabi); Postgres's own built-in
+# today/now functions evaluate in the session's timezone, which is UTC
+# here — the bare SQL keyword lags real UAE local time by a full calendar
+# day during the ~4-hour window each night (UAE 00:00-03:59 = UTC 20:00-
+# 23:59 the previous day), so "today"/"this week" filters could silently
+# miss a meeting created "for today" in UAE time. Every date-boundary
+# filter below uses this Dubai-local expression instead of that bare SQL
+# keyword.
+_TODAY_DUBAI = "(NOW() AT TIME ZONE 'Asia/Dubai')::date"
+
+
+def _dubai_date(column: str) -> str:
+    """SQL fragment: cast a timestamptz column to its Dubai-local calendar
+    date, instead of `column::date` which casts using the session's (UTC)
+    timezone and can land on the wrong day near the UAE day boundary."""
+    return f"({column} AT TIME ZONE 'Asia/Dubai')::date"
+
+
 def _label(val, mapping: dict, prefix: str) -> str:
     if val is None:
         return None
@@ -138,7 +156,7 @@ MEETING_DEFAULT_FIELDS = (
 MEETING_COLUMN_ORDER = (
     "organization", "requester", "status_label", "scheduled_date",
     "scheduled_time", "venue_label", "priority_label", "coordinator_name",
-    "facilities_summary",
+    "facilities_summary", "readiness_summary", "visitor_arrival_summary",
 )
 
 # Curated default views for direction items — mirror the real frontend's
@@ -305,7 +323,7 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         # the model was left to eyeball "has this project's due date
         # passed?" from the raw project list itself, and got it wrong (it
         # flagged a project ending 2027-08-31 as overdue on 2026-10-01).
-        conditions.append("p.end_date::date < CURRENT_DATE")
+        conditions.append("p.end_date::date < (NOW() AT TIME ZONE 'Asia/Dubai')::date")
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -660,10 +678,16 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
             conditions.append("(e.flag->>'flagStatus' IS DISTINCT FROM 'flagged')")
 
     if filters.get("sender"):
-        c1, p1 = _multi_word_ilike("e.sender_name", filters["sender"])
-        c2, p2 = _multi_word_ilike("e.sender_email", filters["sender"])
-        conditions.append(f"({c1} OR {c2})")
-        params.extend(p1 + p2)
+        # Search sender_name and sender_email as ONE combined target, not
+        # two separately-ANDed columns — a "Name <email>" style search (a
+        # very natural way to specify a sender) has its name-words satisfied
+        # by sender_name and its email satisfied by sender_email, but NEVER
+        # both by either column alone, so the old OR-of-two-ANDs could never
+        # match a combined name+email search even when it was exactly right.
+        clause, p = _multi_word_ilike(
+            "(e.sender_name || ' ' || COALESCE(e.sender_email, ''))", filters["sender"])
+        conditions.append(clause)
+        params.extend(p)
 
     if filters.get("recipient"):
         c1, p1 = _multi_word_ilike("e.to_recipients::text", filters["recipient"])
@@ -675,6 +699,23 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
         clause, p = _multi_word_ilike("e.subject", filters["subject"])
         conditions.append(clause)
         params.extend(p)
+
+    if filters.get("duplicate_subject"):
+        conditions.append("""
+            e.subject IN (
+                SELECT subject FROM sg_office_email
+                WHERE subject IS NOT NULL
+                GROUP BY subject HAVING COUNT(*) > 1
+            )
+        """)
+
+    if filters.get("keyword"):
+        # Matches subject OR body_preview — distinct from subject (subject
+        # only) and body_contains (preview/content/summary, no subject).
+        c1, p1 = _multi_word_ilike("e.subject", filters["keyword"])
+        c2, p2 = _multi_word_ilike("e.body_preview", filters["keyword"])
+        conditions.append(f"({c1} OR {c2})")
+        params.extend(p1 + p2)
 
     if filters.get("body_contains"):
         c1, p1 = _multi_word_ilike("e.body_preview", filters["body_contains"])
@@ -705,11 +746,11 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
         params.extend(p)
 
     if filters.get("received_after"):
-        conditions.append("e.received_datetime::date >= %s")
+        conditions.append("(e.received_datetime AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["received_after"])
 
     if filters.get("received_before"):
-        conditions.append("e.received_datetime::date <= %s")
+        conditions.append("(e.received_datetime AT TIME ZONE 'Asia/Dubai')::date <= %s")
         params.append(filters["received_before"])
 
     if filters.get("older_than_days"):
@@ -717,8 +758,23 @@ def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str,
         # comparison in SQL — same reasoning as the projects `overdue`
         # filter: don't make the model do its own date math against
         # today's date, it gets it wrong.
-        conditions.append("e.received_datetime::date < (CURRENT_DATE - (%s || ' days')::interval)")
+        conditions.append("(e.received_datetime AT TIME ZONE 'Asia/Dubai')::date < ((NOW() AT TIME ZONE 'Asia/Dubai')::date - (%s || ' days')::interval)")
         params.append(filters["older_than_days"])
+
+    if filters.get("received_today"):
+        conditions.append("(e.received_datetime AT TIME ZONE 'Asia/Dubai')::date = (NOW() AT TIME ZONE 'Asia/Dubai')::date")
+
+    if filters.get("received_yesterday"):
+        conditions.append(
+            "(e.received_datetime AT TIME ZONE 'Asia/Dubai')::date = "
+            "(NOW() AT TIME ZONE 'Asia/Dubai')::date - INTERVAL '1 day'"
+        )
+
+    if filters.get("workflow_started") is not None:
+        exists_clause = (
+            "EXISTS(SELECT 1 FROM sg_office_directionitem d WHERE d.thread_id = e.thread_id)"
+        )
+        conditions.append(exists_clause if filters["workflow_started"] else f"NOT {exists_clause}")
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -926,7 +982,7 @@ def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> 
         params.extend(p)
 
     if filters.get("date_received_after"):
-        conditions.append("d.date_received::date >= %s")
+        conditions.append("(d.date_received AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["date_received_after"])
 
     if filters.get("meeting_date_on"):
@@ -944,7 +1000,7 @@ def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> 
     if filters.get("overdue"):
         # Deadline passed and the item isn't in a finished state yet.
         conditions.append(
-            f"d.deadline < CURRENT_DATE AND d.status NOT IN {DIRECTION_FINISHED_STATUSES}"
+            f"d.deadline < (NOW() AT TIME ZONE 'Asia/Dubai')::date AND d.status NOT IN {DIRECTION_FINISHED_STATUSES}"
         )
 
     if filters.get("stalled"):
@@ -952,15 +1008,15 @@ def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> 
         # assigned/directed, and sitting for a few days.
         conditions.append(
             f"d.status IN {DIRECTION_PRE_ASSIGNMENT_STATUSES} "
-            "AND d.created_at::date < (CURRENT_DATE - INTERVAL '3 days')"
+            "AND (d.created_at AT TIME ZONE 'Asia/Dubai')::date < ((NOW() AT TIME ZONE 'Asia/Dubai')::date - INTERVAL '3 days')"
         )
 
     if filters.get("created_after"):
-        conditions.append("d.created_at::date >= %s")
+        conditions.append("(d.created_at AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["created_after"])
 
     if filters.get("closed_after"):
-        conditions.append("d.closed_at::date >= %s")
+        conditions.append("(d.closed_at AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["closed_after"])
 
     if conditions:
@@ -1229,23 +1285,23 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
 
     if filters.get("scheduled_today"):
         # Deterministic — don't make the model compute "today" itself.
-        conditions.append("m.scheduled_date = CURRENT_DATE")
+        conditions.append("m.scheduled_date = (NOW() AT TIME ZONE 'Asia/Dubai')::date")
 
     if filters.get("scheduled_this_week"):
         # ISO week (Monday-Sunday) containing today, computed in SQL so the
         # model never has to work out week boundaries itself.
         conditions.append(
-            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
-            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+            "m.scheduled_date BETWEEN date_trunc('week', (NOW() AT TIME ZONE 'Asia/Dubai')::date)::date "
+            "AND (date_trunc('week', (NOW() AT TIME ZONE 'Asia/Dubai')::date) + INTERVAL '6 days')::date"
         )
 
     if filters.get("scheduled_tomorrow"):
-        conditions.append("m.scheduled_date = CURRENT_DATE + INTERVAL '1 day'")
+        conditions.append("m.scheduled_date = (NOW() AT TIME ZONE 'Asia/Dubai')::date + INTERVAL '1 day'")
 
     if filters.get("scheduled_this_month"):
         conditions.append(
-            "m.scheduled_date BETWEEN date_trunc('month', CURRENT_DATE)::date "
-            "AND (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month - 1 day')::date"
+            "m.scheduled_date BETWEEN date_trunc('month', (NOW() AT TIME ZONE 'Asia/Dubai')::date)::date "
+            "AND (date_trunc('month', (NOW() AT TIME ZONE 'Asia/Dubai')::date) + INTERVAL '1 month - 1 day')::date"
         )
 
     if filters.get("not_ready"):
@@ -1264,6 +1320,15 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             "m.id IN (SELECT v.meeting_request_id FROM sg_office_meetingrequestvisitor v WHERE v.readiness_status = 1)"
         )
 
+    if filters.get("duplicate_organization"):
+        conditions.append("""
+            m.organization IN (
+                SELECT organization FROM sg_office_meetingrequest
+                WHERE organization IS NOT NULL
+                GROUP BY organization HAVING COUNT(*) > 1
+            )
+        """)
+
     if filters.get("scheduled_on_weekday"):
         # ISODOW computed in SQL — never let the model work out which
         # calendar date a weekday name falls on, it gets this wrong.
@@ -1271,7 +1336,7 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
                        "friday": 5, "saturday": 6, "sunday": 7}
         dow = weekday_map.get(str(filters["scheduled_on_weekday"]).lower())
         if dow:
-            conditions.append("EXTRACT(ISODOW FROM m.scheduled_date) = %s AND m.scheduled_date >= CURRENT_DATE")
+            conditions.append("EXTRACT(ISODOW FROM m.scheduled_date) = %s AND m.scheduled_date >= (NOW() AT TIME ZONE 'Asia/Dubai')::date")
             params.append(dow)
 
     if filters.get("upcoming_only"):
@@ -1279,14 +1344,14 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         # confirmed") — status=upcoming alone means Confirmed+Rescheduled,
         # not what's wanted here. This restricts to future-dated regardless
         # of status, combine with a specific status filter above.
-        conditions.append("m.scheduled_date >= CURRENT_DATE")
+        conditions.append("m.scheduled_date >= (NOW() AT TIME ZONE 'Asia/Dubai')::date")
 
     if filters.get("created_after"):
-        conditions.append("m.created_at::date >= %s")
+        conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["created_after"])
 
     if filters.get("older_than_days"):
-        conditions.append("m.created_at::date < (CURRENT_DATE - (%s || ' days')::interval)")
+        conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date < ((NOW() AT TIME ZONE 'Asia/Dubai')::date - (%s || ' days')::interval)")
         params.append(filters["older_than_days"])
 
     if filters.get("stalled"):
@@ -1295,7 +1360,7 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         # is this function's own default for "a while"; pass older_than_days
         # instead for a custom threshold on an unconfirmed request.
         conditions.append(
-            "m.status IN (1, 2) AND m.created_at::date < (CURRENT_DATE - INTERVAL '3 days')"
+            "m.status IN (1, 2) AND (m.created_at AT TIME ZONE 'Asia/Dubai')::date < ((NOW() AT TIME ZONE 'Asia/Dubai')::date - INTERVAL '3 days')"
         )
 
     if filters.get("participant"):
@@ -1449,6 +1514,24 @@ def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -
             h["to_status_label"] = _label(h.get("to_status"), MEETING_STATUS_MAP, "Status")
             audit_trail.append(h)
 
+        # Readiness = Confirmed (status 3) facility-prep tasks + Confirmed
+        # (readiness_status 3) visitors, out of the total of both — matches
+        # the real frontend's "X/Y Ready" readiness bar exactly (confirmed
+        # by cross-referencing a real meeting: 2 facilities both unconfirmed
+        # + 7 visitors with 6 confirmed = 6/9, matching the UI's own count).
+        ready_count = (
+            sum(1 for f in facilities if f.get("status") == 3)
+            + sum(1 for v in visitors if v.get("readiness_status") == 3)
+        )
+        total_count = len(facilities) + len(visitors)
+        arrived_count = sum(1 for v in visitors if v.get("arrived"))
+        # Kept on the "meeting" record (not as a new top-level key) so the
+        # table renderer still treats this whole result as one primary
+        # record + sections, instead of falling back to a less readable
+        # generic layout.
+        meeting["readiness_summary"] = f"{ready_count}/{total_count}" if total_count else None
+        meeting["visitor_arrival_summary"] = f"{arrived_count}/{len(visitors)} arrived" if visitors else None
+
     return {
         "meeting": meeting,
         "participants": participants,
@@ -1521,16 +1604,16 @@ def list_sg_office_meeting_facilities(conn, user_id: int, filters: dict = None) 
         conditions.append("f.due_at IS NOT NULL AND f.due_at < NOW() AND f.status != 1")
 
     if filters.get("due_before"):
-        conditions.append("f.due_at::date <= %s")
+        conditions.append("(f.due_at AT TIME ZONE 'Asia/Dubai')::date <= %s")
         params.append(filters["due_before"])
 
     if filters.get("scheduled_today"):
-        conditions.append("m.scheduled_date = CURRENT_DATE")
+        conditions.append("m.scheduled_date = (NOW() AT TIME ZONE 'Asia/Dubai')::date")
 
     if filters.get("scheduled_this_week"):
         conditions.append(
-            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
-            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+            "m.scheduled_date BETWEEN date_trunc('week', (NOW() AT TIME ZONE 'Asia/Dubai')::date)::date "
+            "AND (date_trunc('week', (NOW() AT TIME ZONE 'Asia/Dubai')::date) + INTERVAL '6 days')::date"
         )
 
     if filters.get("meeting_request_id"):
@@ -1607,12 +1690,12 @@ def list_sg_office_meeting_visitors(conn, user_id: int, filters: dict = None) ->
         params.extend(p)
 
     if filters.get("scheduled_today"):
-        conditions.append("m.scheduled_date = CURRENT_DATE")
+        conditions.append("m.scheduled_date = (NOW() AT TIME ZONE 'Asia/Dubai')::date")
 
     if filters.get("scheduled_this_week"):
         conditions.append(
-            "m.scheduled_date BETWEEN date_trunc('week', CURRENT_DATE)::date "
-            "AND (date_trunc('week', CURRENT_DATE) + INTERVAL '6 days')::date"
+            "m.scheduled_date BETWEEN date_trunc('week', (NOW() AT TIME ZONE 'Asia/Dubai')::date)::date "
+            "AND (date_trunc('week', (NOW() AT TIME ZONE 'Asia/Dubai')::date) + INTERVAL '6 days')::date"
         )
 
     if filters.get("meeting_request_id"):
@@ -1750,7 +1833,7 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         params.append(filters["requires_presentation"])
 
     if filters.get("request_date"):
-        conditions.append("t.date_of_request::date = %s")
+        conditions.append("(t.date_of_request AT TIME ZONE 'Asia/Dubai')::date = %s")
         params.append(filters["request_date"])
 
     if filters.get("advisor"):
