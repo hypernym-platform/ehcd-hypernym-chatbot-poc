@@ -22,19 +22,19 @@ class FeatureID:
     NOTES              = 7
     PROJECT_DOCS       = 8
     AI_CHATBOT         = 9
-    SG_OFFICE_INTERNAL = 10  # Internal Directions tab (email/memos/weekly
-                             # actions) — viewable by H.E., Shamma, and
-                             # Theyab per the SG Office internal workflow
-                             # spec.
-    SG_OFFICE_EXTERNAL = 11  # External Meetings/Visitors/Facilities tab.
-                             # Neither of these two has a row in
-                             # role_and_access_feature / role_and_access_role_features
-                             # in prod yet (confirmed 2026-10: catalog only
-                             # has ids 1-9) — grant via that table like any
-                             # other feature once these roles are defined;
-                             # until then db_has_feature() always returns
-                             # False for them, which is exactly why neither
-                             # gate is actually called yet (see db_queries.py).
+    # id 10 doesn't exist in role_and_access_feature (never allocated).
+    SG_OFFICE_INTERNAL = 11  # "Internal Meetings" — email correspondence,
+                             # memos, weekly actions (the Internal
+                             # Directions module).
+    SG_OFFICE_EXTERNAL = 12  # "Meeting Requests" — external meetings,
+                             # visitors, facilities, outcomes.
+    SG_OFFICE_HE_BRIEFINGS = 13  # "H.E. Briefings" — confirmed to exist in
+                             # role_and_access_feature (2026-10-08), but no
+                             # tool/data in this codebase maps to it yet.
+                             # Not gating anything until that's defined.
+    SEND_EMAIL         = 14  # Confirmed to exist; no corresponding tool in
+                             # this codebase (email is sent by the main
+                             # app, not the chatbot), so nothing to gate.
 
 
 def is_superadmin(conn, user_id: int) -> bool:
@@ -120,17 +120,27 @@ def has_user_management(conn, user_id: int) -> bool:
 
 
 def has_sg_office_internal_access(conn, user_id: int) -> bool:
-    """H.E., Shamma, and Theyab all see the Internal Directions tab (email
-    correspondence, memos, weekly actions) — a flat view/no-view gate, not
-    ownership-based like projects/tasks/resolutions, since all three named
-    roles see the same shared data."""
-    return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_INTERNAL)
+    """Internal Directions tab (email correspondence, memos, weekly
+    actions) — a flat view/no-view gate, not ownership-based like projects/
+    tasks/resolutions, since everyone with the feature sees the same shared
+    data. H.E. Briefings (feature 13) is a superset grant — per explicit
+    spec, having it means seeing both Internal and External, even if a
+    role is ever assigned ONLY that feature without 11/12 directly."""
+    return (
+        is_superadmin(conn, user_id)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_INTERNAL)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_HE_BRIEFINGS)
+    )
 
 
 def has_sg_office_external_access(conn, user_id: int) -> bool:
-    """H.E., Shamma, and Theyab all see the External Meetings/Visitors/
-    Facilities tab — same flat view/no-view gate as the internal one."""
-    return is_superadmin(conn, user_id) or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_EXTERNAL)
+    """External Meetings/Visitors/Facilities tab — same flat view/no-view
+    gate as the internal one, with the same H.E. Briefings superset rule."""
+    return (
+        is_superadmin(conn, user_id)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_EXTERNAL)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_HE_BRIEFINGS)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +382,7 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
     if not row:
         return {k: False for k in ["superadmin", "all_projects", "budget",
                                     "user_management", "notes", "education", "project_docs",
-                                    "sg_office_internal"]}
+                                    "sg_office_internal", "sg_office_external"]}
 
     sa = bool(row[0])
     feature_ids = set(row[1] or [])
@@ -384,5 +394,11 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
         "notes": sa or FeatureID.NOTES in feature_ids,
         "education": sa or FeatureID.EDUCATION_DASH in feature_ids,
         "project_docs": sa or FeatureID.PROJECT_DOCS in feature_ids,
-        "sg_office_internal": sa or FeatureID.SG_OFFICE_INTERNAL in feature_ids,
+        # H.E. Briefings is a superset grant — having it means seeing both
+        # Internal and External, per explicit spec (same rule as the
+        # standalone has_sg_office_*_access() functions above).
+        "sg_office_internal": sa or FeatureID.SG_OFFICE_INTERNAL in feature_ids
+                               or FeatureID.SG_OFFICE_HE_BRIEFINGS in feature_ids,
+        "sg_office_external": sa or FeatureID.SG_OFFICE_EXTERNAL in feature_ids
+                               or FeatureID.SG_OFFICE_HE_BRIEFINGS in feature_ids,
     }
