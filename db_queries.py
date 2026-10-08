@@ -663,14 +663,12 @@ def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
 # the model to summarize/read it directly off a fetched email or thread, no
 # separate tool needed.
 #
-# TEMPORARY: rbac.has_sg_office_internal_access() exists and is NOT called
-# here. Confirmed directly against prod (2026-10): role_and_access_feature
-# only has ids 1-9, nothing for SG_OFFICE_INTERNAL (10) — no role has it
-# assigned, so calling the gate right now would block everyone except
-# superadmins, not just restrict to H.E./Shamma/Theyab as intended. Per
-# explicit instruction, access stays open to every authenticated chatbot
-# user until a real role is granted that feature in role_and_access_role_features
-# — wire the gate back in then; see rbac.has_sg_office_internal_access.
+# RBAC: gated via rbac.has_sg_office_internal_access() / the
+# "sg_office_internal" flag from get_user_access_flags(), applied at the
+# tool-availability level in build_available_tools() (tools.py) — a user
+# without role_and_access_feature id 11 ("Internal Meetings", or 13 "H.E.
+# Briefings") never sees these tools offered at all, so no explicit check
+# is needed inside the query functions themselves.
 # ---------------------------------------------------------------------------
 
 def list_sg_office_emails(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
@@ -913,7 +911,8 @@ def get_sg_office_email_details(conn, user_id: int, email_id: int = None,
 
 
 # SG OFFICE — DIRECTION ITEMS (Email/Memo/Weekly Action unified workflow)
-# TEMPORARY: unrestricted access, same reasoning as the rest of this file.
+# RBAC: same "Internal Meetings" gate as the raw email tools above, applied
+# at the tool-availability level — see the comment above list_sg_office_emails.
 
 def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     """List Internal Direction items (emails/memos/weekly actions).
@@ -1217,12 +1216,10 @@ def get_sg_office_direction_item_details(conn, user_id: int, item_id: int = None
 # assignees, deadlines all exist as real columns), so filters here aren't
 # limited by missing schema the way the email ones are.
 #
-# TEMPORARY: same as Internal Directions — unrestricted access, no RBAC gate
-# called here. Confirmed directly against prod (2026-10): role_and_access_feature
-# only has ids 1-9, nothing for SG_OFFICE_EXTERNAL (11) — no role has it
-# assigned, so calling rbac.has_sg_office_external_access() right now would
-# block everyone except superadmins. Wire it in once a real role is granted
-# that feature in role_and_access_role_features.
+# RBAC: gated via rbac.has_sg_office_external_access() / the
+# "sg_office_external" flag, applied at the tool-availability level — a
+# user without role_and_access_feature id 12 ("Meeting Requests", or 13
+# "H.E. Briefings") never sees these tools offered at all.
 # ---------------------------------------------------------------------------
 
 def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:

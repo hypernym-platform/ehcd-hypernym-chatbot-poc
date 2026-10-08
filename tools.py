@@ -1074,6 +1074,17 @@ TOOL_DEFS_BY_NAME = {t["function"]["name"]: t for t in TOOL_DEFINITIONS}
 # Tool dispatcher (unchanged)
 # ---------------------------------------------------------------------------
 
+_SG_OFFICE_INTERNAL_TOOLS = {
+    "list_sg_office_emails", "get_sg_office_email_details",
+    "list_sg_office_direction_items", "get_sg_office_direction_item_details",
+}
+_SG_OFFICE_EXTERNAL_TOOLS = {
+    "list_sg_office_meetings", "get_sg_office_meeting_details",
+    "list_sg_office_meeting_facilities", "list_sg_office_meeting_visitors",
+    "list_sg_office_meeting_outcomes",
+}
+
+
 def execute_tool(
     tool_name: str,
     arguments: dict,
@@ -1085,6 +1096,17 @@ def execute_tool(
     qvec=None,
 ) -> str:
     """Execute a tool call and return JSON string result."""
+    # Defense-in-depth: build_available_tools() already keeps these out of
+    # the router's offered tool list for a user without the feature, so
+    # this shouldn't normally be reachable — but a user with NO SG-office
+    # access must NEVER get this data back under any circumstance, so it's
+    # checked again here at actual execution time too, not just at
+    # tool-offering time.
+    if tool_name in _SG_OFFICE_INTERNAL_TOOLS and not get_user_access_flags(conn, user_id).get("sg_office_internal"):
+        return json.dumps({"error": "Access denied: this account does not have Internal Meetings access."})
+    if tool_name in _SG_OFFICE_EXTERNAL_TOOLS and not get_user_access_flags(conn, user_id).get("sg_office_external"):
+        return json.dumps({"error": "Access denied: this account does not have Meeting Requests access."})
+
     try:
         if tool_name == "list_projects":
             result = list_projects(conn, user_id, filters=arguments)
@@ -1381,21 +1403,29 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
         TOOL_DEFS_BY_NAME["list_resolutions"],
         TOOL_DEFS_BY_NAME["get_resolution_details"],
         TOOL_DEFS_BY_NAME["search_policy"],
-        # TEMPORARY: unconditional, not gated behind flags.get("sg_office_internal")
-        # — the real H.E./Shamma/Theyab accounts/roles don't exist yet, so
-        # per explicit instruction everyone gets access for now. Gate this
-        # behind flags.get("sg_office_internal") once those roles exist —
-        # see rbac.has_sg_office_internal_access (already written, unused).
-        TOOL_DEFS_BY_NAME["list_sg_office_emails"],
-        TOOL_DEFS_BY_NAME["get_sg_office_email_details"],
-        TOOL_DEFS_BY_NAME["list_sg_office_direction_items"],
-        TOOL_DEFS_BY_NAME["get_sg_office_direction_item_details"],
-        TOOL_DEFS_BY_NAME["list_sg_office_meetings"],
-        TOOL_DEFS_BY_NAME["get_sg_office_meeting_details"],
-        TOOL_DEFS_BY_NAME["list_sg_office_meeting_facilities"],
-        TOOL_DEFS_BY_NAME["list_sg_office_meeting_visitors"],
-        TOOL_DEFS_BY_NAME["list_sg_office_meeting_outcomes"],
     ]
+
+    # Internal Directions module (email correspondence, memos, weekly
+    # actions) — gated behind role_and_access_feature id 11 ("Internal
+    # Meetings"), same pattern as the `education` gate below.
+    if flags.get("sg_office_internal"):
+        tools += [
+            TOOL_DEFS_BY_NAME["list_sg_office_emails"],
+            TOOL_DEFS_BY_NAME["get_sg_office_email_details"],
+            TOOL_DEFS_BY_NAME["list_sg_office_direction_items"],
+            TOOL_DEFS_BY_NAME["get_sg_office_direction_item_details"],
+        ]
+
+    # External meetings/visitors/facilities/outcomes — gated behind feature
+    # id 12 ("Meeting Requests").
+    if flags.get("sg_office_external"):
+        tools += [
+            TOOL_DEFS_BY_NAME["list_sg_office_meetings"],
+            TOOL_DEFS_BY_NAME["get_sg_office_meeting_details"],
+            TOOL_DEFS_BY_NAME["list_sg_office_meeting_facilities"],
+            TOOL_DEFS_BY_NAME["list_sg_office_meeting_visitors"],
+            TOOL_DEFS_BY_NAME["list_sg_office_meeting_outcomes"],
+        ]
 
     if flags.get("education"):
         tools.append(TOOL_DEFS_BY_NAME["query_education_data"])
