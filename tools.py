@@ -11,7 +11,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 
@@ -1913,6 +1913,30 @@ chatbot_graph = _build_graph()
 # Entry point — drop-in replacement for generate_tool_response()
 # ---------------------------------------------------------------------------
 
+_SG_OFFICE_INTERNAL_KEYWORDS = (
+    "memo", "weekly action", "internal email", "internal direction",
+    "internal meeting", "email correspondence", "direction item",
+)
+_SG_OFFICE_EXTERNAL_KEYWORDS = (
+    "meeting", "visitor", "facilit",  # "facilit" matches facility/facilities
+)
+
+
+def _detect_sg_office_topic(query: str) -> Optional[str]:
+    """Deterministic keyword check for whether a query is ABOUT the
+    Internal or External SG-office modules — not LLM judgment, since that
+    proved unreliable (sometimes refused legitimate authorized queries,
+    sometimes let an unauthorized one slip through to the wrong tool).
+    Used only to gate UNAUTHORIZED users before routing even starts;
+    authorized users are unaffected regardless of which topic matches."""
+    q = query.lower()
+    if any(kw in q for kw in _SG_OFFICE_INTERNAL_KEYWORDS):
+        return "internal"
+    if any(kw in q for kw in _SG_OFFICE_EXTERNAL_KEYWORDS):
+        return "external"
+    return None
+
+
 def run_chatbot_graph(
     query: str,
     conversation_history: list,
@@ -1934,6 +1958,21 @@ def run_chatbot_graph(
     Run the LangGraph chatbot and yield response chunks.
     Drop-in replacement for the old generate_tool_response().
     """
+    # Deterministic access gate, checked BEFORE routing/tool-calling even
+    # starts — the LLM-judgment approach (telling the router/answer node to
+    # recognize "no matching tool = no access") was unreliable: it either
+    # over-refused legitimate authorized queries or still let an
+    # unauthorized query slip through to an unrelated, wrong tool. This
+    # check is plain keyword + a real DB flag lookup, no model involved.
+    sg_topic = _detect_sg_office_topic(query)
+    if sg_topic:
+        with pg_conn_fn() as conn:
+            flags = get_user_access_flags(conn, user_id)
+        allowed = flags.get(f"sg_office_{sg_topic}")
+        if not allowed:
+            yield "<p>You are unauthorized for this information.</p>"
+            return
+
     today = datetime.now().strftime("%B %d, %Y")
 
     system_content = ROUTER_SYSTEM_PROMPT.format(
