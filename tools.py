@@ -655,25 +655,17 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "get_sg_office_meeting_details",
             "description": (
-                "Get full detail for one specific meeting/visit request: "
-                "requester/schedule/venue info, participants, facility prep "
-                "tasks, visitor readiness, the post-meeting outcome (notes, "
-                "follow-up, who completed it) if the meeting already "
-                "happened, and the full status-change audit trail. The "
-                "meeting record's `readiness_summary` field already gives "
-                "the exact 'ready/total' count (Confirmed facilities + "
-                "Confirmed visitors, out of both totals) and "
-                "`visitor_arrival_summary` gives 'arrived/total visitors' "
-                "— use those directly for 'what is the readiness status of "
-                "X' questions, don't recompute them yourself from the "
-                "facilities/visitors lists. Use ONLY "
-                "when the user actually wants 'readiness', 'facilities', "
-                "'participants', 'outcome', 'audit trail', or the meeting's "
-                "full details/'everything'. For a question about one or a "
-                "few specific attributes (status, date, venue, etc.) use "
-                "list_sg_office_meetings with a requester/organization "
-                "filter and `fields` instead — it returns a much shorter, "
-                "focused answer."
+                "Get detail for one specific meeting/visit request. ALWAYS "
+                "set `view` to match what's actually asked — it controls "
+                "which table comes back, so the user sees exactly the "
+                "columns relevant to their question, nothing extra, and "
+                "the meeting is named once in your answer text rather than "
+                "repeated as a column on every row. Use ONLY when the "
+                "question needs one of these views (or genuinely wants "
+                "'everything'/the full record — then omit `view`); for a "
+                "question about one or a few specific top-level attributes "
+                "(status, date, venue, etc.) use list_sg_office_meetings "
+                "with a requester/organization filter and `fields` instead."
             ),
             "parameters": {
                 "type": "object",
@@ -681,6 +673,24 @@ TOOL_DEFINITIONS = [
                     "meeting_request_id": {
                         "type": "integer",
                         "description": "Database ID of the meeting request. If you only have a requester/organization name, call list_sg_office_meetings first and use the exact `id` field of the matching row from its results — if multiple rows match, pick the one whose requester/organization/purpose text actually matches what the user described, don't just take the first one. NEVER invent or guess an id that didn't appear in a real tool result.",
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["readiness", "facility_status", "meeting_info"],
+                        "description": (
+                            "'readiness' — for 'what is the readiness status of X': ONE table, "
+                            "one row per visitor or facility task, columns Visitor/Readiness/"
+                            "Arrived/Facility Request/Status (blank cells where a row doesn't "
+                            "apply to that column) — no meeting name column, name the meeting in "
+                            "your answer text instead. "
+                            "'facility_status' — for 'what is the facility request status of X': "
+                            "ONE table, Facility Request/Status only. "
+                            "'meeting_info' — for 'give me the meeting information for X': meeting "
+                            "name/date/time/duration/venue/coordinator + participants — no "
+                            "requester/status/facilities/visitors/outcome/audit trail. "
+                            "Omit `view` entirely only when the user wants the full record, "
+                            "participants, outcome, or audit trail together."
+                        ),
                     },
                 },
                 "required": ["meeting_request_id"],
@@ -1099,6 +1109,7 @@ def execute_tool(
             result = get_sg_office_meeting_details(
                 conn, user_id,
                 meeting_request_id=arguments.get("meeting_request_id"),
+                view=arguments.get("view"),
             )
         elif tool_name == "list_sg_office_meeting_facilities":
             result = list_sg_office_meeting_facilities(conn, user_id, filters=arguments)

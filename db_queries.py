@@ -150,14 +150,27 @@ def _reorder_item(item: dict, priority_keys: tuple) -> dict:
 # auto-includes each one's resolved _label; still fully overridable via an
 # explicit `fields` request for anything not in this default set.
 MEETING_DEFAULT_FIELDS = (
-    "organization", "requester", "scheduled_date", "scheduled_time",
+    "meeting", "requester", "scheduled_date", "scheduled_time",
     "venue", "coordinator_name", "status", "facilities_summary",
     "readiness_summary",
 )
 MEETING_COLUMN_ORDER = (
-    "organization", "requester", "status_label", "scheduled_date",
+    "meeting", "requester", "status_label", "scheduled_date",
     "scheduled_time", "venue_label", "priority_label", "coordinator_name",
     "facilities_summary", "readiness_summary", "visitor_arrival_summary",
+)
+
+# Preset for "meetings with incomplete visitor readiness" (visitors_not_ready
+# filter) — one row per meeting; the Visitor column lists ONLY the visitors
+# that aren't confirmed yet, not every visitor, and Status is a constant
+# label since every returned row is incomplete by definition of the filter.
+MEETING_INCOMPLETE_VISITORS_FIELDS = (
+    "meeting", "incomplete_visitors_summary", "visitor_readiness_status",
+)
+# Preset for "meetings with pending facility requests" (not_ready filter) —
+# same idea, Facility Request column lists only the not-yet-confirmed ones.
+MEETING_PENDING_FACILITIES_FIELDS = (
+    "meeting", "pending_facilities_summary", "facility_request_status",
 )
 
 # Curated default views for direction items — mirror the real frontend's
@@ -1209,7 +1222,12 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
                (SELECT COUNT(*) FROM sg_office_meetingrequestvisitor v
                 WHERE v.meeting_request_id = m.id) AS visitors_total,
                (SELECT COUNT(*) FROM sg_office_meetingrequestvisitor v
-                WHERE v.meeting_request_id = m.id AND v.readiness_status = 3) AS visitors_ready
+                WHERE v.meeting_request_id = m.id AND v.readiness_status = 3) AS visitors_ready,
+               (SELECT ARRAY_AGG(v.name) FROM sg_office_meetingrequestvisitor v
+                WHERE v.meeting_request_id = m.id AND v.readiness_status != 3) AS incomplete_visitor_names,
+               (SELECT ARRAY_AGG(DISTINCT f.facility ORDER BY f.facility)
+                FROM sg_office_meetingrequestfacility f
+                WHERE f.meeting_request_id = m.id AND f.status != 3) AS pending_facility_codes
         FROM sg_office_meetingrequest m
         LEFT JOIN user_management_user co ON co.id = m.coordinator_id
         LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
@@ -1433,18 +1451,59 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         v_total, v_ready = item.pop("visitors_total", 0) or 0, item.pop("visitors_ready", 0) or 0
         total = f_total + v_total
         item["readiness_summary"] = f"{f_ready + v_ready}/{total}" if total else None
-        chosen_fields = filters.get("fields") or list(MEETING_DEFAULT_FIELDS)
-        item = _apply_fields(item, chosen_fields, always_keep=("requester", "organization", "scheduled_date"))
+
+        incomplete_names = item.pop("incomplete_visitor_names", None) or []
+        item["incomplete_visitors_summary"] = ", ".join(incomplete_names) if incomplete_names else None
+        item["visitor_readiness_status"] = "Incomplete" if incomplete_names else "Complete"
+
+        pending_codes = item.pop("pending_facility_codes", None) or []
+        item["pending_facilities_summary"] = (
+            ", ".join(_label(c, FACILITY_TYPE_MAP, "Facility") for c in pending_codes)
+            if pending_codes else None
+        )
+        item["facility_request_status"] = "Pending" if pending_codes else "Confirmed"
+
+        # "Meeting" reads better than "Organization" as a column header for
+        # these tables — the underlying `organization` filter param is
+        # unchanged, this only renames what's shown.
+        item["meeting"] = item.pop("organization", None)
+
+        # Query-specific presets: a meeting-level "incomplete readiness" or
+        # "pending facilities" question gets ONE lean table (Meeting +
+        # only-the-incomplete-items + a status word) instead of the general
+        # default — no repeated meeting rows, no irrelevant columns.
+        if filters.get("fields"):
+            chosen_fields, keep = filters["fields"], ("requester", "meeting", "scheduled_date")
+        elif filters.get("visitors_not_ready"):
+            chosen_fields, keep = list(MEETING_INCOMPLETE_VISITORS_FIELDS), ("meeting",)
+        elif filters.get("not_ready"):
+            chosen_fields, keep = list(MEETING_PENDING_FACILITIES_FIELDS), ("meeting",)
+        else:
+            chosen_fields, keep = list(MEETING_DEFAULT_FIELDS), ("requester", "meeting", "scheduled_date")
+        item = _apply_fields(item, chosen_fields, always_keep=keep)
         item = _reorder_item(item, MEETING_COLUMN_ORDER)
         result.append(item)
 
     return {"total_count": len(result), "data": result}
 
 
-def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -> Dict[str, Any]:
+def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int,
+                                  view: str = None) -> Dict[str, Any]:
     """Full detail for one meeting/visit request: the request itself,
     participants, facility prep tasks, visitor readiness, the post-meeting
-    outcome (if any), and the full status-change audit trail."""
+    outcome (if any), and the full status-change audit trail.
+
+    `view` narrows the result to exactly what a specific question type
+    needs, instead of always returning everything:
+    - "readiness": one combined table, one row per visitor or facility
+      prep task, under a shared Visitor/Readiness/Arrived/Facility Request/
+      Status schema — no meeting name/org column (the answer text names
+      the meeting), no repeated meeting rows.
+    - "facility_status": one table, Facility Request/Status only.
+    - "meeting_info": meeting name/date/time/duration/venue/coordinator +
+      participants, no requester/status/facilities/visitors/outcome/audit.
+    - None (default): the full record, unchanged.
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT m.*,
@@ -1468,13 +1527,14 @@ def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -
         meeting["venue_label"] = _label(meeting.get("venue"), VENUE_MAP, "Venue")
         meeting["visitor_email_status_label"] = _label(
             meeting.get("visitor_email_status"), VISITOR_EMAIL_STATUS_MAP, "Status")
+        meeting["meeting"] = meeting.pop("organization", None)
         # Full-detail view still uses the curated set as its base record —
         # the nested sections below (participants/facilities/visitors/
         # outcome/audit_trail) are where the deeper, specifically-asked-for
         # detail actually lives.
         meeting = _apply_fields(
             meeting, list(MEETING_DEFAULT_FIELDS) + ["purpose", "request_type", "duration_minutes"],
-            always_keep=("requester", "organization", "scheduled_date"))
+            always_keep=("requester", "meeting", "scheduled_date"))
         meeting = _reorder_item(meeting, MEETING_COLUMN_ORDER)
 
         cur.execute("""
@@ -1557,6 +1617,41 @@ def get_sg_office_meeting_details(conn, user_id: int, meeting_request_id: int) -
         # generic layout.
         meeting["readiness_summary"] = f"{ready_count}/{total_count}" if total_count else None
         meeting["visitor_arrival_summary"] = f"{arrived_count}/{len(visitors)} arrived" if visitors else None
+
+    if view == "readiness":
+        # One shared column schema for every row regardless of origin, so
+        # they render as ONE table (a mismatched schema per row would make
+        # the renderer split them into separate tables).
+        checklist = []
+        for v in visitors:
+            checklist.append({
+                "visitor": v.get("name"),
+                "readiness": v.get("readiness_status_label"),
+                "arrived": "Arrived" if v.get("arrived") else "Not Arrived",
+                "facility_request": None,
+                "status": None,
+            })
+        for f in facilities:
+            checklist.append({
+                "visitor": None,
+                "readiness": None,
+                "arrived": None,
+                "facility_request": f.get("facility_label"),
+                "status": f.get("status_label"),
+            })
+        return {"total_count": len(checklist), "data": checklist}
+
+    if view == "facility_status":
+        rows = [{"facility_request": f.get("facility_label"), "status": f.get("status_label")} for f in facilities]
+        return {"total_count": len(rows), "data": rows}
+
+    if view == "meeting_info":
+        info = _apply_fields(
+            meeting,
+            ["meeting", "scheduled_date", "scheduled_time", "duration_minutes", "venue", "coordinator_name"],
+            always_keep=("meeting",))
+        info = _reorder_item(info, MEETING_COLUMN_ORDER)
+        return {"meeting": info, "participants": participants}
 
     return {
         "meeting": meeting,
