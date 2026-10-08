@@ -657,25 +657,17 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "get_sg_office_meeting_details",
             "description": (
-                "Get full detail for one specific meeting/visit request: "
-                "requester/schedule/venue info, participants, facility prep "
-                "tasks, visitor readiness, the post-meeting outcome (notes, "
-                "follow-up, who completed it) if the meeting already "
-                "happened, and the full status-change audit trail. The "
-                "meeting record's `readiness_summary` field already gives "
-                "the exact 'ready/total' count (Confirmed facilities + "
-                "Confirmed visitors, out of both totals) and "
-                "`visitor_arrival_summary` gives 'arrived/total visitors' "
-                "— use those directly for 'what is the readiness status of "
-                "X' questions, don't recompute them yourself from the "
-                "facilities/visitors lists. Use ONLY "
-                "when the user actually wants 'readiness', 'facilities', "
-                "'participants', 'outcome', 'audit trail', or the meeting's "
-                "full details/'everything'. For a question about one or a "
-                "few specific attributes (status, date, venue, etc.) use "
-                "list_sg_office_meetings with a requester/organization "
-                "filter and `fields` instead — it returns a much shorter, "
-                "focused answer."
+                "Get detail for one specific meeting/visit request. ALWAYS "
+                "set `view` to match what's actually asked — it controls "
+                "which table comes back, so the user sees exactly the "
+                "columns relevant to their question, nothing extra, and "
+                "the meeting is named once in your answer text rather than "
+                "repeated as a column on every row. Use ONLY when the "
+                "question needs one of these views (or genuinely wants "
+                "'everything'/the full record — then omit `view`); for a "
+                "question about one or a few specific top-level attributes "
+                "(status, date, venue, etc.) use list_sg_office_meetings "
+                "with a requester/organization filter and `fields` instead."
             ),
             "parameters": {
                 "type": "object",
@@ -683,6 +675,24 @@ TOOL_DEFINITIONS = [
                     "meeting_request_id": {
                         "type": "integer",
                         "description": "Database ID of the meeting request. If you only have a requester/organization name, call list_sg_office_meetings first and use the exact `id` field of the matching row from its results — if multiple rows match, pick the one whose requester/organization/purpose text actually matches what the user described, don't just take the first one. NEVER invent or guess an id that didn't appear in a real tool result.",
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["readiness", "facility_status", "meeting_info"],
+                        "description": (
+                            "'readiness' — for 'what is the readiness status of X': ONE table, "
+                            "one row per visitor or facility task, columns Visitor/Readiness/"
+                            "Arrived/Facility Request/Status (blank cells where a row doesn't "
+                            "apply to that column) — no meeting name column, name the meeting in "
+                            "your answer text instead. "
+                            "'facility_status' — for 'what is the facility request status of X': "
+                            "ONE table, Facility Request/Status only. "
+                            "'meeting_info' — for 'give me the meeting information for X': meeting "
+                            "name/date/time/duration/venue/coordinator + participants — no "
+                            "requester/status/facilities/visitors/outcome/audit trail. "
+                            "Omit `view` entirely only when the user wants the full record, "
+                            "participants, outcome, or audit trail together."
+                        ),
                     },
                 },
                 "required": ["meeting_request_id"],
@@ -1237,6 +1247,7 @@ def execute_tool(
             result = get_sg_office_meeting_details(
                 conn, user_id,
                 meeting_request_id=arguments.get("meeting_request_id"),
+                view=arguments.get("view"),
             )
         elif tool_name == "list_sg_office_meeting_facilities":
             result = list_sg_office_meeting_facilities(conn, user_id, filters=arguments)
@@ -1407,6 +1418,22 @@ def render_tool_result_html(data: Any) -> str:
             return render_tool_result_html(data[0])
         dict_items = [d for d in data if isinstance(d, dict)]
         if dict_items and len(dict_items) == len(data):
+            # A single user turn can call more than one tool (e.g. a
+            # meeting lookup AND that meeting's visitor list), and their
+            # results all land in the same flat list here. Those have
+            # DIFFERENT shapes (different key sets) — grouping by the exact
+            # key-set signature first keeps each entity type in its own
+            # table. Without this, the single-table path below would
+            # intersect ALL items' keys down to only the handful every
+            # shape happens to share (e.g. just organization/requester/
+            # scheduled_date for a meeting+visitor mix), silently
+            # discarding almost every actually-useful field.
+            signatures = {frozenset(d.keys()) for d in dict_items}
+            if len(signatures) > 1:
+                groups = {}
+                for d in dict_items:
+                    groups.setdefault(frozenset(d.keys()), []).append(d)
+                return "".join(render_tool_result_html(g) for g in groups.values())
             # Homogeneous list of records (e.g. 23 projects) — one real
             # table, one row per record, columns = the fields they share.
             common_keys = set.intersection(*(set(d.keys()) for d in dict_items))
@@ -1521,6 +1548,13 @@ Tool selection rules:
 6. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
 use the conversation history to identify what the user is referring to.
+7. Conversation history is ONLY for resolving references like that — never a
+substitute for calling the tool again. If the current question needs
+structured data (rule 1), ALWAYS call the matching tool fresh this turn,
+even if an earlier turn asked something that looks the same — the
+underlying data can change between turns (a record was added/edited since),
+so a past tool result may now be stale. Never skip a tool call just because
+conversation history already seems to contain the answer.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 9. Whenever the question asks for a chart, graph, or visualization of an entity
 (projects, SG offices, tasks, resolutions, education stats) — even if it names
@@ -1552,7 +1586,7 @@ messages before the current user message below — read them directly.
 
 ANSWER_SYSTEM_PROMPT = """You are an expert advisor for the Education, Human Development, and Community Development Council (EHCD).
 
-If tool results are present in the conversation, use ONLY that data to answer the user's question.
+If tool results are present in the conversation, use ONLY that data to answer the user's question — specifically the tool results from THIS turn (the most recent ones), never an older tool result from an earlier turn even if it looks like it answers the same question; the data can have changed since then, and this turn's fresh tool call is always the authoritative one.
 If no tool results are present (greetings, general conversation), respond naturally and helpfully.
 
 CONVERSATIONAL CONTEXT RULES:
