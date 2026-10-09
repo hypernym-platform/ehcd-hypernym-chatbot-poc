@@ -11,7 +11,13 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# This system is UAE-based — "now"/"today" for the LLM's own reasoning, and
+# every displayed UTC timestamp, use this instead of the server process's
+# own local clock (which may be UTC or anything else depending on
+# deployment) or the raw UTC instant stored in the DB.
+UAE_TZ = timezone(timedelta(hours=4))
 from typing import Any, Dict, List, Optional, TypedDict
 
 import numpy as np
@@ -1314,8 +1320,13 @@ def _format_scalar(val) -> str:
         return m.group(1)  # midnight timestamps are really just dates
     m = _ISO_DATETIME_WITH_TIME_RE.match(text)
     if m:
-        y, mo, d, hh, mm, _, _, _ = m.groups()
-        return f"{_MONTHS[int(mo) - 1]} {int(d)}, {y}, {_12h(hh, mm)}"
+        y, mo, d, hh, mm, ss, _, _ = m.groups()
+        # Stored value is a UTC instant (timestamptz) — shift to UAE local
+        # time before display using real datetime arithmetic (so day/month/
+        # year rollover near midnight is handled correctly), instead of
+        # showing the raw UTC hour to a UAE-based user.
+        dt_local = datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss)) + timedelta(hours=4)
+        return f"{_MONTHS[dt_local.month - 1]} {dt_local.day}, {dt_local.year}, {_12h(f'{dt_local.hour:02d}', f'{dt_local.minute:02d}')}"
     m = _BARE_TIME_RE.match(text)
     if m:
         hh, mm, _ = m.groups()
@@ -1929,6 +1940,9 @@ def answer_node(state: ChatState) -> dict:
     )
     cache_eligible = not has_tool_results and not history_messages
 
+    # Build answer-specific system prompt (no tool schemas)
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
+    answer_system = ANSWER_SYSTEM_PROMPT.format(
     query_vec = None
     if cache_eligible and redis_client is not None and emb_obj is not None:
         try:
@@ -2134,6 +2148,7 @@ def run_chatbot_graph(
     trimmed = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
     today = datetime.now().strftime("%B %d, %Y")
     history_text = "\n".join(f"{e['role']}: {e['content']}" for e in trimmed)
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
 
     system_content = ROUTER_SYSTEM_PROMPT.format(
         user_name=user_name,
