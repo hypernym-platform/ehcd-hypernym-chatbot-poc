@@ -63,6 +63,7 @@ from voice_bridge import (
     VOICE_SESSION_TOKEN_TTL_SECONDS,
 )
 from chart_engine import detect_chart_opportunity, is_chart_request
+from chart_engine import detect_chart_opportunity, is_chart_request, detect_palette_from_query
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG & LOGGING
@@ -633,7 +634,8 @@ async def handle_query(
         chart_data = None
         try:
             chart_data = detect_chart_opportunity(
-                query, tool_results_for_chart, assistant_response
+                query, tool_results_for_chart, assistant_response,
+                palette=detect_palette_from_query(query),
             )
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
@@ -981,7 +983,8 @@ async def websocket_chat(ws: WebSocket):
             chart_data = None
             try:
                 chart_data = detect_chart_opportunity(
-                    query, tool_results_for_chart, assistant_response
+                    query, tool_results_for_chart, assistant_response,
+                    palette=detect_palette_from_query(query),
                 )
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")

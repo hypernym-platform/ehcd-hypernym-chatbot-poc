@@ -21,8 +21,6 @@ from rbac import get_user_access_flags
 from db_queries import (
     list_projects,
     get_project_details,
-    list_sg_offices,
-    get_sg_office_details,
     list_tasks,
     get_task_details,
     list_resolutions,
@@ -117,57 +115,6 @@ TOOL_DEFINITIONS = [
                     "project_name": {
                         "type": "string",
                         "description": "Project name to search (partial match)",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_sg_offices",
-            "description": (
-                "List SG offices (Secretary General offices / departments / divisions). "
-                "Use when user asks about SG offices, departments, divisions, "
-                "organizational units, or office listings."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "description": "Filter by status: 'in_progress', 'completed', 'delayed', 'on_hold'",
-                        "enum": ["in_progress", "completed", "delayed", "on_hold"],
-                    },
-                    "category_id": {
-                        "type": "integer",
-                        "description": "Filter by category ID",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_sg_office_details",
-            "description": (
-                "Get full details of a specific SG office including budget, team, "
-                "entities, notes, and progress. Use when user asks about a "
-                "specific SG office or department."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sg_office_id": {
-                        "type": "integer",
-                        "description": "SG office database ID",
-                    },
-                    "sg_office_name": {
-                        "type": "string",
-                        "description": "SG office name to search (partial match)",
                     },
                 },
                 "required": [],
@@ -1238,14 +1185,6 @@ def execute_tool(
                 project_id=arguments.get("project_id"),
                 project_name=arguments.get("project_name"),
             )
-        elif tool_name == "list_sg_offices":
-            result = list_sg_offices(conn, user_id, filters=arguments)
-        elif tool_name == "get_sg_office_details":
-            result = get_sg_office_details(
-                conn, user_id,
-                sg_office_id=arguments.get("sg_office_id"),
-                sg_office_name=arguments.get("sg_office_name"),
-            )
         elif tool_name == "list_sg_office_emails":
             result = list_sg_office_emails(conn, user_id, filters=arguments)
         elif tool_name == "get_sg_office_email_details":
@@ -1524,8 +1463,6 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
     tools = [
         TOOL_DEFS_BY_NAME["list_projects"],
         TOOL_DEFS_BY_NAME["get_project_details"],
-        TOOL_DEFS_BY_NAME["list_sg_offices"],
-        TOOL_DEFS_BY_NAME["get_sg_office_details"],
         TOOL_DEFS_BY_NAME["list_tasks"],
         TOOL_DEFS_BY_NAME["get_task_details"],
         TOOL_DEFS_BY_NAME["list_resolutions"],
@@ -1570,7 +1507,7 @@ ROUTER_SYSTEM_PROMPT = """You are a tool routing assistant for the Education, Hu
 Your ONLY job is to decide which tools to call based on the user's question. Do NOT answer the question yourself.
 
 Tool selection rules:
-1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities) → use the list/get tools.
+1. For structured data (projects, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities) → use the list/get tools.
 2. For education statistics → use query_education_data (generate a SQLite SELECT query).
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains.
@@ -1585,9 +1522,8 @@ even if an earlier turn asked something that looks the same — the
 underlying data can change between turns (a record was added/edited since),
 so a past tool result may now be stale. Never skip a tool call just because
 conversation history already seems to contain the answer.
-8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 9. Whenever the question asks for a chart, graph, or visualization of an entity
-(projects, SG offices, tasks, resolutions, education stats) — even if it names
+(projects, tasks, resolutions, SG offices, education stats) — even if it names
 no specific field, e.g. "generate a chart of tasks" — you MUST call the
 matching list/get/query tool for that entity before responding, exactly as
 rule 1 says for structured data. A chart cannot be drawn from data you never
@@ -1709,7 +1645,7 @@ Current Date: {today}
 
 Response formatting rules:
 - Tool result data (projects, tasks, offices, resolutions, education stats, policy excerpts, etc.) is already provided to you fully formatted in HTML in the tool messages above. Do NOT re-render, re-tag, re-list, or repeat that dataset yourself — the system separately ensures the complete, correctly formatted data reaches the user ahead of your response.
-- list_projects/list_sg_offices/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
+- list_projects/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
 - Except for flowcharts and explicit bullet-point requests (see below), your entire response must be ONE brief, plain-language summary or insight about the data (e.g. a notable count, a standout item, a key trend) — wrapped in a single <p>...</p> tag and nothing else. No headings, no lists, no tables, no other HTML tags, no markdown (**, #, backticks), no literal \n.
 - If no tool results are present (greetings, general conversation), respond naturally in plain sentences, still wrapped in a single <p> tag.
 - Respond in the same language as the user's question (if Arabic, respond in Arabic).
@@ -2133,6 +2069,30 @@ chatbot_graph = _build_graph()
 # Entry point — drop-in replacement for generate_tool_response()
 # ---------------------------------------------------------------------------
 
+_SG_OFFICE_INTERNAL_KEYWORDS = (
+    "memo", "weekly action", "internal email", "internal direction",
+    "internal meeting", "email correspondence", "direction item",
+)
+_SG_OFFICE_EXTERNAL_KEYWORDS = (
+    "meeting", "visitor", "facilit",  # "facilit" matches facility/facilities
+)
+
+
+def _detect_sg_office_topic(query: str) -> Optional[str]:
+    """Deterministic keyword check for whether a query is ABOUT the
+    Internal or External SG-office modules — not LLM judgment, since that
+    proved unreliable (sometimes refused legitimate authorized queries,
+    sometimes let an unauthorized one slip through to the wrong tool).
+    Used only to gate UNAUTHORIZED users before routing even starts;
+    authorized users are unaffected regardless of which topic matches."""
+    q = query.lower()
+    if any(kw in q for kw in _SG_OFFICE_INTERNAL_KEYWORDS):
+        return "internal"
+    if any(kw in q for kw in _SG_OFFICE_EXTERNAL_KEYWORDS):
+        return "external"
+    return None
+
+
 def run_chatbot_graph(
     query: str,
     conversation_history: list,
@@ -2156,6 +2116,21 @@ def run_chatbot_graph(
     Run the LangGraph chatbot and yield response chunks.
     Drop-in replacement for the old generate_tool_response().
     """
+    # Deterministic access gate, checked BEFORE routing/tool-calling even
+    # starts — the LLM-judgment approach (telling the router/answer node to
+    # recognize "no matching tool = no access") was unreliable: it either
+    # over-refused legitimate authorized queries or still let an
+    # unauthorized query slip through to an unrelated, wrong tool. This
+    # check is plain keyword + a real DB flag lookup, no model involved.
+    sg_topic = _detect_sg_office_topic(query)
+    if sg_topic:
+        with pg_conn_fn() as conn:
+            flags = get_user_access_flags(conn, user_id)
+        allowed = flags.get(f"sg_office_{sg_topic}")
+        if not allowed:
+            yield "<p>You are unauthorized for this information.</p>"
+            return
+
     trimmed = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
     today = datetime.now().strftime("%B %d, %Y")
     history_text = "\n".join(f"{e['role']}: {e['content']}" for e in trimmed)

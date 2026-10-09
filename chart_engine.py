@@ -14,7 +14,7 @@ BROWN_COLORS = [
     "#A7997C",  # Taupe
     "#7D8C7F",  # Mangrove
     "#917050",  # Earth
-    "#B4B99E",  # Muted Green
+    "#E99B67",  # Muted Green
     "#000000",  # Black
 ]
 
@@ -31,8 +31,75 @@ BROWN_COLORS = [
 #    "#D2B48C",  # Tan
 #]
 
+# Light-to-dark gradients anchored on the federal guideline secondary
+# colors (Secondary 03 Crimson #C8102E, Secondary 02 Green #00843D) — the
+# exact brand hex is kept as one of the 7 steps, not just approximated.
+CRIMSON_COLORS = [
+    "#F4CFD5", "#E693A1", "#D8586D", "#C8102E", "#A00D25", "#780A1C", "#500612",
+]
+GREEN_COLORS = [
+    "#CCE6D8", "#8CC8A8", "#4CA977", "#00843D", "#006A31", "#004F25", "#003518",
+]
 
-_CHART_WORD_RE = re.compile(r"\b(chart|graphs?|visualiz\w*|diagram\w*|pie)\b", re.IGNORECASE)
+PALETTES = {
+    "brown": BROWN_COLORS,
+    "crimson": CRIMSON_COLORS,
+    "green": GREEN_COLORS,
+}
+DEFAULT_PALETTE = "brown"
+
+# Anchor hex for any OTHER color name a user might ask for in chat (e.g.
+# "a bar chart of projects in blue") — gradients for these are generated
+# on the fly with the same tint/shade formula used for CRIMSON_COLORS/
+# GREEN_COLORS above, not hardcoded as full 7-step lists like those two.
+_NAMED_COLOR_HEX = {
+    "blue": "#1565C0", "navy": "#0D47A1", "purple": "#6A1B9A", "violet": "#6A1B9A",
+    "indigo": "#283593", "orange": "#E65100", "yellow": "#F9A825", "gold": "#B68A35",
+    "pink": "#C2185B", "magenta": "#AD1457", "teal": "#00695C", "turquoise": "#00897B",
+    "cyan": "#00838F", "gray": "#424242", "grey": "#424242", "black": "#212121",
+    "white": "#9E9E9E", "lime": "#827717",
+}
+
+
+def _tint(rgb: tuple, t: float) -> tuple:
+    return tuple(round(c + (255 - c) * t) for c in rgb)
+
+
+def _shade(rgb: tuple, t: float) -> tuple:
+    return tuple(round(c * (1 - t)) for c in rgb)
+
+
+def _build_gradient(hex_color: str) -> List[str]:
+    """Light-to-dark 7-step gradient anchored on one hex color — the same
+    formula CRIMSON_COLORS/GREEN_COLORS were generated with, run live here
+    for any other color name instead of hardcoding every possible one."""
+    h = hex_color.lstrip("#")
+    rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    steps = [
+        _tint(rgb, 0.80), _tint(rgb, 0.55), _tint(rgb, 0.30),
+        rgb,
+        _shade(rgb, 0.20), _shade(rgb, 0.40), _shade(rgb, 0.60),
+    ]
+    return ["#%02X%02X%02X" % s for s in steps]
+
+
+def resolve_palette_colors(palette: str) -> List[str]:
+    """Named-palette lookup first (brown/crimson/green — the fixed, fully
+    pre-defined ones), then fall back to generating a gradient for any
+    other recognized color name, then brown if the name isn't recognized
+    at all."""
+    if palette in PALETTES:
+        return PALETTES[palette]
+    anchor = _NAMED_COLOR_HEX.get(palette)
+    if anchor:
+        return _build_gradient(anchor)
+    return BROWN_COLORS
+
+
+_CHART_WORD_RE = re.compile(
+    r"\b(bar\s?chart|pie\s?chart|line\s?chart|chart|graphs?|visualiz\w*|diagram\w*|pie)\b",
+    re.IGNORECASE,
+)
 
 
 def is_chart_request(query: str) -> bool:
@@ -56,16 +123,62 @@ def is_chart_request(query: str) -> bool:
     return "compare budget" in query_lower
 
 
+# A few extra words alias to one of the two brand secondary palettes
+# (people say "red" more often than "crimson"); every other word here maps
+# to itself and gets its gradient built on the fly by resolve_palette_colors.
+_COLOR_WORD_ALIASES = {"red": "crimson", "maroon": "crimson", "violet": "purple", "grey": "gray"}
+_COLOR_WORDS = set(PALETTES) | set(_NAMED_COLOR_HEX) | set(_COLOR_WORD_ALIASES)
+_COLOR_WORD_RE = re.compile(r"\b(" + "|".join(sorted(_COLOR_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+
+def detect_palette_from_query(query: str) -> str:
+    """Pick a palette from ANY color word in the query itself (e.g. "a bar
+    chart of projects in blue") — not just the 3 named brand palettes.
+    Word-boundary matching, not substring, for the same reason as
+    is_chart_request above (a naive "red" in query check would fire on
+    "prepared", "credit", etc). Defaults to the brand's primary palette
+    when no color is named; the frontend's own palette toggle doesn't need
+    this at all — it re-colors client-side from chart_data's
+    `available_palettes`, no backend call involved."""
+    m = _COLOR_WORD_RE.search(query)
+    if not m:
+        return DEFAULT_PALETTE
+    word = m.group(1).lower()
+    return _COLOR_WORD_ALIASES.get(word, word)
+
+
+def _palette_fields(colors: List[str], used_count: int, palette_name: str = DEFAULT_PALETTE) -> Dict[str, Any]:
+    """The colors actually used for this chart's traces (a flat list, in
+    trace order) plus the full catalog of selectable palettes — so a
+    frontend palette-switcher doesn't need any colors hardcoded itself.
+    If the chart was drawn in a color outside the 3 fixed brand palettes
+    (e.g. the user asked for "blue" in chat), that gradient is appended
+    too, so a follow-up toggle for THIS chart can switch back to it."""
+    available = [{"name": name, "colors": c} for name, c in PALETTES.items()]
+    if palette_name not in PALETTES:
+        available.append({"name": palette_name, "colors": colors})
+    return {
+        "palette": colors[:max(used_count, 1)],
+        "available_palettes": available,
+    }
+
+
 def detect_chart_opportunity(
     query: str,
     tool_results: List[Dict],
     assistant_text: str,
+    palette: str = DEFAULT_PALETTE,
 ) -> Optional[Dict[str, Any]]:
     """
     Analyze query + tool results to determine if a chart is appropriate.
     Returns chart_data dict or None.
+
+    `palette` picks which named color set (see PALETTES) draws the chart —
+    defaults to the brand's primary brown palette; pass "crimson" or
+    "green" for either secondary palette instead.
     """
     query_lower = query.lower()
+    colors = resolve_palette_colors(palette)
 
     if not is_chart_request(query):
         return None
@@ -77,7 +190,7 @@ def detect_chart_opportunity(
     # all projects on one shared x-axis) can't produce. Handled separately
     # and returns its own complete payload; falls through to the normal
     # cases if the query isn't this specific or the grouped data is empty.
-    grouped_chart = _extract_grouped_budget_chart(query_lower, tool_results)
+    grouped_chart = _extract_grouped_budget_chart(query_lower, tool_results, colors, palette)
     if grouped_chart:
         return grouped_chart
 
@@ -94,7 +207,7 @@ def detect_chart_opportunity(
         return None
 
     # Generate Plotly config (data + layout, no hardcoded container ID)
-    plotly_config = _build_plotly_config(chart_type, labels, datasets)
+    plotly_config = _build_plotly_config(chart_type, labels, datasets, colors)
 
     result = {
         "chart_type": chart_type,
@@ -104,6 +217,7 @@ def detect_chart_opportunity(
             "total_items": len(labels),
             "labels": labels[:20],
         },
+        **_palette_fields(colors, max(len(labels), len(datasets)), palette),
     }
     if chart_data.get("no_budget_entities_present"):
         result["no_budget_entities_present"] = True
@@ -159,7 +273,8 @@ def _group_value(item: Dict, group_key: str) -> Optional[str]:
 
 
 def _extract_grouped_budget_chart(
-    query_lower: str, tool_results: List[Dict]
+    query_lower: str, tool_results: List[Dict], colors: List[str] = BROWN_COLORS,
+    palette_name: str = DEFAULT_PALETTE,
 ) -> Optional[Dict]:
     """
     Handle queries naming a budget metric (or several, e.g. "spent vs
@@ -220,13 +335,13 @@ def _extract_grouped_budget_chart(
                 "labels": pie_labels,
                 "values": pie_values,
                 "type": "pie",
-                "marker": {"colors": BROWN_COLORS[:len(pie_labels)]},
+                "marker": {"colors": colors[:len(pie_labels)]},
                 "name": metric_label,
             }]
         else:
             traces = []
             for i, (group_name, items) in enumerate(grouped.items()):
-                color = BROWN_COLORS[i % len(BROWN_COLORS)]
+                color = colors[i % len(colors)]
                 x_values = [n for n, _ in items]
                 y_values = [v for _, v in items]
                 if chart_type == "line":
@@ -284,13 +399,13 @@ def _extract_grouped_budget_chart(
                 "labels": group_names,
                 "values": pie_values,
                 "type": "pie",
-                "marker": {"colors": BROWN_COLORS[:len(group_names)]},
+                "marker": {"colors": colors[:len(group_names)]},
                 "name": metric_label,
             }]
         else:
             traces = []
             for i, (metric_field, metric_label) in enumerate(metrics):
-                color = BROWN_COLORS[i % len(BROWN_COLORS)]
+                color = colors[i % len(colors)]
                 y_values = [group_totals[g].get(metric_field, 0) for g in group_names]
                 if chart_type == "line":
                     line_style = {"color": color}
@@ -320,11 +435,13 @@ def _extract_grouped_budget_chart(
             "groups": group_names,
         }
 
+    used_count = len(traces[0]["labels"]) if chart_type == "pie" else len(traces)
     return {
         "chart_type": chart_type,
         "plotly_data": traces,
         "plotly_layout": layout,
         "audit": audit,
+        **_palette_fields(colors, used_count, palette_name),
     }
 
 
@@ -597,10 +714,10 @@ def _infer_chart_type(query: str, labels: list) -> str:
 
 
 def _build_plotly_config(
-    chart_type: str, labels: List[str], datasets: List[Dict]
+    chart_type: str, labels: List[str], datasets: List[Dict], palette_colors: List[str] = BROWN_COLORS
 ) -> Dict[str, Any]:
     """Build Plotly.js data + layout config (no hardcoded container ID)."""
-    colors = BROWN_COLORS[: max(len(labels), len(datasets))]
+    colors = palette_colors[: max(len(labels), len(datasets))]
 
     traces = []
     for i, ds in enumerate(datasets):
