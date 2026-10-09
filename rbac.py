@@ -176,12 +176,11 @@ def _table_has_column(conn, table_name: str, column_name: str) -> bool:
 
 def accessible_project_ids(conn, user_id: int) -> Optional[List[int]]:
     """Return list of project IDs the user can see. None means all.
-    Mirrors accessible_sg_office_ids: project_management_teammember has no
-    user_id column today, so team-member access falls back to matching the
-    member's stored name against the user's own full_name_en — fragile
-    (typos, duplicate names) but it's what the equivalent SG-office code
-    already does in production, and upgrades automatically if a user_id
-    column is ever added to this table."""
+    project_management_teammember has no user_id column today, so
+    team-member access falls back to matching the member's stored name
+    against the user's own full_name_en — fragile (typos, duplicate names)
+    but it upgrades automatically if a user_id column is ever added to
+    this table."""
     if _is_admin_or_super(conn, user_id):
         return None
     with conn.cursor() as cur:
@@ -237,66 +236,17 @@ def user_can_access_project(conn, user_id: int, project_id: int) -> bool:
     return False
 
 
-def accessible_sg_office_ids(conn, user_id: int) -> Optional[List[int]]:
-    """Return list of sg_office IDs the user can see. None means all."""
-    if _is_admin_or_super(conn, user_id):
-        return None
-    with conn.cursor() as cur:
-        if _table_has_column(conn, "sg_office_sgofficeteammember", "user_id"):
-            cur.execute("""
-                SELECT id FROM sg_office_sgoffice WHERE sg_office_manager_id = %s
-                UNION
-                SELECT sg_office_id
-                FROM sg_office_sgofficeteammember
-                WHERE user_id = %s
-            """, (user_id, user_id))
-        else:
-            cur.execute("""
-                SELECT id FROM sg_office_sgoffice WHERE sg_office_manager_id = %s
-                UNION
-                SELECT sg_office_id
-                FROM sg_office_sgofficeteammember
-                WHERE name_en IN (
-                    SELECT full_name_en FROM user_management_user WHERE id = %s
-                )
-            """, (user_id, user_id))
-        return [r[0] for r in cur.fetchall()]
-
-
-def user_can_access_sg_office(conn, user_id: int, sg_office_id: int) -> bool:
-    if _is_admin_or_super(conn, user_id):
-        return True
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 1 FROM sg_office_sgoffice
-            WHERE id = %s AND sg_office_manager_id = %s
-            LIMIT 1
-        """, (sg_office_id, user_id))
-        if cur.fetchone():
-            return True
-        if _table_has_column(conn, "sg_office_sgofficeteammember", "user_id"):
-            cur.execute("""
-                SELECT 1 FROM sg_office_sgofficeteammember
-                WHERE sg_office_id = %s AND user_id = %s
-                LIMIT 1
-            """, (sg_office_id, user_id))
-        else:
-            cur.execute("""
-                SELECT 1 FROM sg_office_sgofficeteammember
-                WHERE sg_office_id = %s
-                  AND name_en IN (
-                      SELECT full_name_en FROM user_management_user WHERE id = %s
-                  )
-                LIMIT 1
-            """, (sg_office_id, user_id))
-        if cur.fetchone():
-            return True
-    return False
-
-
 def accessible_task_ids(conn, user_id: int) -> Optional[List[int]]:
-    """Return list of task IDs the user can see. None means all."""
-    if _is_admin_or_super(conn, user_id):
+    """Return list of task IDs the user can see. None means all.
+    task_management_taskadvisor has no user_id column — advisor access
+    falls back to matching the advisor's stored name_en against the user's
+    own full_name_en, same fragile-but-consistent pattern as
+    project_management_teammember elsewhere in this file.
+    Superadmin-only bypass — unlike projects, there is no "All Tasks"
+    feature in role_and_access_feature, so ALL_PROJECTS must NOT bypass
+    this (confirmed against the real feature catalog: it only covers
+    projects, nothing task-related exists)."""
+    if is_superadmin(conn, user_id):
         return None
     with conn.cursor() as cur:
         cur.execute("""
@@ -307,12 +257,17 @@ def accessible_task_ids(conn, user_id: int) -> Optional[List[int]]:
             SELECT t.id FROM task_management_task t
             JOIN task_management_committeemember cm ON cm.committee_id = t.proposed_committee_id
             WHERE cm.user_id = %s
-        """, (user_id, user_id, user_id))
+            UNION
+            SELECT ta.task_id FROM task_management_taskadvisor ta
+            WHERE ta.name_en IN (
+                SELECT full_name_en FROM user_management_user WHERE id = %s
+            )
+        """, (user_id, user_id, user_id, user_id))
         return [r[0] for r in cur.fetchall()]
 
 
 def user_can_access_task(conn, user_id: int, task_id: int) -> bool:
-    if _is_admin_or_super(conn, user_id):
+    if is_superadmin(conn, user_id):
         return True
     with conn.cursor() as cur:
         cur.execute("""
@@ -328,12 +283,25 @@ def user_can_access_task(conn, user_id: int, task_id: int) -> bool:
             WHERE t.id = %s AND cm.user_id = %s
             LIMIT 1
         """, (task_id, user_id))
+        if cur.fetchone():
+            return True
+        cur.execute("""
+            SELECT 1 FROM task_management_taskadvisor ta
+            WHERE ta.task_id = %s
+              AND ta.name_en IN (
+                  SELECT full_name_en FROM user_management_user WHERE id = %s
+              )
+            LIMIT 1
+        """, (task_id, user_id))
         return cur.fetchone() is not None
 
 
 def accessible_resolution_ids(conn, user_id: int) -> Optional[List[int]]:
-    """Return list of resolution IDs the user can see. None means all."""
-    if _is_admin_or_super(conn, user_id):
+    """Return list of resolution IDs the user can see. None means all.
+    Superadmin-only bypass — same reasoning as accessible_task_ids, no
+    "All Resolutions"/"Council Affairs" feature exists in the real
+    role_and_access_feature catalog."""
+    if is_superadmin(conn, user_id):
         return None
     with conn.cursor() as cur:
         cur.execute("""
@@ -347,7 +315,7 @@ def accessible_resolution_ids(conn, user_id: int) -> Optional[List[int]]:
 
 
 def user_can_access_resolution(conn, user_id: int, resolution_id: int) -> bool:
-    if _is_admin_or_super(conn, user_id):
+    if is_superadmin(conn, user_id):
         return True
     with conn.cursor() as cur:
         cur.execute("""

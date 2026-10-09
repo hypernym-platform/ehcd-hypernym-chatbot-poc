@@ -10,7 +10,13 @@ import queue
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# This system is UAE-based — "now"/"today" for the LLM's own reasoning, and
+# every displayed UTC timestamp, use this instead of the server process's
+# own local clock (which may be UTC or anything else depending on
+# deployment) or the raw UTC instant stored in the DB.
+UAE_TZ = timezone(timedelta(hours=4))
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -19,8 +25,6 @@ from rbac import get_user_access_flags
 from db_queries import (
     list_projects,
     get_project_details,
-    list_sg_offices,
-    get_sg_office_details,
     list_tasks,
     get_task_details,
     list_resolutions,
@@ -131,57 +135,6 @@ TOOL_DEFINITIONS = [
                     "project_name": {
                         "type": "string",
                         "description": "Project name to search (partial match)",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_sg_offices",
-            "description": (
-                "List SG offices (Secretary General offices / departments / divisions). "
-                "Use when user asks about SG offices, departments, divisions, "
-                "organizational units, or office listings."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "description": "Filter by status: 'in_progress', 'completed', 'delayed', 'on_hold'",
-                        "enum": ["in_progress", "completed", "delayed", "on_hold"],
-                    },
-                    "category_id": {
-                        "type": "integer",
-                        "description": "Filter by category ID",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_sg_office_details",
-            "description": (
-                "Get full details of a specific SG office including budget, team, "
-                "entities, notes, and progress. Use when user asks about a "
-                "specific SG office or department."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sg_office_id": {
-                        "type": "integer",
-                        "description": "SG office database ID",
-                    },
-                    "sg_office_name": {
-                        "type": "string",
-                        "description": "SG office name to search (partial match)",
                     },
                 },
                 "required": [],
@@ -1116,14 +1069,6 @@ def execute_tool(
                 project_id=arguments.get("project_id"),
                 project_name=arguments.get("project_name"),
             )
-        elif tool_name == "list_sg_offices":
-            result = list_sg_offices(conn, user_id, filters=arguments)
-        elif tool_name == "get_sg_office_details":
-            result = get_sg_office_details(
-                conn, user_id,
-                sg_office_id=arguments.get("sg_office_id"),
-                sg_office_name=arguments.get("sg_office_name"),
-            )
         elif tool_name == "list_sg_office_emails":
             result = list_sg_office_emails(conn, user_id, filters=arguments)
         elif tool_name == "get_sg_office_email_details":
@@ -1253,8 +1198,13 @@ def _format_scalar(val) -> str:
         return m.group(1)  # midnight timestamps are really just dates
     m = _ISO_DATETIME_WITH_TIME_RE.match(text)
     if m:
-        y, mo, d, hh, mm, _, _, _ = m.groups()
-        return f"{_MONTHS[int(mo) - 1]} {int(d)}, {y}, {_12h(hh, mm)}"
+        y, mo, d, hh, mm, ss, _, _ = m.groups()
+        # Stored value is a UTC instant (timestamptz) — shift to UAE local
+        # time before display using real datetime arithmetic (so day/month/
+        # year rollover near midnight is handled correctly), instead of
+        # showing the raw UTC hour to a UAE-based user.
+        dt_local = datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss)) + timedelta(hours=4)
+        return f"{_MONTHS[dt_local.month - 1]} {dt_local.day}, {dt_local.year}, {_12h(f'{dt_local.hour:02d}', f'{dt_local.minute:02d}')}"
     m = _BARE_TIME_RE.match(text)
     if m:
         hh, mm, _ = m.groups()
@@ -1396,8 +1346,6 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
     tools = [
         TOOL_DEFS_BY_NAME["list_projects"],
         TOOL_DEFS_BY_NAME["get_project_details"],
-        TOOL_DEFS_BY_NAME["list_sg_offices"],
-        TOOL_DEFS_BY_NAME["get_sg_office_details"],
         TOOL_DEFS_BY_NAME["list_tasks"],
         TOOL_DEFS_BY_NAME["get_task_details"],
         TOOL_DEFS_BY_NAME["list_resolutions"],
@@ -1478,7 +1426,7 @@ could have changed since — never just repeat an earlier answer verbatim
 instead of re-querying.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 9. Whenever the question asks for a chart, graph, or visualization of an entity
-(projects, SG offices, tasks, resolutions, education stats) — even if it names
+(projects, tasks, resolutions, education stats) — even if it names
 no specific field, e.g. "generate a chart of tasks" — you MUST call the
 matching list/get/query tool for that entity before responding, exactly as
 rule 1 says for structured data. A chart cannot be drawn from data you never
@@ -1600,7 +1548,7 @@ Current Date: {today}
 
 Response formatting rules:
 - Tool result data (projects, tasks, offices, resolutions, education stats, policy excerpts, etc.) is already provided to you fully formatted in HTML in the tool messages above. Do NOT re-render, re-tag, re-list, or repeat that dataset yourself — the system separately ensures the complete, correctly formatted data reaches the user ahead of your response.
-- list_projects/list_sg_offices/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
+- list_projects/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
 - Except for flowcharts and explicit bullet-point requests (see below), your entire response must be ONE brief, plain-language summary or insight about the data (e.g. a notable count, a standout item, a key trend) — wrapped in a single <p>...</p> tag and nothing else. No headings, no lists, no tables, no other HTML tags, no markdown (**, #, backticks), no literal \n.
 - If no tool results are present (greetings, general conversation), respond naturally in plain sentences, still wrapped in a single <p> tag.
 - Respond in the same language as the user's question (if Arabic, respond in Arabic).
@@ -1812,7 +1760,7 @@ def answer_node(state: ChatState) -> dict:
     chunk_queue = state["chunk_queue"]
 
     # Build answer-specific system prompt (no tool schemas)
-    today = datetime.now().strftime("%B %d, %Y")
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
     answer_system = ANSWER_SYSTEM_PROMPT.format(
         user_name=state["user_name"],
         user_role=state["user_role"],
@@ -1973,7 +1921,7 @@ def run_chatbot_graph(
             yield "<p>You are unauthorized for this information.</p>"
             return
 
-    today = datetime.now().strftime("%B %d, %Y")
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
 
     system_content = ROUTER_SYSTEM_PROMPT.format(
         user_name=user_name,
