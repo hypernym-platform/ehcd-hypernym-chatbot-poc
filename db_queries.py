@@ -15,11 +15,9 @@ from rbac import (
     db_has_feature,
     FeatureID,
     accessible_project_ids,
-    accessible_sg_office_ids,
     accessible_task_ids,
     accessible_resolution_ids,
     user_can_access_project,
-    user_can_access_sg_office,
     user_can_access_task,
     user_can_access_resolution,
     has_sg_office_internal_access,
@@ -485,162 +483,10 @@ def get_project_details(conn, user_id: int, project_id: int = None,
 
 
 # ---------------------------------------------------------------------------
-# SG OFFICE
-# ---------------------------------------------------------------------------
-
-def list_sg_offices(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
-    """List SG offices the user can access. Returns {"total_count": N, "data": [...]}."""
-    filters = filters or {}
-    allowed_ids = accessible_sg_office_ids(conn, user_id)
-
-    query = """
-        SELECT s.id, s.sg_office_id, s.sg_office_name_en, s.sg_office_name_ar,
-               s.start_date, s.end_date, s.status_en, s.status_ar,
-               s.sg_office_description_en,
-               c.category_name_en AS category_name,
-               u.full_name_en AS manager_name
-        FROM sg_office_sgoffice s
-        LEFT JOIN sg_office_sgofficecategory c ON c.id = s.sg_office_category_id
-        LEFT JOIN user_management_user u ON u.id = s.sg_office_manager_id
-    """
-    conditions, params = [], []
-
-    if allowed_ids is not None:
-        if not allowed_ids:
-            return {"message": "You do not have access to any SG offices. Please contact your administrator to get access.", "total_count": 0, "data": []}
-        conditions.append("s.id = ANY(%s)")
-        params.append(allowed_ids)
-
-    if filters.get("status"):
-        status_val = filters["status"]
-        reverse_map = {v.lower(): k for k, v in STATUS_MAP_EN.items()}
-        status_int = reverse_map.get(status_val.lower().replace("_", " "))
-        if status_int:
-            conditions.append("s.status_en = %s")
-            params.append(status_int)
-
-    if filters.get("category_id"):
-        conditions.append("s.sg_office_category_id = %s")
-        params.append(filters["category_id"])
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY s.id"
-
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, params)
-        rows = cur.fetchall()
-
-    if not rows:
-        return {"message": "No SG offices found matching your criteria.", "total_count": 0, "data": []}
-
-    result = []
-    for r in rows:
-        item = dict(r)
-        item["status_label"] = _status_label(item.get("status_en"))
-        item["start_date"] = str(item["start_date"]) if item.get("start_date") else None
-        item["end_date"] = str(item["end_date"]) if item.get("end_date") else None
-        result.append(item)
-    return {"total_count": len(result), "data": result}
-
-
-def get_sg_office_details(conn, user_id: int, sg_office_id: int = None,
-                          sg_office_name: str = None) -> Dict[str, Any]:
-    """Get full SG office details including budget, team, entities."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        if sg_office_id:
-            cur.execute("""
-                SELECT s.*, c.category_name_en, c.category_name_ar,
-                       u.full_name_en AS manager_name
-                FROM sg_office_sgoffice s
-                LEFT JOIN sg_office_sgofficecategory c ON c.id = s.sg_office_category_id
-                LEFT JOIN user_management_user u ON u.id = s.sg_office_manager_id
-                WHERE s.id = %s
-            """, (sg_office_id,))
-        elif sg_office_name:
-            cur.execute("""
-                SELECT s.*, c.category_name_en, c.category_name_ar,
-                       u.full_name_en AS manager_name
-                FROM sg_office_sgoffice s
-                LEFT JOIN sg_office_sgofficecategory c ON c.id = s.sg_office_category_id
-                LEFT JOIN user_management_user u ON u.id = s.sg_office_manager_id
-                WHERE s.sg_office_name_en ILIKE %s OR s.sg_office_name_ar ILIKE %s
-                LIMIT 1
-            """, (f"%{sg_office_name}%", f"%{sg_office_name}%"))
-        else:
-            return {"error": "sg_office_id or sg_office_name is required"}
-
-        office = cur.fetchone()
-        if not office:
-            return {"error": "SG Office not found"}
-
-        oid = office["id"]
-
-        if not user_can_access_sg_office(conn, user_id, oid):
-            return {"error": "Access denied to this SG Office"}
-
-        result = {"office": dict(office), "status_label": _status_label(office.get("status_en"))}
-
-        # Budget
-        cur.execute("""
-            SELECT allocated_budget, spent_budget, budget_left, created_at,
-                   updaed_at AS updated_at
-            FROM sg_office_sgofficebudget WHERE sg_office_id = %s LIMIT 1
-        """, (oid,))
-        row = cur.fetchone()
-        result["budget"] = dict(row) if row else None
-
-        # Team
-        cur.execute("""
-            SELECT id, name_en, name_ar, designation_en, designation_ar, created_at, updated_at
-            FROM sg_office_sgofficeteammember WHERE sg_office_id = %s ORDER BY id
-        """, (oid,))
-        result["team"] = [dict(r) for r in cur.fetchall()]
-
-        # Entities
-        cur.execute("""
-            SELECT e.id, e.entity_name_en, e.entity_name_ar,
-                   e.entity_acronym_en, e.entity_acronym_ar
-            FROM sg_office_sgofficeentity e
-            JOIN sg_office_sgoffice_sg_office_entities m ON m.sgofficeentity_id = e.id
-            WHERE m.sgoffice_id = %s
-        """, (oid,))
-        result["entities"] = [dict(r) for r in cur.fetchall()]
-
-        # Notes (user's own)
-        cur.execute("""
-            SELECT id, title, note, date, created_at, updated_at
-            FROM sg_office_sgofficenotes
-            WHERE sg_office_id = %s AND user_id = %s
-            ORDER BY created_at DESC NULLS LAST, id DESC
-        """, (oid, user_id))
-        result["notes"] = [dict(r) for r in cur.fetchall()]
-
-        # Format JSONB fields
-        for key in ["summary_heading_en", "summary_description_en", "progress_to_date_en",
-                     "next_step_en", "next_step_due_date"]:
-            val = office.get(key)
-            if val:
-                result["office"][key] = _fmt_jsonb(val)
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # SG OFFICE — INTERNAL DIRECTIONS (email correspondence)
-#
-# Read-only for now: the DB only has the raw synced-mailbox tables
+
 # (sg_office_email / sg_office_emailthread / sg_office_emailattachment) —
 # there's no table/column yet for the workflow layer the internal-tab spec
-# describes (H.E. direction, assigned owner, deadline, status). Questions
-# like "awaiting H.E. direction", "overdue directions", "waiting for a
-# response", "due this week", "assigned to X" all describe that not-yet-
-# built workflow layer, not the raw email. What IS real and queryable: the
-# AI-generated `summary` column on both sg_office_email and
-# sg_office_emailthread (the module's existing AI summary feature) — ask
-# the model to summarize/read it directly off a fetched email or thread, no
-# separate tool needed.
-#
 # RBAC: gated via rbac.has_sg_office_internal_access() / the
 # "sg_office_internal" flag from get_user_access_flags(), applied at the
 # tool-availability level in build_available_tools() (tools.py) — a user
