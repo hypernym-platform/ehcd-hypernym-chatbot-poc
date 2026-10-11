@@ -1941,8 +1941,8 @@ def answer_node(state: ChatState) -> dict:
     cache_eligible = not has_tool_results and not history_messages
 
     # Build answer-specific system prompt (no tool schemas)
-    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
-    answer_system = ANSWER_SYSTEM_PROMPT.format(
+    # today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
+    # answer_system = ANSWER_SYSTEM_PROMPT.format(
     query_vec = None
     if cache_eligible and redis_client is not None and emb_obj is not None:
         try:
