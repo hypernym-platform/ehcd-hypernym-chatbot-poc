@@ -608,11 +608,11 @@ TOOL_DEFINITIONS = [
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Set this ONLY to narrow further than the default — e.g. ['email'] to answer just 'what's the requester's email for X'. Omitting `fields` already returns a short curated set (organization/requester/status/date/time/venue/coordinator), matching the real Meeting Requests page — NOT the full ~25-field record, so you don't need `fields` just to avoid a large table.",
+                        "description": "Set this ONLY to narrow further than the default — e.g. ['email'] for the requester's email, ['visitor_email_cc'] for who the visitor info email was CC'd to (what 'recipients'/'CC' questions mean), ['visitor_email_sent_at'] for when it was sent. Omitting `fields` already returns a short curated set (organization/requester/status/date/time/venue/coordinator), matching the real Meeting Requests page — NOT the full ~25-field record, so you don't need `fields` just to avoid a large table.",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max number of meetings to return.",
+                        "description": "Max number of meetings to return. Omit for name/organization searches — multiple meetings can share the same name, and a limit would silently hide the others.",
                     },
                 },
                 "required": [],
