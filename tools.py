@@ -1940,9 +1940,6 @@ def answer_node(state: ChatState) -> dict:
     )
     cache_eligible = not has_tool_results and not history_messages
 
-    # Build answer-specific system prompt (no tool schemas)
-    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
-    answer_system = ANSWER_SYSTEM_PROMPT.format(
     query_vec = None
     if cache_eligible and redis_client is not None and emb_obj is not None:
         try:
@@ -1958,7 +1955,7 @@ def answer_node(state: ChatState) -> dict:
     # Build answer-specific system prompt (no tool schemas). Voice sessions
     # get the plain-spoken-language variant instead of the HTML-formatted
     # one — this is spoken aloud by ElevenLabs' TTS, never shown as text.
-    today = datetime.now().strftime("%B %d, %Y")
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
     prompt_template = VOICE_ANSWER_SYSTEM_PROMPT if voice_mode else ANSWER_SYSTEM_PROMPT
     answer_system = prompt_template.format(
         user_name=state["user_name"],
@@ -2146,7 +2143,6 @@ def run_chatbot_graph(
             return
 
     trimmed = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
-    today = datetime.now().strftime("%B %d, %Y")
     history_text = "\n".join(f"{e['role']}: {e['content']}" for e in trimmed)
     today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
 
