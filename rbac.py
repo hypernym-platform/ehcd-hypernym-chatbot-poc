@@ -15,13 +15,26 @@ DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
 
 
 class FeatureID:
-    USER_MANAGEMENT = 3
-    BUDGET_INFO     = 4
-    EDUCATION_DASH  = 5
-    ALL_PROJECTS    = 6
-    NOTES           = 7
-    PROJECT_DOCS    = 8
-    AI_CHATBOT      = 9
+    USER_MANAGEMENT    = 3
+    BUDGET_INFO        = 4
+    EDUCATION_DASH     = 5
+    ALL_PROJECTS       = 6
+    NOTES              = 7
+    PROJECT_DOCS       = 8
+    AI_CHATBOT         = 9
+    # id 10 doesn't exist in role_and_access_feature (never allocated).
+    SG_OFFICE_INTERNAL = 11  # "Internal Meetings" — email correspondence,
+                             # memos, weekly actions (the Internal
+                             # Directions module).
+    SG_OFFICE_EXTERNAL = 12  # "Meeting Requests" — external meetings,
+                             # visitors, facilities, outcomes.
+    SG_OFFICE_HE_BRIEFINGS = 13  # "H.E. Briefings" — confirmed to exist in
+                             # role_and_access_feature (2026-10-08), but no
+                             # tool/data in this codebase maps to it yet.
+                             # Not gating anything until that's defined.
+    SEND_EMAIL         = 14  # Confirmed to exist; no corresponding tool in
+                             # this codebase (email is sent by the main
+                             # app, not the chatbot), so nothing to gate.
 
 
 def is_superadmin(conn, user_id: int) -> bool:
@@ -106,6 +119,30 @@ def has_user_management(conn, user_id: int) -> bool:
     return db_has_feature(conn, user_id, FeatureID.USER_MANAGEMENT)
 
 
+def has_sg_office_internal_access(conn, user_id: int) -> bool:
+    """Internal Directions tab (email correspondence, memos, weekly
+    actions) — a flat view/no-view gate, not ownership-based like projects/
+    tasks/resolutions, since everyone with the feature sees the same shared
+    data. H.E. Briefings (feature 13) is a superset grant — per explicit
+    spec, having it means seeing both Internal and External, even if a
+    role is ever assigned ONLY that feature without 11/12 directly."""
+    return (
+        is_superadmin(conn, user_id)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_INTERNAL)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_HE_BRIEFINGS)
+    )
+
+
+def has_sg_office_external_access(conn, user_id: int) -> bool:
+    """External Meetings/Visitors/Facilities tab — same flat view/no-view
+    gate as the internal one, with the same H.E. Briefings superset rule."""
+    return (
+        is_superadmin(conn, user_id)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_EXTERNAL)
+        or db_has_feature(conn, user_id, FeatureID.SG_OFFICE_HE_BRIEFINGS)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ownership-based access helpers for new modules
 # ---------------------------------------------------------------------------
@@ -139,12 +176,11 @@ def _table_has_column(conn, table_name: str, column_name: str) -> bool:
 
 def accessible_project_ids(conn, user_id: int) -> Optional[List[int]]:
     """Return list of project IDs the user can see. None means all.
-    Mirrors accessible_sg_office_ids: project_management_teammember has no
-    user_id column today, so team-member access falls back to matching the
-    member's stored name against the user's own full_name_en — fragile
-    (typos, duplicate names) but it's what the equivalent SG-office code
-    already does in production, and upgrades automatically if a user_id
-    column is ever added to this table."""
+    project_management_teammember has no user_id column today, so
+    team-member access falls back to matching the member's stored name
+    against the user's own full_name_en — fragile (typos, duplicate names)
+    but it upgrades automatically if a user_id column is ever added to
+    this table."""
     if _is_admin_or_super(conn, user_id):
         return None
     with conn.cursor() as cur:
@@ -200,66 +236,17 @@ def user_can_access_project(conn, user_id: int, project_id: int) -> bool:
     return False
 
 
-def accessible_sg_office_ids(conn, user_id: int) -> Optional[List[int]]:
-    """Return list of sg_office IDs the user can see. None means all."""
-    if _is_admin_or_super(conn, user_id):
-        return None
-    with conn.cursor() as cur:
-        if _table_has_column(conn, "sg_office_sgofficeteammember", "user_id"):
-            cur.execute("""
-                SELECT id FROM sg_office_sgoffice WHERE sg_office_manager_id = %s
-                UNION
-                SELECT sg_office_id
-                FROM sg_office_sgofficeteammember
-                WHERE user_id = %s
-            """, (user_id, user_id))
-        else:
-            cur.execute("""
-                SELECT id FROM sg_office_sgoffice WHERE sg_office_manager_id = %s
-                UNION
-                SELECT sg_office_id
-                FROM sg_office_sgofficeteammember
-                WHERE name_en IN (
-                    SELECT full_name_en FROM user_management_user WHERE id = %s
-                )
-            """, (user_id, user_id))
-        return [r[0] for r in cur.fetchall()]
-
-
-def user_can_access_sg_office(conn, user_id: int, sg_office_id: int) -> bool:
-    if _is_admin_or_super(conn, user_id):
-        return True
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 1 FROM sg_office_sgoffice
-            WHERE id = %s AND sg_office_manager_id = %s
-            LIMIT 1
-        """, (sg_office_id, user_id))
-        if cur.fetchone():
-            return True
-        if _table_has_column(conn, "sg_office_sgofficeteammember", "user_id"):
-            cur.execute("""
-                SELECT 1 FROM sg_office_sgofficeteammember
-                WHERE sg_office_id = %s AND user_id = %s
-                LIMIT 1
-            """, (sg_office_id, user_id))
-        else:
-            cur.execute("""
-                SELECT 1 FROM sg_office_sgofficeteammember
-                WHERE sg_office_id = %s
-                  AND name_en IN (
-                      SELECT full_name_en FROM user_management_user WHERE id = %s
-                  )
-                LIMIT 1
-            """, (sg_office_id, user_id))
-        if cur.fetchone():
-            return True
-    return False
-
-
 def accessible_task_ids(conn, user_id: int) -> Optional[List[int]]:
-    """Return list of task IDs the user can see. None means all."""
-    if _is_admin_or_super(conn, user_id):
+    """Return list of task IDs the user can see. None means all.
+    task_management_taskadvisor has no user_id column — advisor access
+    falls back to matching the advisor's stored name_en against the user's
+    own full_name_en, same fragile-but-consistent pattern as
+    project_management_teammember elsewhere in this file.
+    Superadmin-only bypass — unlike projects, there is no "All Tasks"
+    feature in role_and_access_feature, so ALL_PROJECTS must NOT bypass
+    this (confirmed against the real feature catalog: it only covers
+    projects, nothing task-related exists)."""
+    if is_superadmin(conn, user_id):
         return None
     with conn.cursor() as cur:
         cur.execute("""
@@ -270,12 +257,17 @@ def accessible_task_ids(conn, user_id: int) -> Optional[List[int]]:
             SELECT t.id FROM task_management_task t
             JOIN task_management_committeemember cm ON cm.committee_id = t.proposed_committee_id
             WHERE cm.user_id = %s
-        """, (user_id, user_id, user_id))
+            UNION
+            SELECT ta.task_id FROM task_management_taskadvisor ta
+            WHERE ta.name_en IN (
+                SELECT full_name_en FROM user_management_user WHERE id = %s
+            )
+        """, (user_id, user_id, user_id, user_id))
         return [r[0] for r in cur.fetchall()]
 
 
 def user_can_access_task(conn, user_id: int, task_id: int) -> bool:
-    if _is_admin_or_super(conn, user_id):
+    if is_superadmin(conn, user_id):
         return True
     with conn.cursor() as cur:
         cur.execute("""
@@ -291,12 +283,25 @@ def user_can_access_task(conn, user_id: int, task_id: int) -> bool:
             WHERE t.id = %s AND cm.user_id = %s
             LIMIT 1
         """, (task_id, user_id))
+        if cur.fetchone():
+            return True
+        cur.execute("""
+            SELECT 1 FROM task_management_taskadvisor ta
+            WHERE ta.task_id = %s
+              AND ta.name_en IN (
+                  SELECT full_name_en FROM user_management_user WHERE id = %s
+              )
+            LIMIT 1
+        """, (task_id, user_id))
         return cur.fetchone() is not None
 
 
 def accessible_resolution_ids(conn, user_id: int) -> Optional[List[int]]:
-    """Return list of resolution IDs the user can see. None means all."""
-    if _is_admin_or_super(conn, user_id):
+    """Return list of resolution IDs the user can see. None means all.
+    Superadmin-only bypass — same reasoning as accessible_task_ids, no
+    "All Resolutions"/"Council Affairs" feature exists in the real
+    role_and_access_feature catalog."""
+    if is_superadmin(conn, user_id):
         return None
     with conn.cursor() as cur:
         cur.execute("""
@@ -310,7 +315,7 @@ def accessible_resolution_ids(conn, user_id: int) -> Optional[List[int]]:
 
 
 def user_can_access_resolution(conn, user_id: int, resolution_id: int) -> bool:
-    if _is_admin_or_super(conn, user_id):
+    if is_superadmin(conn, user_id):
         return True
     with conn.cursor() as cur:
         cur.execute("""
@@ -344,7 +349,8 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
 
     if not row:
         return {k: False for k in ["superadmin", "all_projects", "budget",
-                                    "user_management", "notes", "education", "project_docs"]}
+                                    "user_management", "notes", "education", "project_docs",
+                                    "sg_office_internal", "sg_office_external"]}
 
     sa = bool(row[0])
     feature_ids = set(row[1] or [])
@@ -356,4 +362,11 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
         "notes": sa or FeatureID.NOTES in feature_ids,
         "education": sa or FeatureID.EDUCATION_DASH in feature_ids,
         "project_docs": sa or FeatureID.PROJECT_DOCS in feature_ids,
+        # H.E. Briefings is a superset grant — having it means seeing both
+        # Internal and External, per explicit spec (same rule as the
+        # standalone has_sg_office_*_access() functions above).
+        "sg_office_internal": sa or FeatureID.SG_OFFICE_INTERNAL in feature_ids
+                               or FeatureID.SG_OFFICE_HE_BRIEFINGS in feature_ids,
+        "sg_office_external": sa or FeatureID.SG_OFFICE_EXTERNAL in feature_ids
+                               or FeatureID.SG_OFFICE_HE_BRIEFINGS in feature_ids,
     }
