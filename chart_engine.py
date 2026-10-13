@@ -235,7 +235,26 @@ def detect_chart_opportunity(
     """
     query_lower = query.lower()
     colors = resolve_palette_colors(palette)
-    fallback_query_lower = previous_query.lower() if recent_had_chart and previous_query else None
+    # For TYPE inference only — safe to blend broadly (see
+    # _query_names_chart_type below: this turn's own explicit type
+    # always wins regardless of what's blended in).
+    type_fallback_query_lower = previous_query.lower() if recent_had_chart and previous_query else None
+    # For FIELD matching — much narrower. Reusing the previous turn's
+    # wording must only happen for a genuinely content-free style
+    # continuation ("show in golden colour") — not for any query that
+    # merely fails to name a recognized FIELD, since a fully-formed new
+    # request ("email trends for the current month") can legitimately do
+    # that too (trend/month aren't field names) and must never be
+    # silently replaced by stale, unrelated wording from an earlier turn.
+    is_pure_style_continuation = (
+        recent_had_chart
+        and bool(_CHART_CONTINUATION_RE.search(query_lower))
+        and not _CHART_WORD_RE.search(query_lower)
+        and "compare budget" not in query_lower
+        and not _DATE_BUCKET_RE.search(query_lower)
+        and "readiness" not in query_lower
+    )
+    field_fallback_query_lower = previous_query.lower() if is_pure_style_continuation and previous_query else None
 
     if not is_chart_request(query, recent_had_chart):
         return None
@@ -252,17 +271,23 @@ def detect_chart_opportunity(
         return grouped_chart
 
     # Try to extract chartable data from tool results
-    chart_data = _extract_chart_data(query_lower, tool_results, fallback_query_lower)
+    chart_data = _extract_chart_data(query_lower, tool_results, field_fallback_query_lower)
     if not chart_data:
         return None
 
     labels = chart_data["labels"]
     datasets = chart_data["datasets"]
-    # Keyword presence only (no scoring/tie-break), so blending in the
-    # previous turn's words is safe even when this turn also names a type
-    # explicitly — "pie"/"line" in THIS turn still wins the if/elif chain.
-    type_query_lower = f"{fallback_query_lower} {query_lower}" if fallback_query_lower else query_lower
-    chart_type = chart_data.get("chart_type", _infer_chart_type(type_query_lower, labels))
+    # This turn's own explicit type always wins outright; only blend in
+    # the previous turn's words when THIS turn names no type at all, so
+    # a stale "line" from before can never override an explicit "bar"
+    # asked for now (see _query_names_chart_type).
+    if chart_data.get("chart_type"):
+        chart_type = chart_data["chart_type"]
+    elif _query_names_chart_type(query_lower):
+        chart_type = _infer_chart_type(query_lower, labels)
+    else:
+        type_query_lower = f"{type_fallback_query_lower} {query_lower}" if type_fallback_query_lower else query_lower
+        chart_type = _infer_chart_type(type_query_lower, labels)
 
     if len(labels) < 1:
         return None
@@ -391,7 +416,10 @@ def _match_field(
         norm = _normalize_field(key)
         if not norm:
             continue
-        words = [norm] + _FIELD_SYNONYMS.get(norm, [])
+        # Plain "+s" plural too (sender -> senders) — "top 10 email
+        # senders" otherwise never matched sender_name at all, since the
+        # word-boundary match requires the exact word, not a substring.
+        words = [norm, f"{norm}s"] + _FIELD_SYNONYMS.get(norm, [])
         if not any(re.search(r"\b" + re.escape(w) + r"\b", query_lower) for w in words):
             continue
         if numeric is not None and _field_is_numeric(key, tool_results) != numeric:
@@ -648,9 +676,16 @@ def _extract_date_bucket_chart(query_lower: str, tool_results: List[Dict]) -> Op
     if not date_field:
         return None
 
-    if "week" in query_lower:
+    # Bare "month"/"week" (as in "for the current month") describes the
+    # DATE RANGE, not the bucket size — bucketing a single month's own
+    # data by month always yields exactly one bucket, which the <2 check
+    # below then rejects outright. Only explicit "per week"/"monthly"
+    # phrasing means bucket-by-that-size; everything else defaults to
+    # daily buckets, the only granularity that's ever useful within a
+    # single named month/week.
+    if any(p in query_lower for p in ("per week", "weekly", "each week")):
         granularity = "week"
-    elif "month" in query_lower:
+    elif any(p in query_lower for p in ("per month", "monthly", "each month")):
         granularity = "month"
     else:
         granularity = "day"
@@ -892,9 +927,15 @@ def _extract_chart_data(
             # meetings sharing a few venues) — if every row has its own
             # distinct value, counting isn't meaningful.
             if 2 <= len(counts) < len(tool_results):
+                # Highest count first — what "top N" means, and a
+                # sensible default reading order even when N isn't named.
+                ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+                top_n = re.search(r"\btop (\d+)\b", query_lower)
+                if top_n:
+                    ranked = ranked[: int(top_n.group(1))]
                 return {
-                    "labels": list(counts.keys()),
-                    "datasets": [{"label": "Count", "data": list(counts.values())}],
+                    "labels": [k for k, _ in ranked],
+                    "datasets": [{"label": "Count", "data": [v for _, v in ranked]}],
                 }
 
     # Case 2: Budget comparison across multiple items (projects, SG offices)
@@ -1200,13 +1241,27 @@ def _to_float(val) -> Optional[float]:
     return number * _MAGNITUDE_SUFFIXES.get(suffix, 1)
 
 
+_CHART_TYPE_WORDS = {
+    "pie": ("pie", "distribution", "percentage", "share", "breakdown"),
+    "line": ("line", "trend", "over time", "timeline"),
+    "bar": ("bar",),
+}
+
+
 def _infer_chart_type(query: str, labels: list) -> str:
     """Infer appropriate chart type from query and data shape."""
-    if any(w in query for w in ["pie", "distribution", "percentage", "share", "breakdown"]):
+    if any(w in query for w in _CHART_TYPE_WORDS["pie"]):
         return "pie"
-    if any(w in query for w in ["line", "trend", "over time", "timeline"]):
+    if any(w in query for w in _CHART_TYPE_WORDS["line"]):
         return "line"
     return "bar"
+
+
+def _query_names_chart_type(query: str) -> bool:
+    """True if the query itself names pie/line/bar explicitly — an
+    explicit type THIS turn must always win over one blended in from the
+    previous turn, never get silently overridden by stale context."""
+    return any(w in query for words in _CHART_TYPE_WORDS.values() for w in words)
 
 
 def _build_plotly_config(
