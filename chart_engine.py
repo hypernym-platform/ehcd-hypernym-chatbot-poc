@@ -243,33 +243,82 @@ def _detect_budget_metrics(query_lower: str) -> List[tuple]:
     ]
 
 
-_GROUP_KEYWORDS = [
-    (["department", "category", "sector"], "category"),
-    (["manager"], "manager"),
-    (["status"], "status"),
-]
+# Fields that identify WHICH row a chart item is (already used as the
+# x-axis label elsewhere) — never valid as a group-by/metric axis
+# themselves, so excluded from the generic field matching below.
+_ENTITY_NAME_FIELDS = frozenset({
+    "project_name_en", "project_name_ar", "sg_office_name_en", "sg_office_name_ar",
+    "task_name", "resolution_topic_en", "resolution_topic_ar", "subject", "code",
+})
+
+# The one real vocabulary gap between how people phrase an axis and the
+# actual DB column: "department"/"sector" both mean category_name. Every
+# other word resolves straight from the query to a real field name via
+# _match_field, so a brand new column needs no entry added here.
+_FIELD_SYNONYMS = {"department": "category", "sector": "category"}
+
+_FIELD_SUFFIXES = ("_label", "_en", "_ar", "_name")
+_FIELD_SUFFIX_RANK = {"_label": 0, "_en": 1, "_name": 2, "_ar": 3}
 
 
-def _detect_group_field(query_lower: str) -> Optional[str]:
-    """Returns a group KEY (not a literal column name) since the right
-    field differs by entity shape — e.g. status is "status_label" on SG
-    offices but "status_en" on projects. _group_value() below resolves it
-    per item. "Department"/"sector" aren't real columns; projects and SG
-    offices only have category_name, and that's what users mean by either."""
-    for keywords, group_key in _GROUP_KEYWORDS:
-        if any(k in query_lower for k in keywords):
-            return group_key
-    return None
+def _normalize_field(key: str) -> str:
+    """'status_label' -> 'status', 'category_name' -> 'category' — so a DB
+    column reads like the plain word a user would actually type."""
+    for suf in _FIELD_SUFFIXES:
+        if key.endswith(suf):
+            return key[: -len(suf)].replace("_", " ").strip()
+    return key.replace("_", " ").strip()
 
 
-def _group_value(item: Dict, group_key: str) -> Optional[str]:
-    if group_key == "category":
-        return item.get("category_name")
-    if group_key == "manager":
-        return item.get("manager_name")
-    if group_key == "status":
-        return item.get("status_label") or item.get("status_en") or item.get("status")
-    return None
+def _field_is_numeric(key: str, tool_results: List[Dict]) -> bool:
+    values = [r.get(key) for r in tool_results if isinstance(r, dict) and r.get(key) is not None]
+    return bool(values) and all(_to_float(v) is not None for v in values)
+
+
+def _match_field(
+    query_lower: str, tool_results: List[Dict], numeric: Optional[bool] = None,
+    exclude: frozenset = frozenset(),
+) -> Optional[str]:
+    """
+    Generic axis detection: find a real field in tool_results whose plain
+    name (or a known synonym) is actually named in the query — e.g.
+    "priority" matches a real priority_label column — so any DB field
+    works as a chart axis without a hand-added keyword each time.
+    numeric=True/False restricts to a metric (y-axis) vs. a categorical
+    (x-axis/group-by) field; None allows either.
+    """
+    keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            keys.update(row.keys())
+    keys -= _ENTITY_NAME_FIELDS
+    keys -= exclude
+    keys = {k for k in keys if k != "id" and not k.endswith("_id")}
+
+    best_key, best_score = None, None
+    for key in keys:
+        norm = _normalize_field(key)
+        if not norm:
+            continue
+        word = _FIELD_SYNONYMS.get(norm, norm)
+        if not re.search(r"\b" + re.escape(word) + r"\b", query_lower):
+            continue
+        if numeric is not None and _field_is_numeric(key, tool_results) != numeric:
+            continue
+        # Prefer the most specific (longest) name match; among ties prefer
+        # the most-resolved column (a _label beats a bare/_ar twin).
+        rank = next((r for suf, r in _FIELD_SUFFIX_RANK.items() if key.endswith(suf)), 4)
+        score = (len(norm), -rank)
+        if best_score is None or score > best_score:
+            best_key, best_score = key, score
+    return best_key
+
+
+def _entity_display_name(item: Dict) -> Optional[str]:
+    return (
+        item.get("project_name_en") or item.get("sg_office_name_en")
+        or item.get("task_name") or item.get("resolution_topic_en")
+    )
 
 
 def _extract_grouped_budget_chart(
@@ -295,7 +344,7 @@ def _extract_grouped_budget_chart(
         return None
 
     metrics = _detect_budget_metrics(query_lower)
-    group_key = _detect_group_field(query_lower)
+    group_key = _match_field(query_lower, tool_results, numeric=False)
     if not metrics or not group_key:
         return None
 
@@ -317,7 +366,7 @@ def _extract_grouped_budget_chart(
             name = item.get("project_name_en") or item.get("sg_office_name_en")
             val = _to_float(item.get(metric_field))
             if name and val is not None:
-                group = str(_group_value(item, group_key) or "Uncategorized")
+                group = str(item.get(group_key) or "Uncategorized")
                 rows.append((name, group, val))
 
         if not rows:
@@ -378,7 +427,7 @@ def _extract_grouped_budget_chart(
         for item in tool_results:
             if not (item.get("project_name_en") or item.get("sg_office_name_en")):
                 continue
-            group = str(_group_value(item, group_key) or "Uncategorized")
+            group = str(item.get(group_key) or "Uncategorized")
             for metric_field, _ in metrics:
                 val = _to_float(item.get(metric_field))
                 if val is not None:
@@ -422,7 +471,7 @@ def _extract_grouped_budget_chart(
                         "type": "bar", "name": metric_label,
                         "marker": {"color": color},
                     })
-            layout["xaxis"] = {"title": group_key.title()}
+            layout["xaxis"] = {"title": _normalize_field(group_key).title()}
             layout["yaxis"] = {"title": "Budget"}
             if chart_type == "bar":
                 layout["barmode"] = "group"
@@ -453,7 +502,55 @@ def _extract_chart_data(
     if not tool_results:
         return None
 
-    # Case 1: Budget comparison across multiple items (projects, SG offices)
+    # Case 1: A field explicitly named in the query, resolved generically
+    # against whatever columns these rows actually have — e.g. "projects
+    # vs status", "tasks by priority", "meetings by venue" — checked
+    # FIRST, before the budget case below, since budget fields are present
+    # on project/office rows whether or not budget was asked for (e.g.
+    # "projects vs status" used to chart budget anyway because every row
+    # happens to carry allocated_budget). A new DB column works here with
+    # no code change. Gated to rows carrying an "id" (every entity table
+    # in this app returns one) so it never fires on homogeneous SQL
+    # aggregate rows (query_education_data — year/region/totals, no id),
+    # which already pivot correctly and generically via Case 3 below.
+    is_entity_rows = any(isinstance(r, dict) and "id" in r for r in tool_results)
+    if is_entity_rows:
+        metric_field = _match_field(
+            query_lower, tool_results, numeric=True,
+            exclude=frozenset({"allocated_budget", "spent_budget", "budget_left"}),
+        )
+        if metric_field:
+            items = [
+                (_entity_display_name(item), _to_float(item.get(metric_field)))
+                for item in tool_results
+            ]
+            items = [(n, v) for n, v in items if n and v is not None]
+            if items:
+                return {
+                    "labels": [n for n, _ in items],
+                    "datasets": [{
+                        "label": _normalize_field(metric_field).title(),
+                        "data": [v for _, v in items],
+                    }],
+                }
+
+        group_field = _match_field(query_lower, tool_results, numeric=False)
+        if group_field:
+            counts: Dict[str, int] = {}
+            for item in tool_results:
+                val = item.get(group_field)
+                if val:
+                    counts[str(val)] = counts.get(str(val), 0) + 1
+            # Only a genuine distribution when values repeat (e.g. many
+            # meetings sharing a few venues) — if every row has its own
+            # distinct value, counting isn't meaningful.
+            if 2 <= len(counts) < len(tool_results):
+                return {
+                    "labels": list(counts.keys()),
+                    "datasets": [{"label": "Count", "data": list(counts.values())}],
+                }
+
+    # Case 2: Budget comparison across multiple items (projects, SG offices)
     budget_items = []
     for item in tool_results:
         name = (
@@ -528,12 +625,6 @@ def _extract_chart_data(
     # requested budget data, producing a real-looking but meaningless chart.
     if "budget" in query_lower:
         return None
-
-    # Case 2: Status distribution
-    if any(w in query_lower for w in ["status", "distribution", "breakdown", "pie"]):
-        status_chart = _status_distribution_chart(tool_results)
-        if status_chart:
-            return status_chart
 
     # Case 3: Homogeneous row dicts (e.g. SQL query results like
     # {"year": 2022, "total_students": 509738, "total_schools": 776}) —
