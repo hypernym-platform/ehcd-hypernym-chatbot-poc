@@ -39,7 +39,10 @@ AZURE_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 AZURE_BLOB_CONN_STR=${AZURE_BLOB_CONN_STR}
 # Prod reads the live policy corpus from its own storage account (saehcdprod).
 AZURE_BLOB_CONTAINER=ehdc-test-bot
-AZURE_BLOB_PREFIX=policies/
+# EMPTY on purpose. The Excel data files (GENERAL_EDUCATION.xlsx, FINANCE.xlsx, ...) sit at the ROOT of the container on prod, and the
+# education loader (EDU_CFG in app.py) lists with this prefix. The policy PDFs have their own hard-coded `policies/` prefix, so
+# this value does not affect them. (dev and staging keep their Excel files under policies/, hence `policies/` there.) Old prod's Secret has it empty.
+AZURE_BLOB_PREFIX=
 
 # --- auth --------------------------------------------------------------------
 # MUST equal the backend's SECRET_KEY (same value in the `prod` Environment). A NEW prod value, never the key that was committed to git.
