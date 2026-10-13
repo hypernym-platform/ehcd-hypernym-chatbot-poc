@@ -1,0 +1,61 @@
+# Production configuration TEMPLATE — safe to commit, contains NO secret values.
+#
+# CI (.github/workflows/deploy-prod.yml (to be added with the prod pipeline)) runs this through `envsubst`, filling the
+# ${...} placeholders from the repo's GitHub Environment `prod`, and applies the
+# result as the k8s Secret `ehcd-chatbot-secrets` in namespace prod. The Deployment
+# consumes it with `envFrom.secretRef`.
+#
+# Nothing here is baked into the image: the Dockerfile no longer copies an env
+# file, so the same image runs in any environment.
+#
+# Adding a setting:
+#   non-secret -> write the literal value below
+#   secret     -> add ${NAME} below AND add NAME to the GitHub Environment
+#                 (scripts/sync-chatbot-env-secrets.sh in the hn_devops repo)
+#                 AND to the `env:` map + REQUIRED list of the render step.
+#
+# REDIS_HOST / REDIS_PORT are deliberately absent — the Deployment sets them
+# directly (k8s_yamls/production/codebase_yamls/ehcd-chatbot.yaml), and a
+# container `env` entry wins over `envFrom`.
+
+# --- postgres (postgres-ehcd-prod, database ehcd_be_prod) ----------------------
+PG_HOST=postgres-ehcd-prod.postgres.database.azure.com
+PG_DB=ehcd_be_prod
+PG_USER=ehcd_prod_app
+PG_PASS=${PG_PASS}
+PG_PORT=5432
+
+RBAC_USER_ROLES_TABLE=user_management_user_roles
+DB_SCHEMA=public
+
+# --- azure openai ------------------------------------------------------------
+ENDPOINT_URL=https://app-openai-uae.cognitiveservices.azure.com/
+DEPLOYMENT_NAME=gpt-4o
+AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AZURE_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+
+# --- blob storage (policy documents synced into DATA_ROOT) -------------------
+AZURE_BLOB_CONN_STR=${AZURE_BLOB_CONN_STR}
+# Prod reads the live policy corpus from its own storage account (saehcdprod).
+AZURE_BLOB_CONTAINER=ehdc-test-bot
+AZURE_BLOB_PREFIX=policies/
+
+# --- auth --------------------------------------------------------------------
+# MUST equal the backend's SECRET_KEY (same value in the `prod` Environment). A NEW prod value, never the key that was committed to git.
+JWT_SECRET=${JWT_SECRET}
+JWT_EXPIRY_HOURS=24
+USER_ID_CLAIM=sub/user_id/id
+
+# --- elevenlabs voice (app.py /voice/*) --------------------------------------
+# Optional: leave the GitHub Environment secrets unset and these render empty,
+# which disables the voice endpoints. ELEVENLABS_CUSTOMLLM_SHARED_SECRET empty
+# makes the custom-LLM webhook reject every request (app.py fails closed).
+ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+ELEVENLABS_AGENT_ID=${ELEVENLABS_AGENT_ID}
+ELEVENLABS_CUSTOMLLM_SHARED_SECRET=${ELEVENLABS_CUSTOMLLM_SHARED_SECRET}
+
+# --- runtime -----------------------------------------------------------------
+# emptyDir volume in the Deployment; FAISS indexes + synced docs are rebuilt on
+# restart, so nothing here survives a rollout.
+DATA_ROOT=/app/data
