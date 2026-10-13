@@ -10,8 +10,14 @@ import queue
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import Any, Dict, List, TypedDict
+from datetime import datetime, timedelta, timezone
+
+# This system is UAE-based — "now"/"today" for the LLM's own reasoning, and
+# every displayed UTC timestamp, use this instead of the server process's
+# own local clock (which may be UTC or anything else depending on
+# deployment) or the raw UTC instant stored in the DB.
+UAE_TZ = timezone(timedelta(hours=4))
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 
@@ -19,12 +25,19 @@ from rbac import get_user_access_flags
 from db_queries import (
     list_projects,
     get_project_details,
-    list_sg_offices,
-    get_sg_office_details,
     list_tasks,
     get_task_details,
     list_resolutions,
     get_resolution_details,
+    list_sg_office_emails,
+    get_sg_office_email_details,
+    list_sg_office_meetings,
+    get_sg_office_meeting_details,
+    list_sg_office_meeting_facilities,
+    list_sg_office_meeting_visitors,
+    list_sg_office_meeting_outcomes,
+    list_sg_office_direction_items,
+    get_sg_office_direction_item_details,
 )
 from edu_pg import execute_education_sql, EDU_SCHEMA_FOR_TOOL
 
@@ -131,23 +144,122 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "list_sg_offices",
+            "name": "list_sg_office_emails",
             "description": (
-                "List SG offices (Secretary General offices / departments / divisions). "
-                "Use when user asks about SG offices, departments, divisions, "
-                "organizational units, or office listings."
+                "List internal SG Office email correspondence — the raw "
+                "mailbox, EVERY email regardless of workflow status (From/"
+                "Subject/To-CC/Thread/Workflow/Summary/Received). This is "
+                "what 'Email Correspondence', 'all emails', 'the inbox', "
+                "'unread messages', etc. means — USE THIS BY DEFAULT for "
+                "any question about emails in general. Each row's "
+                "`workflow_label` shows whether it's been turned into a "
+                "tracked item yet ('Not Started' vs 'In Workflow'). Only "
+                "use list_sg_office_direction_items with "
+                "item_type='email_correspondence' instead when the "
+                "question is specifically about WORKFLOW fields — H.E. "
+                "direction, assigned owner, deadline, required decision — "
+                "of an email that's already been promoted into a tracked "
+                "item; that filter covers a much smaller subset (only "
+                "promoted emails), not the whole inbox, so don't use it for "
+                "a general 'show all emails' request."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": {
-                        "type": "string",
-                        "description": "Filter by status: 'in_progress', 'completed', 'delayed', 'on_hold'",
-                        "enum": ["in_progress", "completed", "delayed", "on_hold"],
+                    "is_read": {
+                        "type": "boolean",
+                        "description": "Filter to only read (true) or only unread (false) emails.",
                     },
-                    "category_id": {
+                    "is_draft": {
+                        "type": "boolean",
+                        "description": "Filter to only drafts (true) or only sent/received messages (false).",
+                    },
+                    "flagged": {
+                        "type": "boolean",
+                        "description": "Filter to only Outlook-flagged emails (true) or only unflagged (false). The closest existing signal to 'needs attention' — combine with is_read for a fuller picture.",
+                    },
+                    "sender": {
+                        "type": "string",
+                        "description": "Filter by sender name or email (partial match)",
+                    },
+                    "recipient": {
+                        "type": "string",
+                        "description": "Filter by a name/email appearing in the To or CC recipients (partial match)",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Filter by subject text ONLY (partial match). For 'X in the subject or preview' style questions, use `keyword` instead.",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Filter by text appearing in EITHER the subject or the body preview (partial match) — use for 'search emails containing X in the subject or preview' style questions.",
+                    },
+                    "duplicate_subject": {
+                        "type": "boolean",
+                        "description": "Set true for 'show duplicate email subjects' — returns every email whose subject (exact match) is shared by more than one email. Computed server-side; don't try to spot duplicates yourself from a list.",
+                    },
+                    "body_contains": {
+                        "type": "string",
+                        "description": "Filter by text appearing in the email body or its AI summary (partial match) — use for 'emails about X' style questions.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Filter by Outlook category tag (partial match)",
+                    },
+                    "importance": {
+                        "type": "string",
+                        "description": "Filter by importance level",
+                        "enum": ["low", "normal", "high"],
+                    },
+                    "has_attachments": {
+                        "type": "boolean",
+                        "description": "Filter to only emails that do/don't have attachments.",
+                    },
+                    "thread_id": {
                         "type": "integer",
-                        "description": "Filter by category ID",
+                        "description": "Only emails belonging to this specific thread/conversation.",
+                    },
+                    "mailbox_owner": {
+                        "type": "string",
+                        "description": "Filter by the mailbox owner's name (partial match) — use if the user asks whose mailbox an email is in.",
+                    },
+                    "received_after": {
+                        "type": "string",
+                        "description": "Only emails received on or after this date (YYYY-MM-DD or MM-DD-YYYY).",
+                    },
+                    "received_before": {
+                        "type": "string",
+                        "description": "Only emails received on or before this date (YYYY-MM-DD or MM-DD-YYYY).",
+                    },
+                    "older_than_days": {
+                        "type": "integer",
+                        "description": "Only emails received more than this many days ago — use for 'open for more than N days' / 'older than a week' style questions instead of computing a date yourself.",
+                    },
+                    "received_today": {
+                        "type": "boolean",
+                        "description": "Set true for 'emails received today' — computed server-side in the system's local timezone, don't compute today's date yourself.",
+                    },
+                    "received_yesterday": {
+                        "type": "boolean",
+                        "description": "Set true for 'emails received yesterday' — computed server-side in the system's local timezone, don't compute yesterday's date yourself.",
+                    },
+                    "workflow_started": {
+                        "type": "boolean",
+                        "description": "Set false for 'emails with no workflow started yet' / 'not started', true for 'emails already turned into a workflow item'. Computed from whether a direction item exists for that email's thread.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Set to 'oldest' for oldest-received-first. Omit (default) for newest-first.",
+                        "enum": ["oldest"],
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Set this when the user asked about only one or a few specific attributes (e.g. ['summary'], ['has_attachments']) — the result will include only those fields plus sender/subject for context, instead of the default view. Omit entirely for the default From/Subject/To-CC/Thread/Workflow/Summary/Received view.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of emails to return, e.g. 'the 5 latest emails' -> limit=5. Omit to return all matching emails.",
                     },
                 },
                 "required": [],
@@ -157,22 +269,578 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "get_sg_office_details",
+            "name": "get_sg_office_email_details",
             "description": (
-                "Get full details of a specific SG office including budget, team, "
-                "entities, notes, and progress. Use when user asks about a "
-                "specific SG office or department."
+                "Get the full content of a specific SG Office email, or an "
+                "entire email thread/conversation with all its messages "
+                "(or just the latest message with latest_only). Use when "
+                "the user asks to read/see the full content of a specific "
+                "email, wants the whole conversation on a topic, or asks "
+                "'what's the latest response/reply on this'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sg_office_id": {
+                    "email_id": {
                         "type": "integer",
-                        "description": "SG office database ID",
+                        "description": "Database ID of a single email to retrieve.",
                     },
-                    "sg_office_name": {
+                    "thread_id": {
+                        "type": "integer",
+                        "description": "Database ID of an email thread/conversation to retrieve.",
+                    },
+                    "latest_only": {
+                        "type": "boolean",
+                        "description": "With thread_id, return only the most recent message in the thread instead of all of them. Use for 'what's the latest response/update on this thread'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_direction_items",
+            "description": (
+                "List SG Office Internal Direction items — the tracked "
+                "workflow records Shamma manages: emails turned into a "
+                "workflow item, Memos, and Weekly Actions. Has real status/"
+                "H.E. direction/owner/deadline fields, unlike the raw "
+                "mailbox tools (list_sg_office_emails). Use for questions "
+                "about memos, weekly actions, items awaiting H.E. "
+                "direction, overdue/stalled items, or anything about the "
+                "status/owner/deadline of an internal direction item. "
+                "PREFER THIS over get_sg_office_direction_item_details "
+                "(with `code` set to the exact item) whenever the user asks "
+                "about ONE OR A FEW specific attributes of a specific item "
+                "(e.g. 'what is the status of MEM-011', 'what's the "
+                "deadline for WA-012') — pass those attribute names in "
+                "`fields` to get back a short, focused answer instead of "
+                "the full record. Only use get_sg_office_direction_item_details "
+                "when notes, attachments, the audit trail, related items, "
+                "or the item's full details are actually wanted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_type": {
                         "type": "string",
-                        "description": "SG office name to search (partial match)",
+                        "enum": ["email_correspondence", "memo", "weekly_action"],
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Exact item code, e.g. 'MEM-026' or 'WA-032'.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["draft", "new", "under_review", "awaiting_h.e._direction",
+                                  "in_progress", "response_sent", "closed", "completed", "cancelled"],
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "required_decision": {
+                        "type": "string",
+                        "enum": ["approval", "signature", "nomination", "review_and_endorsement",
+                                  "confirm_action_owners", "direction", "for_information"],
+                    },
+                    "direction_outcome": {
+                        "type": "string",
+                        "enum": ["approved", "approved_with_amendments", "rejected",
+                                  "noted", "more_information_requested"],
+                    },
+                    "correspondence_direction": {
+                        "type": "string",
+                        "enum": ["incoming", "outgoing"],
+                    },
+                    "cc_council_affairs": {
+                        "type": "boolean",
+                    },
+                    "subject_contains": {
+                        "type": "string",
+                        "description": "Search subject/description/notes text (partial match).",
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Filter by assigned owner's name.",
+                    },
+                    "created_by": {
+                        "type": "string",
+                    },
+                    "sender_name": {
+                        "type": "string",
+                        "description": "Memo field — sender's name.",
+                    },
+                    "sender_unit": {
+                        "type": "string",
+                        "description": "Memo field — sender's unit/department.",
+                    },
+                    "recipient_name": {
+                        "type": "string",
+                        "description": "Memo field — recipient's name.",
+                    },
+                    "reference": {
+                        "type": "string",
+                        "description": "Memo field — reference number (partial match).",
+                    },
+                    "source_meeting": {
+                        "type": "string",
+                        "description": "Weekly action field — the meeting it came from.",
+                    },
+                    "date_received_after": {
+                        "type": "string",
+                        "description": "Memo field — only items received on or after this date.",
+                    },
+                    "meeting_date_on": {
+                        "type": "string",
+                        "description": "Weekly action field — exact meeting date (YYYY-MM-DD).",
+                    },
+                    "deadline_before": {
+                        "type": "string",
+                    },
+                    "deadline_after": {
+                        "type": "string",
+                    },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "Deadline passed and not yet closed/completed/cancelled — computed server-side, don't compute today's date yourself.",
+                    },
+                    "stalled": {
+                        "type": "boolean",
+                        "description": "Still New/Under Review/Awaiting H.E. Direction (nothing assigned yet) and sitting a few days — computed server-side.",
+                    },
+                    "created_after": {
+                        "type": "string",
+                    },
+                    "closed_after": {
+                        "type": "string",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["oldest"],
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Set this ONLY to narrow further than the default — e.g. ['status'] to answer just 'what's the status of X'. Omitting `fields` already returns a short curated set (code/subject/sender/decision/owner/deadline/status for memos; code/subject/source meeting/owner/deadline/priority/status/reminder for weekly actions), matching the real Memo Register / Weekly Actions pages — NOT the full ~50-field record, so you don't need `fields` just to avoid a large table.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sg_office_direction_item_details",
+            "description": (
+                "Full detail for one Internal Direction item (email/memo/"
+                "weekly action): the record, notes, attachments, audit "
+                "trail, and related items. Use ONLY when the user actually "
+                "wants notes, attachments, the audit/status history, "
+                "related items, or the item's full details/'everything'. "
+                "For a question about one or a few specific attributes "
+                "(status, deadline, owner, priority, etc.) use "
+                "list_sg_office_direction_items with `code` and `fields` "
+                "instead — it returns a much shorter, focused answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "Database ID — prefer `code` if the user gave one (e.g. 'MEM-026').",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "The item's code, e.g. 'MEM-026', 'WA-032', 'SG-001'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meetings",
+            "description": (
+                "List external SG Office meeting/visit requests (Theyab's "
+                "Meetings & Visits board — organizations/visitors requesting "
+                "to meet SG Office leadership). Use for questions about "
+                "meeting requests, visits, visitor meetings, upcoming "
+                "meetings, or their status/priority/coordinator. PREFER "
+                "THIS over get_sg_office_meeting_details whenever the user "
+                "asks about ONE OR A FEW specific attributes of one meeting "
+                "(e.g. 'when is the meeting with X', 'what's the status of "
+                "the meeting with Y') — filter by requester/organization "
+                "and pass those attribute names in `fields` for a short, "
+                "focused answer. Only use get_sg_office_meeting_details when "
+                "participants, facilities, visitors, the outcome, the audit "
+                "trail, or the meeting's full details are actually wanted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status. Use 'upcoming' ONLY when the user says just 'upcoming meetings' with no other status named — it means Confirmed OR Rescheduled combined (matches the UI's 'Upcoming' count). If the user names a SPECIFIC status too (e.g. 'upcoming confirmed meetings'), use that specific status here instead (e.g. 'confirmed') and set upcoming_only=true — do NOT use 'upcoming' here, it would silently include Rescheduled ones too.",
+                        "enum": ["new", "under_review", "confirmed", "completed", "rescheduled", "cancelled", "upcoming"],
+                    },
+                    "upcoming_only": {
+                        "type": "boolean",
+                        "description": "Restrict to meetings scheduled today or later, regardless of status — combine with a specific `status` value for 'upcoming confirmed' style questions. Computed server-side, don't compute today's date yourself.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "request_type": {
+                        "type": "string",
+                        "enum": ["meeting", "official_visit", "delegation_visit", "facility_visit"],
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the INDIVIDUAL PERSON's name who requested the meeting, e.g. 'Ali Hassan Al Jaberi' — not the organization/company name (use `organization` for that). If the user's phrasing names a company/foundation/ministry/entity rather than a person, use `organization` instead.",
+                    },
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the requesting organization/company/entity name, e.g. 'Emirates Foundation' or 'Ministry of Economy' — not the individual person's name (use `requester` for that). If unsure which the user means and they named something that sounds like an entity rather than a person, prefer this field, or pass both.",
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Filter by requester email (partial match)",
+                    },
+                    "purpose_contains": {
+                        "type": "string",
+                        "description": "Filter by text in the purpose/notes (partial match) — use for 'meetings about X'.",
+                    },
+                    "coordinator": {
+                        "type": "string",
+                        "description": "Filter by the assigned coordinator's name (partial match)",
+                    },
+                    "created_by": {
+                        "type": "string",
+                        "description": "Filter by who created the request (partial match)",
+                    },
+                    "visitor_email_status": {
+                        "type": "string",
+                        "enum": ["sent", "not_sent"],
+                    },
+                    "is_confirmed": {
+                        "type": "boolean",
+                        "description": "Filter to only requests that have (true) or haven't (false) been formally confirmed.",
+                    },
+                    "notify_stakeholders": {
+                        "type": "boolean",
+                    },
+                    "scheduled_on": {
+                        "type": "string",
+                        "description": "Only meetings scheduled on exactly this date (YYYY-MM-DD).",
+                    },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings scheduled today' — compares against today's date in the database, don't compute today's date yourself.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings this week' — computed server-side as the current Monday-Sunday week, don't compute the date range yourself.",
+                    },
+                    "scheduled_tomorrow": {
+                        "type": "boolean",
+                        "description": "Set true for 'tomorrow's meeting(s)' — computed server-side, don't compute tomorrow's date yourself.",
+                    },
+                    "scheduled_on_weekday": {
+                        "type": "string",
+                        "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+                        "description": "Set for 'which meeting is on Tuesday' style questions — matches any upcoming meeting falling on that weekday, computed server-side. NEVER work out which calendar date a weekday falls on yourself and use scheduled_on with it — you will get it wrong.",
+                    },
+                    "scheduled_this_month": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings this month' — computed server-side as the current calendar month, don't compute the date range yourself.",
+                    },
+                    "not_ready": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings that aren't ready yet' or 'meetings with pending facility requests' — at least one of its facility prep tasks isn't Confirmed. Computed server-side from the facility tracker. Each result row's `facilities_summary` field already lists which facility types (Room, Parking, etc.) were requested for that meeting — don't call list_sg_office_meeting_facilities just to see what facilities a meeting needs.",
+                    },
+                    "visitors_not_ready": {
+                        "type": "boolean",
+                        "description": "Set true for 'meetings with incomplete visitor readiness' — at least one visitor's readiness isn't confirmed. Use THIS (not list_sg_office_meeting_visitors) when the question is about which MEETINGS aren't ready — it returns one row per meeting, not one row per visitor.",
+                    },
+                    "duplicate_organization": {
+                        "type": "boolean",
+                        "description": "Set true for 'show duplicate meeting names/organizations' — returns every meeting whose organization (exact match) is shared by more than one meeting request. Computed server-side; don't try to spot duplicates yourself from a list.",
+                    },
+                    "scheduled_after": {
+                        "type": "string",
+                        "description": "Only meetings scheduled on or after this date.",
+                    },
+                    "scheduled_before": {
+                        "type": "string",
+                        "description": "Only meetings scheduled on or before this date.",
+                    },
+                    "created_after": {
+                        "type": "string",
+                        "description": "Only requests created on or after this date.",
+                    },
+                    "older_than_days": {
+                        "type": "integer",
+                        "description": "Only requests created more than this many days ago. For 'stalled' specifically, prefer the dedicated `stalled` filter instead.",
+                    },
+                    "stalled": {
+                        "type": "boolean",
+                        "description": "Set true for 'stalled meetings' — requests still New or Under Review (nothing confirmed, no response yet) that have been sitting for a few days. Computed server-side, don't try to express this via status+older_than_days yourself.",
+                    },
+                    "participant": {
+                        "type": "string",
+                        "description": "Filter to meetings where this person (by name, partial match) is a listed participant.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["oldest", "soonest"],
+                        "description": "'oldest' sorts by request creation date, oldest first. 'soonest' sorts by scheduled_date ascending — use for 'next upcoming meeting' style questions, combined with upcoming_only=true and limit=1. Omit (default) for newest-created-first.",
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Set this ONLY to narrow further than the default — e.g. ['email'] for the requester's email, ['visitor_email_cc'] for who the visitor info email was CC'd to (what 'recipients'/'CC' questions mean), ['visitor_email_sent_at'] for when it was sent. Omitting `fields` already returns a short curated set (organization/requester/status/date/time/venue/coordinator), matching the real Meeting Requests page — NOT the full ~25-field record, so you don't need `fields` just to avoid a large table.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of meetings to return. Omit for name/organization searches — multiple meetings can share the same name, and a limit would silently hide the others.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sg_office_meeting_details",
+            "description": (
+                "Get detail for one specific meeting/visit request. ALWAYS "
+                "set `view` to match what's actually asked — it controls "
+                "which table comes back, so the user sees exactly the "
+                "columns relevant to their question, nothing extra, and "
+                "the meeting is named once in your answer text rather than "
+                "repeated as a column on every row. Use ONLY when the "
+                "question needs one of these views (or genuinely wants "
+                "'everything'/the full record — then omit `view`); for a "
+                "question about one or a few specific top-level attributes "
+                "(status, date, venue, etc.) use list_sg_office_meetings "
+                "with a requester/organization filter and `fields` instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Database ID of the meeting request. If you only have a requester/organization name, call list_sg_office_meetings first and use the exact `id` field of the matching row from its results — if multiple rows match, pick the one whose requester/organization/purpose text actually matches what the user described, don't just take the first one. NEVER invent or guess an id that didn't appear in a real tool result.",
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["readiness", "facility_status", "meeting_info"],
+                        "description": (
+                            "'readiness' — for 'what is the readiness status of X': ONE table, "
+                            "one row per visitor or facility task, columns Visitor/Readiness/"
+                            "Arrived/Facility Request/Status (blank cells where a row doesn't "
+                            "apply to that column) — no meeting name column, name the meeting in "
+                            "your answer text instead. "
+                            "'facility_status' — for 'what is the facility request status of X': "
+                            "ONE table, Facility Request/Status only. "
+                            "'meeting_info' — for 'give me the meeting information for X': meeting "
+                            "name/date/time/duration/venue/coordinator + participants — no "
+                            "requester/status/facilities/visitors/outcome/audit trail. "
+                            "Omit `view` entirely only when the user wants the full record, "
+                            "participants, outcome, or audit trail together."
+                        ),
+                    },
+                },
+                "required": ["meeting_request_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meeting_facilities",
+            "description": (
+                "Cross-meeting facility-preparation tracker, one row per "
+                "FACILITY TASK — e.g. 'which facility tasks are "
+                "unassigned', 'what facility prep is overdue', 'show "
+                "facility tasks assigned to X'. If the question is about "
+                "which MEETINGS have pending/incomplete facility requests "
+                "(not which individual tasks), use list_sg_office_meetings "
+                "with not_ready=true instead — it returns one row per "
+                "meeting (with a facilities_summary column listing what was "
+                "requested), not one per facility, and won't repeat the "
+                "same meeting once per facility."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the meeting's organization name — use this directly instead of looking up meeting_request_id first.",
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the meeting's requester name.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Only 'not_confirmed' is a confirmed value in this system.",
+                        "enum": ["not_confirmed"],
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "facility": {
+                        "type": "string",
+                        "description": "Filter by facility type, e.g. 'which meetings need parking or security access'.",
+                        "enum": ["room", "parking", "security_access", "access_pass", "hospitality"],
+                    },
+                    "unassigned": {
+                        "type": "boolean",
+                        "description": "Filter to only facility tasks with no one assigned (true) or with someone assigned (false).",
+                    },
+                    "assigned_to": {
+                        "type": "string",
+                        "description": "Filter by assignee name (partial match)",
+                    },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "Set true for facility tasks whose due date has passed and aren't yet confirmed — computed server-side against today's date, don't compute it yourself.",
+                    },
+                    "due_before": {
+                        "type": "string",
+                        "description": "Only facility tasks due on or before this date.",
+                    },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Only facility tasks for meetings scheduled today.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Only facility tasks for meetings scheduled this (Mon-Sun) week.",
+                    },
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Only facility tasks for this one meeting.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meeting_visitors",
+            "description": (
+                "Cross-meeting visitor tracker, one row per VISITOR — e.g. "
+                "'which visitors haven't arrived', 'whose readiness is not "
+                "confirmed', 'did the visitor email fail for anyone'. If "
+                "the question is about which MEETINGS have incomplete "
+                "visitor readiness (not which visitors), use "
+                "list_sg_office_meetings with visitors_not_ready=true "
+                "instead — it returns one row per meeting, not one per "
+                "visitor, and won't overcount/miscount how many meetings "
+                "are affected."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the meeting's organization name — use this directly instead of looking up meeting_request_id first.",
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the meeting's requester name.",
+                    },
+                    "readiness_status": {
+                        "type": "string",
+                        "description": "Only 'not_confirmed' is a confirmed value in this system.",
+                        "enum": ["not_confirmed"],
+                    },
+                    "arrived": {
+                        "type": "boolean",
+                        "description": "Filter to only visitors who have (true) or haven't (false) been marked arrived.",
+                    },
+                    "email_failed": {
+                        "type": "boolean",
+                        "description": "Filter to visitors whose visitor-info email failed to send.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Filter by visitor name (partial match)",
+                    },
+                    "scheduled_today": {
+                        "type": "boolean",
+                        "description": "Only visitors for meetings scheduled today.",
+                    },
+                    "scheduled_this_week": {
+                        "type": "boolean",
+                        "description": "Only visitors for meetings scheduled this (Mon-Sun) week.",
+                    },
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Only visitors for this one meeting.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sg_office_meeting_outcomes",
+            "description": (
+                "Cross-meeting outcomes tracker — e.g. 'which completed "
+                "meetings need a follow-up', 'what was the outcome of the "
+                "meeting with X'. Spans all meetings at once; for everything "
+                "else about one specific meeting use get_sg_office_meeting_details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "organization": {
+                        "type": "string",
+                        "description": "Filter by the meeting's organization name.",
+                    },
+                    "requester": {
+                        "type": "string",
+                        "description": "Filter by the meeting's requester name.",
+                    },
+                    "follow_up_required": {
+                        "type": "boolean",
+                        "description": "Filter to outcomes flagged as needing (true) or not needing (false) a follow-up.",
+                    },
+                    "completed_after": {
+                        "type": "string",
+                        "description": "Only outcomes completed on or after this date.",
+                    },
+                    "meeting_request_id": {
+                        "type": "integer",
+                        "description": "Only the outcome for this one meeting.",
+                    },
+                    "limit": {
+                        "type": "integer",
                     },
                 },
                 "required": [],
@@ -359,6 +1027,17 @@ TOOL_DEFS_BY_NAME = {t["function"]["name"]: t for t in TOOL_DEFINITIONS}
 # Tool dispatcher (unchanged)
 # ---------------------------------------------------------------------------
 
+_SG_OFFICE_INTERNAL_TOOLS = {
+    "list_sg_office_emails", "get_sg_office_email_details",
+    "list_sg_office_direction_items", "get_sg_office_direction_item_details",
+}
+_SG_OFFICE_EXTERNAL_TOOLS = {
+    "list_sg_office_meetings", "get_sg_office_meeting_details",
+    "list_sg_office_meeting_facilities", "list_sg_office_meeting_visitors",
+    "list_sg_office_meeting_outcomes",
+}
+
+
 def execute_tool(
     tool_name: str,
     arguments: dict,
@@ -370,6 +1049,17 @@ def execute_tool(
     qvec=None,
 ) -> str:
     """Execute a tool call and return JSON string result."""
+    # Defense-in-depth: build_available_tools() already keeps these out of
+    # the router's offered tool list for a user without the feature, so
+    # this shouldn't normally be reachable — but a user with NO SG-office
+    # access must NEVER get this data back under any circumstance, so it's
+    # checked again here at actual execution time too, not just at
+    # tool-offering time.
+    if tool_name in _SG_OFFICE_INTERNAL_TOOLS and not get_user_access_flags(conn, user_id).get("sg_office_internal"):
+        return json.dumps({"error": "Access denied: this account does not have Internal Meetings access."})
+    if tool_name in _SG_OFFICE_EXTERNAL_TOOLS and not get_user_access_flags(conn, user_id).get("sg_office_external"):
+        return json.dumps({"error": "Access denied: this account does not have Meeting Requests access."})
+
     try:
         if tool_name == "list_projects":
             result = list_projects(conn, user_id, filters=arguments)
@@ -379,14 +1069,37 @@ def execute_tool(
                 project_id=arguments.get("project_id"),
                 project_name=arguments.get("project_name"),
             )
-        elif tool_name == "list_sg_offices":
-            result = list_sg_offices(conn, user_id, filters=arguments)
-        elif tool_name == "get_sg_office_details":
-            result = get_sg_office_details(
+        elif tool_name == "list_sg_office_emails":
+            result = list_sg_office_emails(conn, user_id, filters=arguments)
+        elif tool_name == "get_sg_office_email_details":
+            result = get_sg_office_email_details(
                 conn, user_id,
-                sg_office_id=arguments.get("sg_office_id"),
-                sg_office_name=arguments.get("sg_office_name"),
+                email_id=arguments.get("email_id"),
+                thread_id=arguments.get("thread_id"),
+                latest_only=bool(arguments.get("latest_only")),
             )
+        elif tool_name == "list_sg_office_direction_items":
+            result = list_sg_office_direction_items(conn, user_id, filters=arguments)
+        elif tool_name == "get_sg_office_direction_item_details":
+            result = get_sg_office_direction_item_details(
+                conn, user_id,
+                item_id=arguments.get("item_id"),
+                code=arguments.get("code"),
+            )
+        elif tool_name == "list_sg_office_meetings":
+            result = list_sg_office_meetings(conn, user_id, filters=arguments)
+        elif tool_name == "get_sg_office_meeting_details":
+            result = get_sg_office_meeting_details(
+                conn, user_id,
+                meeting_request_id=arguments.get("meeting_request_id"),
+                view=arguments.get("view"),
+            )
+        elif tool_name == "list_sg_office_meeting_facilities":
+            result = list_sg_office_meeting_facilities(conn, user_id, filters=arguments)
+        elif tool_name == "list_sg_office_meeting_visitors":
+            result = list_sg_office_meeting_visitors(conn, user_id, filters=arguments)
+        elif tool_name == "list_sg_office_meeting_outcomes":
+            result = list_sg_office_meeting_outcomes(conn, user_id, filters=arguments)
         elif tool_name == "list_tasks":
             result = list_tasks(conn, user_id, filters=arguments)
         elif tool_name == "get_task_details":
@@ -441,6 +1154,10 @@ def _search_policy(query_text: str, policy_cfg, emb_obj, qvec=None) -> List[Dict
 
 _ID_LIKE_RE = re.compile(r"(^id$|_id$)", re.IGNORECASE)
 _ISO_DATETIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T]00:00:00(\.\d+)?(\+00:00)?$")
+_ISO_DATETIME_WITH_TIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(\.\d+)?(\+00:00)?$"
+)
+_BARE_TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})$")
 # db_queries.py computes a human-readable label alongside several raw coded
 # fields within the SAME dict (e.g. list_projects sets item["status_en"] =
 # _status_label(status) but leaves the raw numeric "status" in the same
@@ -462,20 +1179,62 @@ def _humanize_field(key: str) -> str:
     return f"{label.strip().title()}{suffix}"
 
 
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _12h(hh: str, mm: str) -> str:
+    h = int(hh)
+    period = "AM" if h < 12 else "PM"
+    h = h % 12 or 12
+    return f"{h}:{mm} {period}"
+
+
 def _format_scalar(val) -> str:
     if val in (None, ""):
         return "-"
     text = str(val)
     m = _ISO_DATETIME_RE.match(text)
-    return m.group(1) if m else text  # midnight timestamps are really just dates
+    if m:
+        return m.group(1)  # midnight timestamps are really just dates
+    m = _ISO_DATETIME_WITH_TIME_RE.match(text)
+    if m:
+        y, mo, d, hh, mm, ss, _, _ = m.groups()
+        # Stored value is a UTC instant (timestamptz) — shift to UAE local
+        # time before display using real datetime arithmetic (so day/month/
+        # year rollover near midnight is handled correctly), instead of
+        # showing the raw UTC hour to a UAE-based user.
+        dt_local = datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss)) + timedelta(hours=4)
+        return f"{_MONTHS[dt_local.month - 1]} {dt_local.day}, {dt_local.year}, {_12h(f'{dt_local.hour:02d}', f'{dt_local.minute:02d}')}"
+    m = _BARE_TIME_RE.match(text)
+    if m:
+        hh, mm, _ = m.groups()
+        return _12h(hh, mm)
+    return text
 
 
 def _drop_fields(keys) -> set:
     keys = set(keys)
-    return {
+    drop = {
         raw for raw, labels in _RAW_FIELD_SUPERSEDED_BY.items()
         if raw in keys and any(lbl in keys for lbl in labels)
     }
+    # General rule: any raw field "x" is superseded by a same-row "x_label"
+    # (the pattern _label() produces everywhere in db_queries.py) — covers
+    # priority/request_type/venue/visitor_email_status/facility/etc. without
+    # needing a hardcoded entry per field.
+    drop |= {k for k in keys if f"{k}_label" in keys}
+    return drop
+
+
+def _is_detail_wrapper(d: dict) -> bool:
+    """True for a get_*_details-shaped dict: every top-level value is itself
+    a dict or list (no plain scalar fields), with at least one non-empty
+    dict-valued key to serve as the primary record."""
+    if not d or not isinstance(d, dict):
+        return False
+    if any(v is not None and not isinstance(v, (dict, list)) for v in d.values()):
+        return False
+    return any(isinstance(v, dict) and v for v in d.values())
 
 
 def render_tool_result_html(data: Any) -> str:
@@ -495,8 +1254,30 @@ def render_tool_result_html(data: Any) -> str:
     if isinstance(data, list):
         if not data:
             return "<p>No results found.</p>"
+        if len(data) == 1 and isinstance(data[0], dict) and _is_detail_wrapper(data[0]):
+            # A get_*_details result (e.g. {"item": {...}, "notes": [...],
+            # "attachments": [...]}) lands here wrapped in a 1-item list —
+            # unwrap it so it renders as one flat record + labeled sections
+            # instead of one row whose columns are each a nested sub-table.
+            return render_tool_result_html(data[0])
         dict_items = [d for d in data if isinstance(d, dict)]
         if dict_items and len(dict_items) == len(data):
+            # A single user turn can call more than one tool (e.g. a
+            # meeting lookup AND that meeting's visitor list), and their
+            # results all land in the same flat list here. Those have
+            # DIFFERENT shapes (different key sets) — grouping by the exact
+            # key-set signature first keeps each entity type in its own
+            # table. Without this, the single-table path below would
+            # intersect ALL items' keys down to only the handful every
+            # shape happens to share (e.g. just organization/requester/
+            # scheduled_date for a meeting+visitor mix), silently
+            # discarding almost every actually-useful field.
+            signatures = {frozenset(d.keys()) for d in dict_items}
+            if len(signatures) > 1:
+                groups = {}
+                for d in dict_items:
+                    groups.setdefault(frozenset(d.keys()), []).append(d)
+                return "".join(render_tool_result_html(g) for g in groups.values())
             # Homogeneous list of records (e.g. 23 projects) — one real
             # table, one row per record, columns = the fields they share.
             common_keys = set.intersection(*(set(d.keys()) for d in dict_items))
@@ -523,6 +1304,21 @@ def render_tool_result_html(data: Any) -> str:
         return f"<table>{rows}</table>"
 
     if isinstance(data, dict):
+        if _is_detail_wrapper(data):
+            # get_*_details shape: one primary record plus several
+            # list/dict-valued sections (notes, attachments, audit_trail,
+            # participants, facilities, outcome, ...). Render the primary
+            # record as one flat table, then each non-empty section as its
+            # own clearly labeled table below — not nested inside one cell.
+            primary_key = next((k for k, v in data.items() if isinstance(v, dict) and v), None)
+            parts = [render_tool_result_html(data[primary_key])]
+            for key, val in data.items():
+                if key == primary_key or not val:
+                    continue
+                parts.append(f"<h4>{html.escape(_humanize_field(key))}</h4>")
+                parts.append(render_tool_result_html(val))
+            return "".join(parts)
+
         keys = data.keys()
         drop = _drop_fields(keys)
         rows = []
@@ -550,14 +1346,34 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
     tools = [
         TOOL_DEFS_BY_NAME["list_projects"],
         TOOL_DEFS_BY_NAME["get_project_details"],
-        TOOL_DEFS_BY_NAME["list_sg_offices"],
-        TOOL_DEFS_BY_NAME["get_sg_office_details"],
         TOOL_DEFS_BY_NAME["list_tasks"],
         TOOL_DEFS_BY_NAME["get_task_details"],
         TOOL_DEFS_BY_NAME["list_resolutions"],
         TOOL_DEFS_BY_NAME["get_resolution_details"],
         TOOL_DEFS_BY_NAME["search_policy"],
     ]
+
+    # Internal Directions module (email correspondence, memos, weekly
+    # actions) — gated behind role_and_access_feature id 11 ("Internal
+    # Meetings"), same pattern as the `education` gate below.
+    if flags.get("sg_office_internal"):
+        tools += [
+            TOOL_DEFS_BY_NAME["list_sg_office_emails"],
+            TOOL_DEFS_BY_NAME["get_sg_office_email_details"],
+            TOOL_DEFS_BY_NAME["list_sg_office_direction_items"],
+            TOOL_DEFS_BY_NAME["get_sg_office_direction_item_details"],
+        ]
+
+    # External meetings/visitors/facilities/outcomes — gated behind feature
+    # id 12 ("Meeting Requests").
+    if flags.get("sg_office_external"):
+        tools += [
+            TOOL_DEFS_BY_NAME["list_sg_office_meetings"],
+            TOOL_DEFS_BY_NAME["get_sg_office_meeting_details"],
+            TOOL_DEFS_BY_NAME["list_sg_office_meeting_facilities"],
+            TOOL_DEFS_BY_NAME["list_sg_office_meeting_visitors"],
+            TOOL_DEFS_BY_NAME["list_sg_office_meeting_outcomes"],
+        ]
 
     if flags.get("education"):
         tools.append(TOOL_DEFS_BY_NAME["query_education_data"])
@@ -574,7 +1390,7 @@ ROUTER_SYSTEM_PROMPT = """You are a tool routing assistant for the Education, Hu
 Your ONLY job is to decide which tools to call based on the user's question. Do NOT answer the question yourself.
 
 Tool selection rules:
-1. For structured data (projects, SG offices, tasks, resolutions) → use the list/get tools.
+1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities) → use the list/get tools.
 2. For education statistics → use query_education_data (generate a SQLite SELECT query).
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains. This
@@ -592,6 +1408,14 @@ because it doesn't fit in a single call.
 5. If the question does NOT need any tools (greetings, general knowledge, casual conversation) → respond with a short text answer.
 6. When the current question refers to a previous request using words such as
 "them", "those", "the above", "the list", "it", "same", "previous", or similar,
+use the conversation history to identify what the user is referring to.
+7. Conversation history is ONLY for resolving references like that — never a
+substitute for calling the tool again. If the current question needs
+structured data (rule 1), ALWAYS call the matching tool fresh this turn,
+even if an earlier turn asked something that looks the same — the
+underlying data can change between turns (a record was added/edited since),
+so a past tool result may now be stale. Never skip a tool call just because
+conversation history already seems to contain the answer.
 use the conversation history to identify what the user is referring to. This
 is about resolving WHAT the user means, never about reusing a PAST ANSWER —
 if the current question asks for data (a list, count, chart, lookup), always
@@ -602,12 +1426,22 @@ could have changed since — never just repeat an earlier answer verbatim
 instead of re-querying.
 8. For cross-module queries (e.g. "tasks in SG office X"), you may need multiple rounds: first get the SG office details to find its entities, then query tasks filtered by those entities. Call the tools you need step by step.
 9. Whenever the question asks for a chart, graph, or visualization of an entity
-(projects, SG offices, tasks, resolutions, education stats) — even if it names
+(projects, tasks, resolutions, education stats) — even if it names
 no specific field, e.g. "generate a chart of tasks" — you MUST call the
 matching list/get/query tool for that entity before responding, exactly as
 rule 1 says for structured data. A chart cannot be drawn from data you never
 fetched. Never skip the tool call just because the request sounds like it's
 only asking for a picture.
+10. When a "get details" tool needs a database id (project_id, task_id,
+resolution_id, email_id, thread_id, meeting_request_id, etc.) and the user
+only gave you a name/description, call ONLY the matching "list" tool in this
+turn — do NOT also call the "get details" tool in the same turn, since you
+cannot know the real id until you see the list results. Wait for the next
+round, read the real id off the row that actually matches what the user
+described (if several rows match, pick the one whose details — name/org/
+subject/purpose — genuinely match, never just the first one), and call
+"get details" with that id then. Never invent or guess an id that didn't
+literally appear in a tool result.
 User information:
 - Name: {user_name}
 - Role: {user_role}
@@ -621,7 +1455,7 @@ messages before the current user message below — read them directly.
 
 ANSWER_SYSTEM_PROMPT = """You are an expert advisor for the Education, Human Development, and Community Development Council (EHCD).
 
-If tool results are present in the conversation, use ONLY that data to answer the user's question.
+If tool results are present in the conversation, use ONLY that data to answer the user's question — specifically the tool results from THIS turn (the most recent ones), never an older tool result from an earlier turn even if it looks like it answers the same question; the data can have changed since then, and this turn's fresh tool call is always the authoritative one.
 If no tool results are present (greetings, general conversation), respond naturally and helpfully.
 
 CONVERSATIONAL CONTEXT RULES:
@@ -714,7 +1548,7 @@ Current Date: {today}
 
 Response formatting rules:
 - Tool result data (projects, tasks, offices, resolutions, education stats, policy excerpts, etc.) is already provided to you fully formatted in HTML in the tool messages above. Do NOT re-render, re-tag, re-list, or repeat that dataset yourself — the system separately ensures the complete, correctly formatted data reaches the user ahead of your response.
-- list_projects/list_sg_offices/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
+- list_projects/list_tasks/list_resolutions results include a total_count field — the authoritative number of records, alongside the actual records themselves. When the user asks "how many" of something, ALWAYS answer using total_count exactly as given. NEVER count the records yourself, even if you can see all of them — manual counting has been wrong before. For a pure count question, no table is attached to your response — just state the number clearly in your <p>.
 - Except for flowcharts and explicit bullet-point requests (see below), your entire response must be ONE brief, plain-language summary or insight about the data (e.g. a notable count, a standout item, a key trend) — wrapped in a single <p>...</p> tag and nothing else. No headings, no lists, no tables, no other HTML tags, no markdown (**, #, backticks), no literal \n.
 - If no tool results are present (greetings, general conversation), respond naturally in plain sentences, still wrapped in a single <p> tag.
 - Respond in the same language as the user's question (if Arabic, respond in Arabic).
@@ -926,7 +1760,7 @@ def answer_node(state: ChatState) -> dict:
     chunk_queue = state["chunk_queue"]
 
     # Build answer-specific system prompt (no tool schemas)
-    today = datetime.now().strftime("%B %d, %Y")
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
     answer_system = ANSWER_SYSTEM_PROMPT.format(
         user_name=state["user_name"],
         user_role=state["user_role"],
@@ -1027,6 +1861,30 @@ chatbot_graph = _build_graph()
 # Entry point — drop-in replacement for generate_tool_response()
 # ---------------------------------------------------------------------------
 
+_SG_OFFICE_INTERNAL_KEYWORDS = (
+    "memo", "weekly action", "internal email", "internal direction",
+    "internal meeting", "email correspondence", "direction item",
+)
+_SG_OFFICE_EXTERNAL_KEYWORDS = (
+    "meeting", "visitor", "facilit",  # "facilit" matches facility/facilities
+)
+
+
+def _detect_sg_office_topic(query: str) -> Optional[str]:
+    """Deterministic keyword check for whether a query is ABOUT the
+    Internal or External SG-office modules — not LLM judgment, since that
+    proved unreliable (sometimes refused legitimate authorized queries,
+    sometimes let an unauthorized one slip through to the wrong tool).
+    Used only to gate UNAUTHORIZED users before routing even starts;
+    authorized users are unaffected regardless of which topic matches."""
+    q = query.lower()
+    if any(kw in q for kw in _SG_OFFICE_INTERNAL_KEYWORDS):
+        return "internal"
+    if any(kw in q for kw in _SG_OFFICE_EXTERNAL_KEYWORDS):
+        return "external"
+    return None
+
+
 def run_chatbot_graph(
     query: str,
     conversation_history: list,
@@ -1048,7 +1906,22 @@ def run_chatbot_graph(
     Run the LangGraph chatbot and yield response chunks.
     Drop-in replacement for the old generate_tool_response().
     """
-    today = datetime.now().strftime("%B %d, %Y")
+    # Deterministic access gate, checked BEFORE routing/tool-calling even
+    # starts — the LLM-judgment approach (telling the router/answer node to
+    # recognize "no matching tool = no access") was unreliable: it either
+    # over-refused legitimate authorized queries or still let an
+    # unauthorized query slip through to an unrelated, wrong tool. This
+    # check is plain keyword + a real DB flag lookup, no model involved.
+    sg_topic = _detect_sg_office_topic(query)
+    if sg_topic:
+        with pg_conn_fn() as conn:
+            flags = get_user_access_flags(conn, user_id)
+        allowed = flags.get(f"sg_office_{sg_topic}")
+        if not allowed:
+            yield "<p>You are unauthorized for this information.</p>"
+            return
+
+    today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
 
     system_content = ROUTER_SYSTEM_PROMPT.format(
         user_name=user_name,
