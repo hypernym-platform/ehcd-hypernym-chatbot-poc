@@ -129,7 +129,13 @@ def _apply_fields(item: dict, fields, always_keep=()) -> dict:
     unchanged when fields is empty, so full-detail callers are unaffected."""
     if not fields:
         return item
-    keep = set(always_keep) | set(fields) | {f"{f}_label" for f in fields}
+    # Also keep each field's _name twin (e.g. "coordinator" -> coordinator_
+    # name) — a filter-param name like 'coordinator' doesn't always match
+    # the stored column, same reason _label is auto-included below.
+    keep = (
+        set(always_keep) | set(fields)
+        | {f"{f}_label" for f in fields} | {f"{f}_name" for f in fields}
+    )
     return {k: v for k, v in item.items() if k in keep}
 
 

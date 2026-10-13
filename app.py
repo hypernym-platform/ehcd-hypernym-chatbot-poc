@@ -49,7 +49,10 @@ from emb_pace import PacedEmbeddings
 # Modular imports
 from rbac import fetch_user_profile
 from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
-from chart_engine import detect_chart_opportunity, is_chart_request, detect_palette_from_query
+from chart_engine import (
+    detect_chart_opportunity, is_chart_request, detect_palette_from_query,
+    CHART_SHOWN_MARKER, recent_turn_had_chart,
+)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG & LOGGING
@@ -530,6 +533,7 @@ async def handle_query(
     history_key = f"uid:{rbac_user_id}:conv:{conv_id}"
 
     conversation_history = get_conversation_history(history_key)
+    recent_had_chart = recent_turn_had_chart(conversation_history)
     conversation_history.append({"role": "user", "content": query})
 
     # Fetch user info and available tools in one connection
@@ -581,21 +585,26 @@ async def handle_query(
             assistant_response = error_msg
             yield error_msg
 
-        # Save conversation history (plain-text — see _strip_html_for_history)
-        conversation_history.append(
-            {"role": "assistant", "content": _strip_html_for_history(assistant_response)}
-        )
-        save_conversation_history(history_key, conversation_history)
-
-        # Detect chart opportunity and build final payload
+        # Detect chart opportunity and build final payload — computed
+        # before saving history so CHART_SHOWN_MARKER (below) can record
+        # whether this turn had one, for a later color/type-only follow-up
+        # ("show in orange colour") to still count as a chart request.
         chart_data = None
         try:
             chart_data = detect_chart_opportunity(
                 query, tool_results_for_chart, assistant_response,
                 palette=detect_palette_from_query(query),
+                recent_had_chart=recent_had_chart,
             )
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
+
+        # Save conversation history (plain-text — see _strip_html_for_history)
+        history_text = _strip_html_for_history(assistant_response)
+        if chart_data:
+            history_text += CHART_SHOWN_MARKER
+        conversation_history.append({"role": "assistant", "content": history_text})
+        save_conversation_history(history_key, conversation_history)
 
         # The model always assumes a chart will be attached whenever the
         # query sounds chart-like (per ANSWER_SYSTEM_PROMPT's CHARTS
@@ -604,7 +613,7 @@ async def handle_query(
         # chartable (e.g. the requested field doesn't exist for that entity,
         # like a task's "budget"). Without this, the model's text falsely
         # claims a chart is coming when none will ever show up.
-        if is_chart_request(query) and not chart_data:
+        if is_chart_request(query, recent_had_chart) and not chart_data:
             assistant_response = (
                 "<p>I couldn't generate a chart for this — the data needed "
                 "for it wasn't found. It may not exist for what you asked "
@@ -703,6 +712,7 @@ async def websocket_chat(ws: WebSocket):
             history_key = f"uid:{rbac_user_id}:conv:{conv_id}"
 
             conversation_history = get_conversation_history(history_key)
+            recent_had_chart = recent_turn_had_chart(conversation_history)
             conversation_history.append({"role": "user", "content": query})
 
             # Fetch user info
@@ -768,25 +778,28 @@ async def websocket_chat(ws: WebSocket):
                     if plain:
                         await ws.send_json({"type": "chunk", "content": plain})
 
-            # Save history (plain-text — see _strip_html_for_history)
-            conversation_history.append(
-                {"role": "assistant", "content": _strip_html_for_history(assistant_response)}
-            )
-            save_conversation_history(history_key, conversation_history)
-
-            # Chart detection
+            # Chart detection — computed before saving history so
+            # CHART_SHOWN_MARKER can record whether this turn had one.
             chart_data = None
             try:
                 chart_data = detect_chart_opportunity(
                     query, tool_results_for_chart, assistant_response,
                     palette=detect_palette_from_query(query),
+                    recent_had_chart=recent_had_chart,
                 )
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
- 
+
+            # Save history (plain-text — see _strip_html_for_history)
+            history_text = _strip_html_for_history(assistant_response)
+            if chart_data:
+                history_text += CHART_SHOWN_MARKER
+            conversation_history.append({"role": "assistant", "content": history_text})
+            save_conversation_history(history_key, conversation_history)
+
             # Same honest-fallback reasoning as the REST endpoint — see the
             # comment there.
-            if is_chart_request(query) and not chart_data:
+            if is_chart_request(query, recent_had_chart) and not chart_data:
                 assistant_response = (
                     "<p>I couldn't generate a chart for this — the data needed "
                     "for it wasn't found. It may not exist for what you asked "

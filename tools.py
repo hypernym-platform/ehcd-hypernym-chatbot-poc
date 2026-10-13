@@ -9,6 +9,7 @@ import logging
 import queue
 import re
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -132,12 +133,14 @@ TOOL_DEFINITIONS = [
             "description": (
                 "List internal SG Office email correspondence — the raw "
                 "mailbox, EVERY email regardless of workflow status (From/"
-                "Subject/To-CC/Thread/Workflow/Summary/Received). This is "
-                "what 'Email Correspondence', 'all emails', 'the inbox', "
-                "'unread messages', etc. means — USE THIS BY DEFAULT for "
-                "any question about emails in general. Each row's "
-                "`workflow_label` shows whether it's been turned into a "
-                "tracked item yet ('Not Started' vs 'In Workflow'). Only "
+                "Subject/To-CC/Received by default). This is what 'Email "
+                "Correspondence', 'all emails', 'the inbox', 'unread "
+                "messages', etc. means — USE THIS BY DEFAULT for any "
+                "question about emails in general. For 'status'/'workflow' "
+                "questions, set fields=['workflow'] — it shows whether an "
+                "email's been turned into a tracked item yet ('Not "
+                "Started' vs 'In Workflow'), but is NOT returned by "
+                "default. Only "
                 "use list_sg_office_direction_items with "
                 "item_type='email_correspondence' instead when the "
                 "question is specifically about WORKFLOW fields — H.E. "
@@ -239,7 +242,7 @@ TOOL_DEFINITIONS = [
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Set this when the user asked about only one or a few specific attributes (e.g. ['summary'], ['has_attachments']) — the result will include only those fields plus sender/subject for context, instead of the default view. Omit entirely for the default From/Subject/To-CC/Thread/Workflow/Summary/Received view.",
+                        "description": "Set this when the user asked about only one or a few specific attributes — e.g. ['summary'], ['has_attachments'], ['workflow'] for workflow/tracking status (what 'status' questions about emails mean — NOT included unless asked). Omit for the default Subject/Sender/To-CC/Received view (no workflow, no summary).",
                     },
                     "limit": {
                         "type": "integer",
@@ -458,7 +461,13 @@ TOOL_DEFINITIONS = [
                 "Meetings & Visits board — organizations/visitors requesting "
                 "to meet SG Office leadership). Use for questions about "
                 "meeting requests, visits, visitor meetings, upcoming "
-                "meetings, or their status/priority/coordinator. PREFER "
+                "meetings, or their status/priority/coordinator. This tool "
+                "has no categorical 'readiness status' field — for a "
+                "readiness breakdown/chart, use "
+                "list_sg_office_meeting_visitors and/or "
+                "list_sg_office_meeting_facilities instead (this tool's "
+                "own not_ready/visitors_not_ready are plain yes/no filters, "
+                "not a breakdown). PREFER "
                 "THIS over get_sg_office_meeting_details whenever the user "
                 "asks about ONE OR A FEW specific attributes of one meeting "
                 "(e.g. 'when is the meeting with X', 'what's the status of "
@@ -592,7 +601,7 @@ TOOL_DEFINITIONS = [
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Set this ONLY to narrow further than the default — e.g. ['email'] for the requester's email, ['visitor_email_cc'] for who the visitor info email was CC'd to (what 'recipients'/'CC' questions mean), ['visitor_email_sent_at'] for when it was sent. Omitting `fields` already returns a short curated set (organization/requester/status/date/time/venue/coordinator), matching the real Meeting Requests page — NOT the full ~25-field record, so you don't need `fields` just to avoid a large table.",
+                        "description": "Set this ONLY to narrow further than the default — e.g. ['email'] for the requester's email, ['request_type'] for the request type/meeting type (NOT included by default), ['visitor_email_cc'] for who the visitor info email was CC'd to (what 'recipients'/'CC' questions mean), ['visitor_email_sent_at'] for when it was sent. The real column for the coordinator is 'coordinator_name', not 'coordinator' — but it's already in the default, so don't set `fields` just for a coordinator question. Omitting `fields` already returns a short curated set (organization/requester/status/date/time/venue/coordinator) — NOT priority or request type — matching the real Meeting Requests page, so you don't need `fields` just to avoid a large table.",
                     },
                     "limit": {
                         "type": "integer",
@@ -658,7 +667,13 @@ TOOL_DEFINITIONS = [
                 "Cross-meeting facility-preparation tracker, one row per "
                 "FACILITY TASK — e.g. 'which facility tasks are "
                 "unassigned', 'what facility prep is overdue', 'show "
-                "facility tasks assigned to X'. If the question is about "
+                "facility tasks assigned to X'. Its `status` is what "
+                "'facility readiness' means — use this tool for any "
+                "question naming FACILITY readiness specifically. For a "
+                "general 'readiness status' question with no facility/"
+                "visitor qualifier, call this tool AND "
+                "list_sg_office_meeting_visitors together, so both halves "
+                "of readiness are covered. If the question is about "
                 "which MEETINGS have pending/incomplete facility requests "
                 "(not which individual tasks), use list_sg_office_meetings "
                 "with not_ready=true instead — it returns one row per "
@@ -679,7 +694,7 @@ TOOL_DEFINITIONS = [
                     },
                     "status": {
                         "type": "string",
-                        "description": "Only 'not_confirmed' is a confirmed value in this system.",
+                        "description": "Only 'not_confirmed' is a confirmed value in this system. Set this ONLY for 'which facility tasks aren't confirmed yet' style questions — for a facility READINESS BREAKDOWN/CHART (e.g. 'facility readiness status'), omit it entirely so all facility statuses come back, not just the not-confirmed ones.",
                         "enum": ["not_confirmed"],
                     },
                     "priority": {
@@ -734,13 +749,18 @@ TOOL_DEFINITIONS = [
             "description": (
                 "Cross-meeting visitor tracker, one row per VISITOR — e.g. "
                 "'which visitors haven't arrived', 'whose readiness is not "
-                "confirmed', 'did the visitor email fail for anyone'. If "
-                "the question is about which MEETINGS have incomplete "
-                "visitor readiness (not which visitors), use "
-                "list_sg_office_meetings with visitors_not_ready=true "
-                "instead — it returns one row per meeting, not one per "
-                "visitor, and won't overcount/miscount how many meetings "
-                "are affected."
+                "confirmed', 'did the visitor email fail for anyone'. Its "
+                "`readiness_status` is what 'visitor readiness' means — "
+                "use this tool for any question naming VISITOR readiness "
+                "specifically. For a general 'readiness status' question "
+                "with no facility/visitor qualifier, call this tool AND "
+                "list_sg_office_meeting_facilities together, so both "
+                "halves of readiness are covered. If the question is about "
+                "which MEETINGS have incomplete visitor readiness (not "
+                "which visitors), use list_sg_office_meetings with "
+                "visitors_not_ready=true instead — it returns one row per "
+                "meeting, not one per visitor, and won't overcount/"
+                "miscount how many meetings are affected."
             ),
             "parameters": {
                 "type": "object",
@@ -755,7 +775,7 @@ TOOL_DEFINITIONS = [
                     },
                     "readiness_status": {
                         "type": "string",
-                        "description": "Only 'not_confirmed' is a confirmed value in this system.",
+                        "description": "Only 'not_confirmed' is a confirmed value in this system. Set this ONLY for 'which visitors aren't confirmed yet' style questions — for a visitor READINESS BREAKDOWN/CHART (e.g. 'visitor readiness status'), omit it entirely so all readiness statuses come back, not just the not-confirmed ones.",
                         "enum": ["not_confirmed"],
                     },
                     "arrived": {
@@ -1650,18 +1670,41 @@ def tool_executor_node(state: ChatState) -> dict:
                 policy_cfg=policy_cfg,
                 emb=emb_obj,
             )
-        return tool_call, result_str
+        return tool_call, fn_args, result_str
 
     # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
         results = list(pool.map(_run_one_tool, tool_calls))
 
+    # Same tool called more than once in this turn (e.g. once per status
+    # value) means the distinguishing filter won't survive as a real field
+    # once every call's rows are flattened into one list below — charting
+    # that merged list then has nothing to group by. Backfill each row
+    # with the filter value it was fetched under, same shape as the real
+    # resolved _label columns, so the chart extractor can still use it.
+    _PROVENANCE_FILTERS = ("status", "request_type", "priority", "readiness_status", "item_type")
+    fn_name_counts = Counter(tc.function.name for tc, _, _ in results)
+
     # Append tool results to messages and collect for chart detection
-    for tool_call, result_str in results:
+    for tool_call, fn_args, result_str in results:
         try:
             parsed = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
             parsed = None
+
+        if fn_name_counts[tool_call.function.name] > 1 and isinstance(parsed, (list, dict)):
+            for filt in _PROVENANCE_FILTERS:
+                val = fn_args.get(filt)
+                if val is None or not isinstance(val, str):
+                    continue
+                label_key = f"{filt}_label"
+                display = val.replace("_", " ").title()
+                rows = parsed if isinstance(parsed, list) else (
+                    next((v for v in parsed.values() if isinstance(v, list)), [])
+                )
+                for row in rows:
+                    if isinstance(row, dict) and label_key not in row:
+                        row[label_key] = display
 
         # Feed the LLM pre-rendered HTML instead of raw JSON — it should
         # never have to invent HTML structure for tool data itself.
@@ -1716,6 +1759,39 @@ def tool_executor_node(state: ChatState) -> dict:
 # Node 3: Answer — GPT-4o streamed, NO tool defs (cleaner context)
 # ---------------------------------------------------------------------------
 
+def _verified_breakdown_counts(tool_results) -> str:
+    """Exact per-field counts for any low-cardinality resolved column
+    (status_label, priority_label, ...) — appended to the answer prompt so
+    the model reports these instead of hand-counting a long result list,
+    which it does unreliably (seen mismatching a chart's real counts).
+    Same "repeats but isn't all-unique" rule used for charting."""
+    if not isinstance(tool_results, list) or len(tool_results) < 3:
+        return ""
+    keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            keys.update(k for k in row.keys() if k.endswith(("_label", "_en")))
+
+    lines = []
+    for key in sorted(keys)[:5]:
+        counts = {}
+        for row in tool_results:
+            val = row.get(key) if isinstance(row, dict) else None
+            if val:
+                counts[str(val)] = counts.get(str(val), 0) + 1
+        if 2 <= len(counts) < len(tool_results):
+            pairs = ", ".join(f"{k}: {v}" for k, v in list(counts.items())[:10])
+            lines.append(f"- {key}: {pairs}")
+
+    if not lines:
+        return ""
+    return (
+        "\n\nVERIFIED COUNTS for this turn's data (use these exact numbers "
+        "for any breakdown by these fields — do not recount from the list "
+        "yourself):\n" + "\n".join(lines)
+    )
+
+
 def answer_node(state: ChatState) -> dict:
     """Generate final streamed answer. ALL responses go through this node."""
     client = state["client"]
@@ -1732,6 +1808,7 @@ def answer_node(state: ChatState) -> dict:
         user_contact_no=state["user_contact_no"],
         today=today,
     )
+    answer_system += _verified_breakdown_counts(state.get("tool_results_for_chart"))
 
     # Replace the system prompt with the leaner answer prompt
     answer_messages = [{"role": "system", "content": answer_system}] + messages[1:]
