@@ -65,7 +65,10 @@ jobs:
       - name: Promote image from staging registry
         run: |
           set -euo pipefail
-          az acr import -n "$ACR" --source "$SRC_ACR.azurecr.io/$REPO@${{ inputs.digest }}" \
+          # --registry <resource id>: import FROM a registry in this tenant using our own Azure identity (AcrPull on the source).
+          # Without it, --source <host>/<repo> is treated as an anonymous external registry and fails with 401.
+          SRC_ID="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-ehcd-stag/providers/Microsoft.ContainerRegistry/registries/$SRC_ACR"
+          az acr import -n "$ACR" --registry "$SRC_ID" --source "$REPO@${{ inputs.digest }}" \
             -t "$REPO:prod-${GITHUB_SHA::8}" --force
           GOT=$(az acr repository show -n "$ACR" --image "$REPO:prod-${GITHUB_SHA::8}" --query digest -o tsv)
           [ "$GOT" = "${{ inputs.digest }}" ] || { echo "::error::digest mismatch after import: $GOT"; exit 1; }
