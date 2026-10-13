@@ -56,8 +56,8 @@ MEETING_UPCOMING_STATUSES = [3, 5]
 MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
 MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 3: "Delegation Visit", 4: "Facility Visit"}
 VISITOR_EMAIL_STATUS_MAP = {1: "Not Sent", 2: "Sent"}
-READINESS_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 still unconfirmed
-FACILITY_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 unconfirmed
+READINESS_STATUS_MAP = {1: "Not Confirmed", 2: "Pending", 3: "Confirmed"}
+FACILITY_STATUS_MAP = {1: "Not Confirmed", 2: "Pending", 3: "Confirmed"}
 FACILITY_TYPE_MAP = {
     5: "Room", 2: "Parking", 1: "Security Access",
     4: "Access Pass", 3: "Hospitality",
