@@ -51,9 +51,9 @@ USER_ID_CLAIM=sub/user_id/id
 # Optional: leave the GitHub Environment secrets unset and these render empty,
 # which disables the voice endpoints. ELEVENLABS_CUSTOMLLM_SHARED_SECRET empty
 # makes the custom-LLM webhook reject every request (app.py fails closed).
-ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
-ELEVENLABS_AGENT_ID=${ELEVENLABS_AGENT_ID}
-ELEVENLABS_CUSTOMLLM_SHARED_SECRET=${ELEVENLABS_CUSTOMLLM_SHARED_SECRET}
+ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+ELEVENLABS_AGENT_ID=${ELEVENLABS_AGENT_ID:-}
+ELEVENLABS_CUSTOMLLM_SHARED_SECRET=${ELEVENLABS_CUSTOMLLM_SHARED_SECRET:-}
 
 # --- runtime -----------------------------------------------------------------
 # emptyDir volume in the Deployment; FAISS indexes + synced docs are rebuilt on
