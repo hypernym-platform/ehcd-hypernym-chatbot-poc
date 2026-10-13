@@ -121,12 +121,19 @@ jobs:
 
       - name: Sync k8s Secret ${{ env.SERVICE }}-secrets
         run: |
-          az aks command invoke -g "$RG" -n "$AKS" -o tsv \
+          RESULT=$(az aks command invoke -g "$RG" -n "$AKS" -o json \
             --file env.rendered \
-            --command "kubectl -n $NAMESPACE create secret generic $SERVICE-secrets --from-env-file=env.rendered --dry-run=client -o yaml | kubectl apply -f -"
+            --command "kubectl -n $NAMESPACE create secret generic $SERVICE-secrets --from-env-file=env.rendered --dry-run=client -o yaml | kubectl apply -f -")
+          echo "$RESULT" | jq -r '.logs'
+          # `az aks command invoke` exits 0 even when the command inside it failed, so read the exit code it reports.
+          [ "$(echo "$RESULT" | jq -r '.exitCode')" = "0" ] || { echo "::error::could not apply the Secret"; exit 1; }
 
       # Pin the Deployment to the digest (not a tag), then wait; undo the rollout if it does not become ready.
       - name: Deploy by digest
         run: |
-          az aks command invoke -g "$RG" -n "$AKS" -o tsv \
-            --command "kubectl -n $NAMESPACE set image deploy/$SERVICE $SERVICE=$ACR.azurecr.io/$REPO@${{ inputs.digest }} && (kubectl -n $NAMESPACE rollout status deploy/$SERVICE --timeout=300s || (kubectl -n $NAMESPACE rollout undo deploy/$SERVICE && exit 1))"
+          IMG="$ACR.azurecr.io/$REPO@${{ inputs.digest }}"   # expanded HERE, before the command is sent to the cluster
+          RESULT=$(az aks command invoke -g "$RG" -n "$AKS" -o json --command "set -e
+          kubectl -n $NAMESPACE set image deploy/$SERVICE $SERVICE=$IMG
+          kubectl -n $NAMESPACE rollout status deploy/$SERVICE --timeout=300s || { kubectl -n $NAMESPACE rollout undo deploy/$SERVICE; exit 1; }")
+          echo "$RESULT" | jq -r '.logs'
+          [ "$(echo "$RESULT" | jq -r '.exitCode')" = "0" ] || { echo "::error::deploy failed on the cluster (the rollout is undone if it never became ready)"; exit 1; }
