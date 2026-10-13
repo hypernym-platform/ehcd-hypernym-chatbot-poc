@@ -1,0 +1,129 @@
+# PRODUCTION deploy (aks-ehcd-prod, namespace prod). Manual, by digest, after approval.
+#
+# Unlike dev/stag this workflow NEVER builds: it promotes the exact image that ran on staging.
+#   1. required reviewers approve the `prod` GitHub Environment (nothing below runs before that)
+#   2. passwordless OIDC login as id-gh-ehcd-prod-deploy
+#   3. import $SERVICE@<digest> from acrehcdstag into acrehcdprod (same bytes, no rebuild)
+#   4. render env-prod.tmpl against the `prod` Environment -> apply as k8s Secret $SERVICE-secrets
+#   5. set the Deployment image to the prod digest + rollout status (rolls back on failure)
+#
+# Run:  gh workflow run deploy-prod.yml --ref production -f digest=sha256:<64 hex>
+# The digest is the one running on staging:  az acr repository show -n acrehcdstag --image $IMAGE --query digest -o tsv
+#
+# `environment: prod` makes the OIDC subject repo:<org>/<repo>:environment:prod. The federated credentials, the
+# AcrPull role on acrehcdstag and AcrPush/AKS Contributor on the prod resources come from a setup-github-oidc-prod.sh
+# (same as setup-github-oidc-stag.sh); without them azure/login fails with AADSTS70021.
+name: deploy-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "Image digest to promote from staging (sha256:...)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false      # never abort a half-finished prod rollout
+
+env:
+  # ---- EDIT THESE THREE, nothing else -------------------------------------
+  SERVICE: ehcd-chatbot                  # k8s Deployment + container name; Secret is $SERVICE-secrets
+  REPO: ehcd-chatbot                     # image repo, same name in both registries
+  ENV_TMPL: env-prod.tmpl                # config template committed in the repo
+  # ---- shared prod-platform constants, same for every service ---------------
+  SRC_ACR: acrehcdstag
+  ACR: acrehcdprod
+  RG: rg-ehcd-prod
+  AKS: aks-ehcd-prod
+  NAMESPACE: prod
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prod         # required reviewers + source of the secrets/vars the render step reads
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate digest
+        run: |
+          [[ "${{ inputs.digest }}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest must be sha256:<64 hex>"; exit 1; }
+
+      - name: Azure login (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Same digest in both registries = the tested image, byte for byte.
+      - name: Promote image from staging registry
+        run: |
+          set -euo pipefail
+          az acr import -n "$ACR" --source "$SRC_ACR.azurecr.io/$REPO@${{ inputs.digest }}" \
+            -t "$REPO:prod-${GITHUB_SHA::8}" --force
+          GOT=$(az acr repository show -n "$ACR" --image "$REPO:prod-${GITHUB_SHA::8}" --query digest -o tsv)
+          [ "$GOT" = "${{ inputs.digest }}" ] || { echo "::error::digest mismatch after import: $GOT"; exit 1; }
+
+      # ${NAME} required (missing/empty fails the run), ${NAME:-} optional. Values are never printed.
+      - name: Render env file from GitHub Environment
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          tmpl_path = os.environ["ENV_TMPL"]
+          pool = {}
+          for blob in (os.environ["SECRETS_JSON"], os.environ["VARS_JSON"]):
+              pool.update(json.loads(blob))
+
+          PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:-)?\}")
+          missing, out = [], []
+
+          for raw in open(tmpl_path, encoding="utf-8").read().splitlines():
+              if not raw.strip() or raw.lstrip().startswith("#"):
+                  continue
+              def sub(m):
+                  name, optional = m.group(1), m.group(2)
+                  val = pool.get(name)
+                  if val is None or val == "":
+                      if not optional:
+                          missing.append(name)
+                      return ""
+                  return val
+              out.append(PLACEHOLDER.sub(sub, raw))
+
+          if missing:
+              for n in sorted(set(missing)):
+                  print(f"::error::{n} is referenced by {tmpl_path} but is not set in the 'prod' GitHub Environment")
+              sys.exit(1)
+
+          bad = [l.split("=", 1)[0] for l in out if "\n" in l or "=" not in l]
+          if bad:
+              print(f"::error::malformed or multi-line values: {bad}")
+              sys.exit(1)
+
+          open("env.rendered", "w", encoding="utf-8").write("\n".join(out) + "\n")
+          print("rendered keys:")
+          for l in out:
+              print("  " + l.split("=", 1)[0])
+          PY
+
+      - name: Sync k8s Secret ${{ env.SERVICE }}-secrets
+        run: |
+          az aks command invoke -g "$RG" -n "$AKS" -o tsv \
+            --file env.rendered \
+            --command "kubectl -n $NAMESPACE create secret generic $SERVICE-secrets --from-env-file=env.rendered --dry-run=client -o yaml | kubectl apply -f -"
+
+      # Pin the Deployment to the digest (not a tag), then wait; undo the rollout if it does not become ready.
+      - name: Deploy by digest
+        run: |
+          az aks command invoke -g "$RG" -n "$AKS" -o tsv \
+            --command "kubectl -n $NAMESPACE set image deploy/$SERVICE $SERVICE=$ACR.azurecr.io/$REPO@${{ inputs.digest }} && (kubectl -n $NAMESPACE rollout status deploy/$SERVICE --timeout=300s || (kubectl -n $NAMESPACE rollout undo deploy/$SERVICE && exit 1))"
