@@ -400,10 +400,18 @@ def execute_education_sql(sql_query: str, row_limit: int = 200) -> dict:
     if _FORBIDDEN.search(sql_query):
         return {"error": "Query contains forbidden statements."}
 
-    # 3. Must only reference edu_* tables
+    # 3. Must reference at least one edu_* table — a FROM-less SELECT (e.g.
+    # "SELECT 'x' AS a, 3 AS b") has no match here at all, which let a
+    # fabricated literal "result" slip straight through this check and get
+    # executed/returned as if it were real data (seen live: the model
+    # invented SQL hardcoding its own guessed answer as UNION'd literals
+    # for an unrelated projects question — nothing caught it because the
+    # loop below simply never ran).
     table_refs = re.findall(
         r"\b(?:FROM|JOIN)\s+\"?([a-zA-Z_][a-zA-Z0-9_]*)\"?", sql_query, re.IGNORECASE
     )
+    if not table_refs:
+        return {"error": "Query must select FROM an edu_* table — no fabricated/literal-only results."}
     for tref in table_refs:
         if not tref.lower().startswith("edu_"):
             return {"error": f"Query references non-education table: {tref}. Only edu_* tables are allowed."}
