@@ -1670,11 +1670,23 @@ def router_node(state: ChatState) -> dict:
         # unneeded sampling noise on what should be a deterministic
         # decision). Prose quality/variety is answer_node's job, which
         # keeps its own temperature — this one only ever outputs structure.
+        #
+        # temperature=0 alone isn't a full guarantee — seen live: the same
+        # prompt, same history, re-run with temperature already at 0, still
+        # once fabricated a bogus SQL query on one of 8 identical runs. GPU
+        # batching/MoE-routing noise on the serving side can still vary the
+        # output even at temperature 0; `seed` is OpenAI/Azure's own
+        # documented second lever for this (used together with temperature
+        # 0), confirmed stable here (5/5 identical outputs + system_fingerprint
+        # in a live check) — not a mathematical guarantee either, but the
+        # right tool for a decision step that must be a stable function of
+        # the conversation, not a creative one.
         api_kwargs = dict(
             model=model,
             messages=messages,
             max_tokens=4000,
             temperature=0,
+            seed=12345,
             stream=False,
         )
         if available_tools:
