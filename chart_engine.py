@@ -863,25 +863,30 @@ _COUNT_FRAMING_RE = re.compile(r"\b(number of|how many|count of)\b", re.IGNORECA
 _PROVENANCE_FILTER_FIELDS = ("status", "request_type", "priority", "readiness_status", "item_type", "project_manager")
 
 
-def _extract_single_subject_count_chart(query_lower: str, tool_results: List[Dict]) -> Optional[Dict]:
+def _extract_subject_count_chart(query_lower: str, tool_results: List[Dict]) -> Optional[Dict]:
     """
-    "number of projects X is included in"/"how many tasks does Y have" —
-    a plain count for ONE filtered subject, not a breakdown across
-    categories, so the usual "2+ distinct values" distribution logic
-    never fires for it (there's only one). tools.py backfills a resolved
-    _label for whichever filter the data was actually fetched under —
-    when every row shares that same single value, this is what it means:
-    one bar, that subject's name, the row count as its height.
+    "number of projects X is included in" / "...X and Y are included in,
+    x axis = name, y axis = number of projects" — a plain count per
+    filtered SUBJECT (one or many), not a breakdown across a data field,
+    so the usual "2+ distinct values of some row field" distribution
+    logic doesn't apply here (there's no such field — the grouping is
+    "which filter value actually fetched this row"). tools.py backfills
+    a resolved _label onto every row for whichever filter was used on
+    that call; grouping by that label and counting rows per group gives
+    one bar per subject queried, whether there's one or several.
     """
     if not _COUNT_FRAMING_RE.search(query_lower) or not tool_results:
         return None
     for filt in _PROVENANCE_FILTER_FIELDS:
         key = f"{filt}_label"
-        values = {str(r.get(key)) for r in tool_results if isinstance(r, dict) and r.get(key)}
-        if len(values) == 1:
+        counts: Dict[str, int] = {}
+        for r in tool_results:
+            if isinstance(r, dict) and r.get(key):
+                counts[str(r[key])] = counts.get(str(r[key]), 0) + 1
+        if counts:
             return {
-                "labels": [next(iter(values))],
-                "datasets": [{"label": "Count", "data": [len(tool_results)]}],
+                "labels": list(counts.keys()),
+                "datasets": [{"label": "Count", "data": list(counts.values())}],
             }
     return None
 
@@ -993,10 +998,10 @@ def _extract_chart_data(
                     "datasets": [{"label": "Count", "data": [v for _, v in ranked]}],
                 }
 
-    # Case 1b: a plain count for ONE filtered subject ("number of
-    # projects X is included in") — checked before budget below, which
-    # would otherwise unconditionally win on project/office rows.
-    subject_count_chart = _extract_single_subject_count_chart(query_lower, tool_results)
+    # Case 1b: a plain count per filtered subject ("number of projects X
+    # is included in", or "...X and Y...") — checked before budget below,
+    # which would otherwise unconditionally win on project/office rows.
+    subject_count_chart = _extract_subject_count_chart(query_lower, tool_results)
     if subject_count_chart:
         return subject_count_chart
 
