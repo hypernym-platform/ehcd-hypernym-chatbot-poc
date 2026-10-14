@@ -56,8 +56,8 @@ MEETING_UPCOMING_STATUSES = [3, 5]
 MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
 MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 3: "Delegation Visit", 4: "Facility Visit"}
 VISITOR_EMAIL_STATUS_MAP = {1: "Not Sent", 2: "Sent"}
-READINESS_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 still unconfirmed
-FACILITY_STATUS_MAP = {1: "Not Confirmed", 3: "Confirmed"}  # 2 unconfirmed
+READINESS_STATUS_MAP = {1: "Not Confirmed", 2: "Pending", 3: "Confirmed"}
+FACILITY_STATUS_MAP = {1: "Not Confirmed", 2: "Pending", 3: "Confirmed"}
 FACILITY_TYPE_MAP = {
     5: "Room", 2: "Parking", 1: "Security Access",
     4: "Access Pass", 3: "Hospitality",
@@ -129,7 +129,13 @@ def _apply_fields(item: dict, fields, always_keep=()) -> dict:
     unchanged when fields is empty, so full-detail callers are unaffected."""
     if not fields:
         return item
-    keep = set(always_keep) | set(fields) | {f"{f}_label" for f in fields}
+    # Also keep each field's _name twin (e.g. "coordinator" -> coordinator_
+    # name) — a filter-param name like 'coordinator' doesn't always match
+    # the stored column, same reason _label is auto-included below.
+    keep = (
+        set(always_keep) | set(fields)
+        | {f"{f}_label" for f in fields} | {f"{f}_name" for f in fields}
+    )
     return {k: v for k, v in item.items() if k in keep}
 
 
