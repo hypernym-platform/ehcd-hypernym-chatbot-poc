@@ -51,7 +51,7 @@ from rbac import fetch_user_profile
 from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
 from chart_engine import (
     detect_chart_opportunity, is_chart_request, detect_palette_from_query,
-    CHART_SHOWN_MARKER, recent_turn_had_chart, last_user_query,
+    CHART_SHOWN_MARKER, recent_turn_had_chart, last_user_query, _encode_palette_marker,
 )
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -576,6 +576,7 @@ async def handle_query(
     def generate():
         assistant_response = ""
         tool_results_for_chart = []
+        chart_intent = {}
         pending_tag = ""
 
         try:
@@ -594,6 +595,7 @@ async def handle_query(
                 policy_cfg=POLICY_CFG,
                 emb=emb,
                 tool_results_collector=tool_results_for_chart,
+                chart_intent_collector=chart_intent,
             ):
                 assistant_response += chunk
                 plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
@@ -620,11 +622,14 @@ async def handle_query(
         if not rows_for_chart and recent_had_chart:
             rows_for_chart = get_last_chart_rows(history_key)
         chart_data = None
+        chart_palette = detect_palette_from_query(query, conversation_history)
         try:
             chart_data = detect_chart_opportunity(
                 query, rows_for_chart, assistant_response,
-                palette=detect_palette_from_query(query),
+                palette=chart_palette,
                 recent_had_chart=recent_had_chart, previous_query=previous_query,
+                want_chart=chart_intent.get("want_chart"),
+                router_chart_type=chart_intent.get("chart_type"),
             )
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
@@ -634,7 +639,7 @@ async def handle_query(
         # Save conversation history (plain-text — see _strip_html_for_history)
         history_text = _strip_html_for_history(assistant_response)
         if chart_data:
-            history_text += CHART_SHOWN_MARKER
+            history_text += CHART_SHOWN_MARKER + _encode_palette_marker(chart_palette)
         conversation_history.append({"role": "assistant", "content": history_text})
         save_conversation_history(history_key, conversation_history)
 
@@ -645,7 +650,7 @@ async def handle_query(
         # chartable (e.g. the requested field doesn't exist for that entity,
         # like a task's "budget"). Without this, the model's text falsely
         # claims a chart is coming when none will ever show up.
-        if is_chart_request(query, recent_had_chart) and not chart_data:
+        if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
             assistant_response = (
                 "<p>I couldn't generate a chart for this — the data needed "
                 "for it wasn't found. It may not exist for what you asked "
@@ -764,6 +769,7 @@ async def websocket_chat(ws: WebSocket):
             # Stream response using async queue to avoid blocking the event loop
             assistant_response = ""
             tool_results_for_chart = []
+            chart_intent = {}
             pending_tag = ""
             async_q = asyncio.Queue()
             loop = asyncio.get_event_loop()
@@ -786,6 +792,7 @@ async def websocket_chat(ws: WebSocket):
                         policy_cfg=POLICY_CFG,
                         emb=emb,
                         tool_results_collector=tool_results_for_chart,
+                        chart_intent_collector=chart_intent,
                     ):
                         loop.call_soon_threadsafe(async_q.put_nowait, ("chunk", chunk))
                 except Exception as e:
@@ -818,11 +825,14 @@ async def websocket_chat(ws: WebSocket):
             if not rows_for_chart and recent_had_chart:
                 rows_for_chart = get_last_chart_rows(history_key)
             chart_data = None
+            chart_palette = detect_palette_from_query(query, conversation_history)
             try:
                 chart_data = detect_chart_opportunity(
                     query, rows_for_chart, assistant_response,
-                    palette=detect_palette_from_query(query),
+                    palette=chart_palette,
                     recent_had_chart=recent_had_chart, previous_query=previous_query,
+                    want_chart=chart_intent.get("want_chart"),
+                    router_chart_type=chart_intent.get("chart_type"),
                 )
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
@@ -832,13 +842,13 @@ async def websocket_chat(ws: WebSocket):
             # Save history (plain-text — see _strip_html_for_history)
             history_text = _strip_html_for_history(assistant_response)
             if chart_data:
-                history_text += CHART_SHOWN_MARKER
+                history_text += CHART_SHOWN_MARKER + _encode_palette_marker(chart_palette)
             conversation_history.append({"role": "assistant", "content": history_text})
             save_conversation_history(history_key, conversation_history)
 
             # Same honest-fallback reasoning as the REST endpoint — see the
             # comment there.
-            if is_chart_request(query, recent_had_chart) and not chart_data:
+            if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
                 assistant_response = (
                     "<p>I couldn't generate a chart for this — the data needed "
                     "for it wasn't found. It may not exist for what you asked "
