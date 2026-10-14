@@ -185,20 +185,67 @@ _COLOR_WORDS = set(PALETTES) | set(_NAMED_COLOR_HEX) | set(_COLOR_WORD_ALIASES)
 _COLOR_WORD_RE = re.compile(r"\b(" + "|".join(sorted(_COLOR_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
 
 
-def detect_palette_from_query(query: str) -> str:
+_COLORLESS_CHANGE_RE = re.compile(r"\bcolou?rs?\b", re.IGNORECASE)
+
+# Offered in rotation for a colorless "change the colors" follow-up — must
+# stay different from whatever was used last, or the request is pointless.
+_PALETTE_ROTATION = ["crimson", "green", "blue", "purple", "teal", "orange"]
+_PALETTE_MARKER_BASE = 0xFE00  # invisible Unicode variation selectors
+
+
+def _encode_palette_marker(palette_name: str) -> str:
+    """Invisible single character recording which palette this turn's
+    chart used, appended to saved history text (same technique as
+    CHART_SHOWN_MARKER) so a later colorless "change the colors" knows
+    what to rotate away FROM. Empty string for a palette not in the
+    rotation (e.g. an explicitly-named one-off like "blue") — nothing to
+    rotate away from in that case."""
+    if palette_name not in _PALETTE_ROTATION:
+        return ""
+    return chr(_PALETTE_MARKER_BASE + _PALETTE_ROTATION.index(palette_name))
+
+
+def _last_used_palette(conversation_history: list) -> Optional[str]:
+    """The palette encoded on the most recent assistant turn that had a
+    chart, or None if there wasn't one / it used a non-rotation palette."""
+    for turn in reversed(conversation_history or []):
+        if turn.get("role") == "assistant":
+            for ch in turn.get("content") or "":
+                cp = ord(ch)
+                if _PALETTE_MARKER_BASE <= cp < _PALETTE_MARKER_BASE + len(_PALETTE_ROTATION):
+                    return _PALETTE_ROTATION[cp - _PALETTE_MARKER_BASE]
+            return None
+    return None
+
+
+def detect_palette_from_query(query: str, conversation_history: Optional[list] = None) -> str:
     """Pick a palette from ANY color word in the query itself (e.g. "a bar
     chart of projects in blue") — not just the 3 named brand palettes.
     Word-boundary matching, not substring, for the same reason as
     is_chart_request above (a naive "red" in query check would fire on
-    "prepared", "credit", etc). Defaults to the brand's primary palette
-    when no color is named; the frontend's own palette toggle doesn't need
-    this at all — it re-colors client-side from chart_data's
-    `available_palettes`, no backend call involved."""
+    "prepared", "credit", etc).
+
+    A colorless "change the colors" follow-up (no color word of its own)
+    rotates to a genuinely different palette than whichever one the most
+    recent chart actually used, read from conversation_history — without
+    this it always fell back to the same default (brown) on every repeat,
+    so asking "change the colors" three times in a row produced the exact
+    same chart three times. Pass conversation_history to enable this;
+    omit it to keep the plain no-color-word default (the frontend's own
+    palette toggle doesn't need this at all — it re-colors client-side
+    from chart_data's `available_palettes`, no backend call involved).
+    """
     m = _COLOR_WORD_RE.search(query)
-    if not m:
-        return DEFAULT_PALETTE
-    word = m.group(1).lower()
-    return _COLOR_WORD_ALIASES.get(word, word)
+    if m:
+        word = m.group(1).lower()
+        return _COLOR_WORD_ALIASES.get(word, word)
+
+    if conversation_history is not None and _COLORLESS_CHANGE_RE.search(query):
+        last = _last_used_palette(conversation_history)
+        idx = (_PALETTE_ROTATION.index(last) + 1) % len(_PALETTE_ROTATION) if last in _PALETTE_ROTATION else 0
+        return _PALETTE_ROTATION[idx]
+
+    return DEFAULT_PALETTE
 
 
 def _palette_fields(colors: List[str], used_count: int, palette_name: str = DEFAULT_PALETTE) -> Dict[str, Any]:

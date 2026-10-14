@@ -51,7 +51,7 @@ from rbac import fetch_user_profile
 from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
 from chart_engine import (
     detect_chart_opportunity, is_chart_request, detect_palette_from_query,
-    CHART_SHOWN_MARKER, recent_turn_had_chart, last_user_query,
+    CHART_SHOWN_MARKER, recent_turn_had_chart, last_user_query, _encode_palette_marker,
 )
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -622,10 +622,11 @@ async def handle_query(
         if not rows_for_chart and recent_had_chart:
             rows_for_chart = get_last_chart_rows(history_key)
         chart_data = None
+        chart_palette = detect_palette_from_query(query, conversation_history)
         try:
             chart_data = detect_chart_opportunity(
                 query, rows_for_chart, assistant_response,
-                palette=detect_palette_from_query(query),
+                palette=chart_palette,
                 recent_had_chart=recent_had_chart, previous_query=previous_query,
                 want_chart=chart_intent.get("want_chart"),
                 router_chart_type=chart_intent.get("chart_type"),
@@ -638,7 +639,7 @@ async def handle_query(
         # Save conversation history (plain-text — see _strip_html_for_history)
         history_text = _strip_html_for_history(assistant_response)
         if chart_data:
-            history_text += CHART_SHOWN_MARKER
+            history_text += CHART_SHOWN_MARKER + _encode_palette_marker(chart_palette)
         conversation_history.append({"role": "assistant", "content": history_text})
         save_conversation_history(history_key, conversation_history)
 
@@ -824,10 +825,11 @@ async def websocket_chat(ws: WebSocket):
             if not rows_for_chart and recent_had_chart:
                 rows_for_chart = get_last_chart_rows(history_key)
             chart_data = None
+            chart_palette = detect_palette_from_query(query, conversation_history)
             try:
                 chart_data = detect_chart_opportunity(
                     query, rows_for_chart, assistant_response,
-                    palette=detect_palette_from_query(query),
+                    palette=chart_palette,
                     recent_had_chart=recent_had_chart, previous_query=previous_query,
                     want_chart=chart_intent.get("want_chart"),
                     router_chart_type=chart_intent.get("chart_type"),
@@ -840,7 +842,7 @@ async def websocket_chat(ws: WebSocket):
             # Save history (plain-text — see _strip_html_for_history)
             history_text = _strip_html_for_history(assistant_response)
             if chart_data:
-                history_text += CHART_SHOWN_MARKER
+                history_text += CHART_SHOWN_MARKER + _encode_palette_marker(chart_palette)
             conversation_history.append({"role": "assistant", "content": history_text})
             save_conversation_history(history_key, conversation_history)
 
