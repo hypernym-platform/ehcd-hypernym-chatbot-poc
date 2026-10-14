@@ -5,12 +5,13 @@ then generates Chart.js-compatible JSON configuration.
 """
 
 import re
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 # Brown color palette as specified
 BROWN_COLORS = [
-    "#EFE7C5",  # Sunlight
-    "#ECECE5",  # Linen
+    "#F1DD83",  # Sunlight
+    "#808036",  # Linen
     "#A7997C",  # Taupe
     "#7D8C7F",  # Mangrove
     "#917050",  # Earth
@@ -101,8 +102,45 @@ _CHART_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Appended (invisible) to a saved assistant turn's history text whenever
+# that turn included a chart — read back on the next turn so a color/type
+# -only follow-up ("show in orange colour") can still be recognized as a
+# chart request without repeating the word "chart" itself. Pure zero-width
+# characters, no readable text — a readable bracket tag like "[chart]" was
+# tried first and the model sometimes echoed it back into its own visible
+# answer on the next turn, since it's replayed to it as prior conversation.
+CHART_SHOWN_MARKER = "​‌‍​"
 
-def is_chart_request(query: str) -> bool:
+
+def recent_turn_had_chart(conversation_history: list) -> bool:
+    """True if the most recent assistant turn in history included a chart."""
+    for turn in reversed(conversation_history or []):
+        if turn.get("role") == "assistant":
+            return CHART_SHOWN_MARKER in (turn.get("content") or "")
+    return False
+
+
+def last_user_query(conversation_history: list) -> str:
+    """The most recent USER turn's text, for detect_chart_opportunity's
+    previous_query — called before this turn's own query is appended."""
+    for turn in reversed(conversation_history or []):
+        if turn.get("role") == "user":
+            return turn.get("content") or ""
+    return ""
+
+
+# Follow-up phrasing that only makes sense as "redo the chart I just saw,
+# differently" — a bare chart word isn't in these ("show in orange colour"
+# never says "chart"), so they only count when the PRIOR turn had a chart
+# (see CHART_SHOWN_MARKER / recent_had_chart below). Without that guard
+# these words are too common in unrelated sentences to trust alone.
+_CHART_CONTINUATION_RE = re.compile(
+    r"\b(colou?r|instead|switch (it|this) to|change (it|this) to|as an?\s*(line|bar|pie))\b",
+    re.IGNORECASE,
+)
+
+
+def is_chart_request(query: str, recent_had_chart: bool = False) -> bool:
     """
     True if the query's own wording asks for a chart/graph, independent of
     whether chartable data actually exists. Shared with app.py so it can
@@ -116,11 +154,19 @@ def is_chart_request(query: str) -> bool:
     query` check previously fired on any word containing "pie" as a
     substring, e.g. "recipients" ("reci-PIE-nts"), turning an ordinary
     retrieval question into a false chart request.
+
+    recent_had_chart=True (the immediately preceding turn showed a chart)
+    additionally allows a short follow-up like "show in orange colour" or
+    "as a pie instead" to count, even though it never says "chart" itself
+    — without this, a color/type-only follow-up silently fell back to a
+    table because it looked like a plain data question in isolation.
     """
     query_lower = query.lower()
     if _CHART_WORD_RE.search(query_lower):
         return True
-    return "compare budget" in query_lower
+    if "compare budget" in query_lower:
+        return True
+    return recent_had_chart and bool(_CHART_CONTINUATION_RE.search(query_lower))
 
 
 # A few extra words alias to one of the two brand secondary palettes
@@ -168,6 +214,8 @@ def detect_chart_opportunity(
     tool_results: List[Dict],
     assistant_text: str,
     palette: str = DEFAULT_PALETTE,
+    recent_had_chart: bool = False,
+    previous_query: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     Analyze query + tool results to determine if a chart is appropriate.
@@ -176,11 +224,39 @@ def detect_chart_opportunity(
     `palette` picks which named color set (see PALETTES) draws the chart —
     defaults to the brand's primary brown palette; pass "crimson" or
     "green" for either secondary palette instead.
+
+    `recent_had_chart` — see is_chart_request — lets a color/type-only
+    follow-up to a chart still count as a chart request.
+
+    `previous_query` — the prior turn's query text, used only when THIS
+    turn names no field of its own (see _extract_chart_data) and, for
+    chart TYPE only, blended in alongside this turn's words so "show in
+    orange" after a pie chart still renders as a pie, not the bar default.
     """
     query_lower = query.lower()
     colors = resolve_palette_colors(palette)
+    # For TYPE inference only — safe to blend broadly (see
+    # _query_names_chart_type below: this turn's own explicit type
+    # always wins regardless of what's blended in).
+    type_fallback_query_lower = previous_query.lower() if recent_had_chart and previous_query else None
+    # For FIELD matching — much narrower. Reusing the previous turn's
+    # wording must only happen for a genuinely content-free style
+    # continuation ("show in golden colour") — not for any query that
+    # merely fails to name a recognized FIELD, since a fully-formed new
+    # request ("email trends for the current month") can legitimately do
+    # that too (trend/month aren't field names) and must never be
+    # silently replaced by stale, unrelated wording from an earlier turn.
+    is_pure_style_continuation = (
+        recent_had_chart
+        and bool(_CHART_CONTINUATION_RE.search(query_lower))
+        and not _CHART_WORD_RE.search(query_lower)
+        and "compare budget" not in query_lower
+        and not _DATE_BUCKET_RE.search(query_lower)
+        and "readiness" not in query_lower
+    )
+    field_fallback_query_lower = previous_query.lower() if is_pure_style_continuation and previous_query else None
 
-    if not is_chart_request(query):
+    if not is_chart_request(query, recent_had_chart):
         return None
 
     # Most specific case first: a query naming BOTH a single budget metric
@@ -195,13 +271,23 @@ def detect_chart_opportunity(
         return grouped_chart
 
     # Try to extract chartable data from tool results
-    chart_data = _extract_chart_data(query_lower, tool_results)
+    chart_data = _extract_chart_data(query_lower, tool_results, field_fallback_query_lower)
     if not chart_data:
         return None
 
     labels = chart_data["labels"]
     datasets = chart_data["datasets"]
-    chart_type = chart_data.get("chart_type", _infer_chart_type(query_lower, labels))
+    # This turn's own explicit type always wins outright; only blend in
+    # the previous turn's words when THIS turn names no type at all, so
+    # a stale "line" from before can never override an explicit "bar"
+    # asked for now (see _query_names_chart_type).
+    if chart_data.get("chart_type"):
+        chart_type = chart_data["chart_type"]
+    elif _query_names_chart_type(query_lower):
+        chart_type = _infer_chart_type(query_lower, labels)
+    else:
+        type_query_lower = f"{type_fallback_query_lower} {query_lower}" if type_fallback_query_lower else query_lower
+        chart_type = _infer_chart_type(type_query_lower, labels)
 
     if len(labels) < 1:
         return None
@@ -243,33 +329,130 @@ def _detect_budget_metrics(query_lower: str) -> List[tuple]:
     ]
 
 
-_GROUP_KEYWORDS = [
-    (["department", "category", "sector"], "category"),
-    (["manager"], "manager"),
-    (["status"], "status"),
-]
+# Fields that identify WHICH row a chart item is (already used as the
+# x-axis label elsewhere) — never valid as a group-by/metric axis
+# themselves, so excluded from the generic field matching below.
+_ENTITY_NAME_FIELDS = frozenset({
+    "project_name_en", "project_name_ar", "sg_office_name_en", "sg_office_name_ar",
+    "task_name", "resolution_topic_en", "resolution_topic_ar", "subject", "code",
+})
+
+# Field-norm -> extra words a user might say instead of the real column
+# name — e.g. category_name means "department"/"sector" to most users;
+# emails' own status-equivalent column is literally named "workflow".
+_FIELD_SYNONYMS = {
+    "category": ["department", "sector"],
+    "workflow": ["status"],
+    "readiness status": ["confirmation status", "visitor status"],
+}
+
+_FIELD_SUFFIXES = ("_label", "_en", "_ar", "_name")
+_FIELD_SUFFIX_RANK = {"_label": 0, "_en": 1, "_name": 2, "_ar": 3}
 
 
-def _detect_group_field(query_lower: str) -> Optional[str]:
-    """Returns a group KEY (not a literal column name) since the right
-    field differs by entity shape — e.g. status is "status_label" on SG
-    offices but "status_en" on projects. _group_value() below resolves it
-    per item. "Department"/"sector" aren't real columns; projects and SG
-    offices only have category_name, and that's what users mean by either."""
-    for keywords, group_key in _GROUP_KEYWORDS:
-        if any(k in query_lower for k in keywords):
-            return group_key
-    return None
+def _normalize_field(key: str) -> str:
+    """'status_label' -> 'status', 'category_name' -> 'category' — so a DB
+    column reads like the plain word a user would actually type."""
+    for suf in _FIELD_SUFFIXES:
+        if key.endswith(suf):
+            return key[: -len(suf)].replace("_", " ").strip()
+    return key.replace("_", " ").strip()
 
 
-def _group_value(item: Dict, group_key: str) -> Optional[str]:
-    if group_key == "category":
-        return item.get("category_name")
-    if group_key == "manager":
-        return item.get("manager_name")
-    if group_key == "status":
-        return item.get("status_label") or item.get("status_en") or item.get("status")
-    return None
+def _field_is_numeric(key: str, tool_results: List[Dict]) -> bool:
+    values = [r.get(key) for r in tool_results if isinstance(r, dict) and r.get(key) is not None]
+    return bool(values) and all(_to_float(v) is not None for v in values)
+
+
+def _raw_code_keys(keys, tool_results: List[Dict]) -> set:
+    """Fields that are raw numeric codes standing in for some OTHER field
+    with the same normalized name that actually holds real text — e.g.
+    status/status_en/status_ar all normalize to "status", but only
+    status_en is ever translated; status_ar keeps the same raw numeric
+    code and is never resolved. Trusting the _ar suffix alone (as if it
+    always meant "resolved Arabic text") let that raw code slip through
+    as if it were a real metric. Grouping by normalized name and checking
+    actual values instead catches this regardless of which field (if
+    any) ends up holding the real text."""
+    groups: Dict[str, List[str]] = {}
+    for k in keys:
+        groups.setdefault(_normalize_field(k), []).append(k)
+    drop = set()
+    for group_keys in groups.values():
+        if len(group_keys) < 2:
+            continue
+        if any(not _field_is_numeric(k, tool_results) for k in group_keys):
+            drop.update(k for k in group_keys if _field_is_numeric(k, tool_results))
+    return drop
+
+
+def _match_field(
+    query_lower: str, tool_results: List[Dict], numeric: Optional[bool] = None,
+    exclude: frozenset = frozenset(),
+) -> Optional[str]:
+    """
+    Generic axis detection: find a real field in tool_results whose plain
+    name (or a known synonym) is actually named in the query — e.g.
+    "priority" matches a real priority_label column — so any DB field
+    works as a chart axis without a hand-added keyword each time.
+    numeric=True/False restricts to a metric (y-axis) vs. a categorical
+    (x-axis/group-by) field; None allows either.
+    """
+    keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            keys.update(row.keys())
+    keys -= _ENTITY_NAME_FIELDS
+    keys -= exclude
+    keys = {k for k in keys if k != "id" and not k.endswith("_id")}
+    # A raw code (e.g. request_type=2) superseded by a sibling field that
+    # actually holds real text is never a real axis itself — same rule
+    # tools.py uses to drop these from the table, so it's never picked as
+    # a "numeric metric" over the category it encodes.
+    keys -= _raw_code_keys(keys, tool_results)
+
+    best_key, best_score = None, None
+    for key in keys:
+        norm = _normalize_field(key)
+        if not norm:
+            continue
+        # Plain "+s" plural too (sender -> senders) — "top 10 email
+        # senders" otherwise never matched sender_name at all, since the
+        # word-boundary match requires the exact word, not a substring.
+        words = [norm, f"{norm}s"] + _FIELD_SYNONYMS.get(norm, [])
+        if not any(re.search(r"\b" + re.escape(w) + r"\b", query_lower) for w in words):
+            continue
+        if numeric is not None and _field_is_numeric(key, tool_results) != numeric:
+            continue
+        if numeric is False:
+            # A true identity field (e.g. a meeting's own name) is never a
+            # real grouping dimension — every row has its own distinct
+            # value, so nothing repeats. Skip it instead of letting a
+            # longer field name like "meeting" out-score "status" purely
+            # on string length.
+            vals = [r.get(key) for r in tool_results if isinstance(r, dict) and r.get(key)]
+            if vals and len(set(map(str, vals))) >= len(vals):
+                continue
+        # "status" is almost always the actual intent even next to a
+        # longer word — "facility readiness status" means group by status
+        # (facility is just which readiness), not facility type, so a
+        # bare "status"/"readiness status" match always wins over a
+        # longer but unrelated word purely on string length.
+        is_status = norm in ("status", "readiness status")
+        # Prefer the most specific (longest) name match; among ties prefer
+        # the most-resolved column (a _label beats a bare/_ar twin).
+        rank = next((r for suf, r in _FIELD_SUFFIX_RANK.items() if key.endswith(suf)), 4)
+        score = (is_status, len(norm), -rank)
+        if best_score is None or score > best_score:
+            best_key, best_score = key, score
+    return best_key
+
+
+def _entity_display_name(item: Dict) -> Optional[str]:
+    return (
+        item.get("project_name_en") or item.get("sg_office_name_en")
+        or item.get("task_name") or item.get("resolution_topic_en")
+    )
 
 
 def _extract_grouped_budget_chart(
@@ -295,7 +478,7 @@ def _extract_grouped_budget_chart(
         return None
 
     metrics = _detect_budget_metrics(query_lower)
-    group_key = _detect_group_field(query_lower)
+    group_key = _match_field(query_lower, tool_results, numeric=False)
     if not metrics or not group_key:
         return None
 
@@ -317,7 +500,7 @@ def _extract_grouped_budget_chart(
             name = item.get("project_name_en") or item.get("sg_office_name_en")
             val = _to_float(item.get(metric_field))
             if name and val is not None:
-                group = str(_group_value(item, group_key) or "Uncategorized")
+                group = str(item.get(group_key) or "Uncategorized")
                 rows.append((name, group, val))
 
         if not rows:
@@ -378,7 +561,7 @@ def _extract_grouped_budget_chart(
         for item in tool_results:
             if not (item.get("project_name_en") or item.get("sg_office_name_en")):
                 continue
-            group = str(_group_value(item, group_key) or "Uncategorized")
+            group = str(item.get(group_key) or "Uncategorized")
             for metric_field, _ in metrics:
                 val = _to_float(item.get(metric_field))
                 if val is not None:
@@ -422,7 +605,7 @@ def _extract_grouped_budget_chart(
                         "type": "bar", "name": metric_label,
                         "marker": {"color": color},
                     })
-            layout["xaxis"] = {"title": group_key.title()}
+            layout["xaxis"] = {"title": _normalize_field(group_key).title()}
             layout["yaxis"] = {"title": "Budget"}
             if chart_type == "bar":
                 layout["barmode"] = "group"
@@ -445,15 +628,317 @@ def _extract_grouped_budget_chart(
     }
 
 
-def _extract_chart_data(
-    query_lower: str, tool_results: List[Dict]
-) -> Optional[Dict]:
-    """Extract label-value pairs from tool results for charting."""
+_DATE_BUCKET_RE = re.compile(
+    r"\b(per day|daily|each day|per week|weekly|per month|monthly|trend|trends|over time)\b",
+    re.IGNORECASE,
+)
+# Checked in this order — any of these present in a row is used as the
+# date to bucket by, first match wins.
+_DATE_FIELD_CANDIDATES = (
+    "received_datetime", "scheduled_date", "date_received", "created_at",
+    "meeting_date", "deadline", "closed_at", "updated_at", "due_at",
+    "scheduled_on", "readiness_updated_at", "arrived_at",
+)
 
+
+def _parse_date(val) -> Optional[datetime]:
+    """Tolerant parse of whatever date/datetime string shape this DB
+    returns (date-only, ISO datetime, with/without timezone or trailing
+    'Z') — returns None rather than raising on anything unparseable."""
+    if not val:
+        return None
+    s = str(val).strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+
+
+def _extract_date_bucket_chart(query_lower: str, tool_results: List[Dict]) -> Optional[Dict]:
+    """
+    Handle "per day"/"weekly"/"trend"/"over time" style queries by
+    counting rows per day/week/month from whichever date field is
+    actually present — e.g. "emails received each day for the last 7
+    days", "memos received per week". Returns a time-ordered chart, or
+    None if the query doesn't ask for this or no usable date field exists.
+    """
+    if not _DATE_BUCKET_RE.search(query_lower) or not tool_results:
+        return None
+
+    keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            keys.update(row.keys())
+    date_field = next((f for f in _DATE_FIELD_CANDIDATES if f in keys), None)
+    if not date_field:
+        return None
+
+    # Bare "month"/"week" (as in "for the current month") describes the
+    # DATE RANGE, not the bucket size — bucketing a single month's own
+    # data by month always yields exactly one bucket, which the <2 check
+    # below then rejects outright. Only explicit "per week"/"monthly"
+    # phrasing means bucket-by-that-size; everything else defaults to
+    # daily buckets, the only granularity that's ever useful within a
+    # single named month/week.
+    if any(p in query_lower for p in ("per week", "weekly", "each week")):
+        granularity = "week"
+    elif any(p in query_lower for p in ("per month", "monthly", "each month")):
+        granularity = "month"
+    else:
+        granularity = "day"
+
+    buckets: Dict[str, int] = {}
+    for row in tool_results:
+        parsed = _parse_date(row.get(date_field))
+        if not parsed:
+            continue
+        if granularity == "day":
+            key = parsed.strftime("%Y-%m-%d")
+        elif granularity == "week":
+            key = (parsed - timedelta(days=parsed.weekday())).strftime("%Y-%m-%d")
+        else:
+            key = parsed.strftime("%Y-%m")
+        buckets[key] = buckets.get(key, 0) + 1
+
+    if len(buckets) < 2:
+        return None
+    sorted_keys = sorted(buckets.keys())
+    return {
+        "labels": sorted_keys,
+        "datasets": [{"label": "Count", "data": [buckets[k] for k in sorted_keys]}],
+        "chart_type": "line" if "trend" in query_lower or granularity != "day" else "bar",
+    }
+
+
+_READINESS_RANK = {"Not Confirmed": 0, "Pending": 1, "Confirmed": 2}
+
+
+def _extract_combined_readiness_chart(query_lower: str, tool_results: List[Dict]) -> Optional[Dict]:
+    """
+    "meetings vs readiness status" with no "visitor"/"facility" qualifier
+    means both halves of readiness — facility task status AND visitor
+    readiness — so when the router calls both
+    list_sg_office_meeting_facilities and list_sg_office_meeting_visitors
+    for it, their rows land merged in one list. One meeting can have
+    several facility tasks or visitors, so each is reduced to its single
+    WORST (most-blocking) status — any one unconfirmed item means that
+    meeting isn't ready — then charted as one grouped bar: meetings on
+    the x-axis, Facility/Visitor readiness as two series. A qualified
+    question ("visitor readiness"/"facility readiness") is left to the
+    per-meeting matcher below, since then only one tool's rows exist.
+    """
+    if "readiness" not in query_lower:
+        return None
+    if "visitor" in query_lower or "facility" in query_lower:
+        return None
+
+    facility_rows = [r for r in tool_results if isinstance(r, dict) and "facility_label" in r]
+    visitor_rows = [r for r in tool_results if isinstance(r, dict) and "readiness_status_label" in r]
+    if not facility_rows or not visitor_rows:
+        return None
+
+    def _worst_per_meeting(rows, key):
+        worst: Dict[str, str] = {}
+        for row in rows:
+            name = row.get("organization") or row.get("requester")
+            status = row.get(key)
+            if not name or not status:
+                continue
+            status = str(status)
+            if name not in worst or _READINESS_RANK.get(status, 99) < _READINESS_RANK.get(worst[name], 99):
+                worst[name] = status
+        return worst
+
+    facility_by_meeting = _worst_per_meeting(facility_rows, "status_label")
+    visitor_by_meeting = _worst_per_meeting(visitor_rows, "readiness_status_label")
+    meetings = list(dict.fromkeys(list(facility_by_meeting) + list(visitor_by_meeting)))
+    if not meetings:
+        return None
+
+    return {
+        "labels": meetings,
+        "datasets": [
+            {"label": "Facility Readiness", "data": [facility_by_meeting.get(m) for m in meetings]},
+            {"label": "Visitor Readiness", "data": [visitor_by_meeting.get(m) for m in meetings]},
+        ],
+        # No explicit chart_type — let the caller infer bar/line/pie from
+        # the query itself (a hardcoded "bar" here ignored "line chart").
+    }
+
+
+def _extract_readiness_per_meeting_chart(query_lower: str, tool_results: List[Dict]) -> Optional[Dict]:
+    """
+    "visitor readiness status"/"facility readiness status" means one bar
+    PER MEETING with its actual status text as the value (not a count) —
+    meetings on the x-axis, the resolved label (Confirmed/Not Confirmed/
+    Pending), not the raw numeric code, on the y-axis. Facility/visitor
+    rows have no "meeting" field of their own — organization (falling
+    back to requester) is what identifies which meeting each belongs to.
+    """
+    if "readiness" not in query_lower:
+        return None
+    if "visitor" in query_lower:
+        key, series_label = "readiness_status_label", "Visitor Readiness"
+    elif "facility" in query_lower:
+        key, series_label = "status_label", "Facility Readiness"
+    else:
+        return None  # bare "readiness" — the combined chart above handles it
+
+    items = []
+    for row in tool_results:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("organization") or row.get("requester")
+        status = row.get(key)
+        if name and status:
+            items.append((str(name), str(status)))
+    if len(items) < 2:
+        return None
+
+    return {
+        "labels": [n for n, _ in items],
+        "datasets": [{"label": series_label, "data": [s for _, s in items]}],
+    }
+
+
+def _match_field_by_value(query_lower: str, tool_results: List[Dict]) -> Optional[str]:
+    """
+    Fallback for when no field NAME matched the query: look for a field
+    whose actual VALUES are named instead — e.g. "completed, pending and
+    unassigned facility tasks" never says "status", but those three words
+    ARE real status_label values. Requires 2+ of a field's own distinct
+    values to be named, not just one, so an ordinary word that happens to
+    equal some value somewhere doesn't false-positive.
+    """
+    keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            keys.update(k for k in row.keys() if k.endswith(("_label", "_en", "_ar", "_name")))
+    keys -= _ENTITY_NAME_FIELDS
+
+    best_key, best_hits = None, 1
+    for key in keys:
+        values = {str(r.get(key)) for r in tool_results if isinstance(r, dict) and r.get(key)}
+        hits = sum(
+            1 for v in values
+            if re.search(r"\b" + re.escape(v.lower()) + r"\b", query_lower)
+        )
+        if hits > best_hits:
+            best_key, best_hits = key, hits
+    return best_key
+
+
+def _extract_chart_data(
+    query_lower: str, tool_results: List[Dict], fallback_query_lower: Optional[str] = None
+) -> Optional[Dict]:
+    """Extract label-value pairs from tool results for charting.
+
+    fallback_query_lower — the PREVIOUS turn's query, only used when this
+    turn names no real field at all (e.g. "show in golden colour" has
+    none) — e.g. "bar chart of projects vs status" then "show in golden
+    colour" would otherwise default straight to the budget chart (present
+    whether or not asked for) instead of re-showing status, since the new
+    message alone gives nothing to match. An explicit new field this turn
+    ("show it by venue instead") always wins outright — this only fills
+    in when there's truly nothing to go on.
+    """
     if not tool_results:
         return None
 
-    # Case 1: Budget comparison across multiple items (projects, SG offices)
+    if fallback_query_lower and not _match_field(query_lower, tool_results):
+        query_lower = fallback_query_lower
+
+    # Case 0: "per day"/"weekly"/"trend" style queries — bucketed by date,
+    # checked before everything else since these are unambiguous about
+    # wanting a time series, not a category breakdown.
+    date_chart = _extract_date_bucket_chart(query_lower, tool_results)
+    if date_chart:
+        return date_chart
+
+    # Case 0b: unqualified "readiness status" — both facility and visitor
+    # readiness combined, if both came back this turn.
+    readiness_chart = _extract_combined_readiness_chart(query_lower, tool_results)
+    if readiness_chart:
+        return readiness_chart
+
+    # Case 0c: "visitor"/"facility" readiness — one bar per meeting with
+    # its real status text, not an aggregate count.
+    per_meeting_chart = _extract_readiness_per_meeting_chart(query_lower, tool_results)
+    if per_meeting_chart:
+        return per_meeting_chart
+
+    # Case 1: A field explicitly named in the query, resolved generically
+    # against whatever columns these rows actually have — e.g. "projects
+    # vs status", "tasks by priority", "meetings by venue" — checked
+    # FIRST, before the budget case below, since budget fields are present
+    # on project/office rows whether or not budget was asked for (e.g.
+    # "projects vs status" used to chart budget anyway because every row
+    # happens to carry allocated_budget). A new DB column works here with
+    # no code change. Gated to rows that carry a resolved _label/_en/_ar/
+    # _name/_summary column (every entity table in this app produces
+    # these) rather than just an "id" — a narrow `fields` request can
+    # strip "id" out entirely, but a resolved column like status_label
+    # survives since it's what was actually asked for. This keeps the
+    # check from ever firing on homogeneous SQL aggregate rows
+    # (query_education_data — year/region/totals, no such columns), which
+    # already pivot correctly and generically via Case 3 below.
+    is_entity_rows = any(
+        isinstance(r, dict) and (
+            "id" in r or any(k.endswith(("_label", "_en", "_ar", "_name", "_summary")) for k in r)
+        )
+        for r in tool_results
+    )
+    if is_entity_rows:
+        metric_field = _match_field(
+            query_lower, tool_results, numeric=True,
+            exclude=frozenset({"allocated_budget", "spent_budget", "budget_left"}),
+        )
+        if metric_field:
+            items = [
+                (_entity_display_name(item), _to_float(item.get(metric_field)))
+                for item in tool_results
+            ]
+            items = [(n, v) for n, v in items if n and v is not None]
+            if items:
+                return {
+                    "labels": [n for n, _ in items],
+                    "datasets": [{
+                        "label": _normalize_field(metric_field).title(),
+                        "data": [v for _, v in items],
+                    }],
+                }
+
+        group_field = _match_field(query_lower, tool_results, numeric=False)
+        if not group_field:
+            # Nothing matched by FIELD name — try matching by the actual
+            # VALUES instead (e.g. "completed, pending and unassigned
+            # facility tasks" never says "status").
+            group_field = _match_field_by_value(query_lower, tool_results)
+        if group_field:
+            counts: Dict[str, int] = {}
+            for item in tool_results:
+                val = item.get(group_field)
+                if val:
+                    counts[str(val)] = counts.get(str(val), 0) + 1
+            # Only a genuine distribution when values repeat (e.g. many
+            # meetings sharing a few venues) — if every row has its own
+            # distinct value, counting isn't meaningful.
+            if 2 <= len(counts) < len(tool_results):
+                # Highest count first — what "top N" means, and a
+                # sensible default reading order even when N isn't named.
+                ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+                top_n = re.search(r"\btop (\d+)\b", query_lower)
+                if top_n:
+                    ranked = ranked[: int(top_n.group(1))]
+                return {
+                    "labels": [k for k, _ in ranked],
+                    "datasets": [{"label": "Count", "data": [v for _, v in ranked]}],
+                }
+
+    # Case 2: Budget comparison across multiple items (projects, SG offices)
     budget_items = []
     for item in tool_results:
         name = (
@@ -529,12 +1014,6 @@ def _extract_chart_data(
     if "budget" in query_lower:
         return None
 
-    # Case 2: Status distribution
-    if any(w in query_lower for w in ["status", "distribution", "breakdown", "pie"]):
-        status_chart = _status_distribution_chart(tool_results)
-        if status_chart:
-            return status_chart
-
     # Case 3: Homogeneous row dicts (e.g. SQL query results like
     # {"year": 2022, "total_students": 509738, "total_schools": 776}) —
     # pivot into a proper grouped-bar chart: one categorical column for the
@@ -547,6 +1026,15 @@ def _extract_chart_data(
 
     # Case 4: Generic numeric data extraction (fallback for anything that
     # doesn't look like a set of homogeneous rows)
+    all_keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            all_keys.update(row.keys())
+    # Skip a raw code superseded by a sibling field that actually holds
+    # real text — same rule as elsewhere, so a status/venue/etc code
+    # never gets plotted as if it were a real number.
+    drop_keys = _raw_code_keys(all_keys, tool_results)
+
     numeric_items = []
     for item in tool_results:
         name = (
@@ -558,7 +1046,11 @@ def _extract_chart_data(
         )
         for key, val in item.items():
             fval = _to_float(val)
-            if fval is not None and fval > 0 and key not in ("id", "task_id", "resolution_id"):
+            if (
+                fval is not None and fval > 0
+                and key != "id" and not key.endswith("_id")
+                and key not in drop_keys
+            ):
                 numeric_items.append({"label": f"{name} - {key}", "value": fval})
 
     if len(numeric_items) >= 2:
@@ -571,12 +1063,51 @@ def _extract_chart_data(
         }
 
     # Case 5: Last resort. The query asked for *a* chart of some entity list
-    # (e.g. "generate a chart of tasks") without naming any specific numeric
-    # field, and none of the cases above found one — tasks in particular
-    # have no numeric fields at all (no budget, no count column). Status is
-    # the one dimension every entity list here actually has, so fall back to
-    # a status-distribution chart instead of giving up outright.
-    return _status_distribution_chart(tool_results)
+    # (e.g. "generate a chart of tasks", or a color-only follow-up like
+    # "show in orange" that names no field at all) without naming any
+    # specific numeric field, and none of the cases above found one.
+    # Status is the one dimension every entity list here usually has, so
+    # try that first — but a follow-up can land on data narrowed to some
+    # OTHER field only (e.g. priority-only, from the prior turn's own
+    # field selection), so fall back further to whichever real categorical
+    # field is actually present, instead of giving up outright.
+    return (
+        _status_distribution_chart(tool_results)
+        or _any_available_distribution_chart(tool_results)
+    )
+
+
+def _any_available_distribution_chart(tool_results: List[Dict]) -> Optional[Dict]:
+    """Picks whichever real categorical field has the most genuine
+    distribution, using the same candidate rules as _match_field but
+    without requiring the query to name it — the true last resort."""
+    keys = set()
+    for row in tool_results:
+        if isinstance(row, dict):
+            keys.update(row.keys())
+    keys -= _ENTITY_NAME_FIELDS
+    keys = {k for k in keys if k != "id" and not k.endswith("_id")}
+    keys -= _raw_code_keys(keys, tool_results)
+
+    best_counts, best_total = None, 0
+    for key in keys:
+        if _field_is_numeric(key, tool_results):
+            continue
+        counts: Dict[str, int] = {}
+        for row in tool_results:
+            val = row.get(key)
+            if val:
+                counts[str(val)] = counts.get(str(val), 0) + 1
+        total = sum(counts.values())
+        if 2 <= len(counts) < len(tool_results) and total > best_total:
+            best_counts, best_total = counts, total
+
+    if not best_counts:
+        return None
+    return {
+        "labels": list(best_counts.keys()),
+        "datasets": [{"label": "Count", "data": list(best_counts.values())}],
+    }
 
 
 def _status_distribution_chart(tool_results: List[Dict]) -> Optional[Dict]:
@@ -626,7 +1157,13 @@ def _extract_row_dicts_chart(tool_results: List[Dict]) -> Optional[Dict]:
     if not common_keys:
         return None
 
-    EXCLUDE = {"id", "task_id", "resolution_id"}
+    # Any foreign-key id (meeting_request_id, arrival_marked_by_id, ...) is
+    # never a real metric, not just the 3 literal names caught before.
+    EXCLUDE = {k for k in common_keys if k == "id" or k.endswith("_id")}
+    # A raw code (status=2) superseded by a sibling field holding real
+    # text is never a real metric — same rule _match_field uses, so this
+    # pivot doesn't plot raw enum codes as if they were real numbers.
+    EXCLUDE |= _raw_code_keys(common_keys, rows)
 
     # Prefer a conventionally-named category column for the x-axis. Entity
     # "name" fields come first — without this, the generic fallback below
@@ -704,13 +1241,27 @@ def _to_float(val) -> Optional[float]:
     return number * _MAGNITUDE_SUFFIXES.get(suffix, 1)
 
 
+_CHART_TYPE_WORDS = {
+    "pie": ("pie", "distribution", "percentage", "share", "breakdown"),
+    "line": ("line", "trend", "over time", "timeline"),
+    "bar": ("bar",),
+}
+
+
 def _infer_chart_type(query: str, labels: list) -> str:
     """Infer appropriate chart type from query and data shape."""
-    if any(w in query for w in ["pie", "distribution", "percentage", "share", "breakdown"]):
+    if any(w in query for w in _CHART_TYPE_WORDS["pie"]):
         return "pie"
-    if any(w in query for w in ["line", "trend", "over time", "timeline"]):
+    if any(w in query for w in _CHART_TYPE_WORDS["line"]):
         return "line"
     return "bar"
+
+
+def _query_names_chart_type(query: str) -> bool:
+    """True if the query itself names pie/line/bar explicitly — an
+    explicit type THIS turn must always win over one blended in from the
+    previous turn, never get silently overridden by stale context."""
+    return any(w in query for words in _CHART_TYPE_WORDS.values() for w in words)
 
 
 def _build_plotly_config(
