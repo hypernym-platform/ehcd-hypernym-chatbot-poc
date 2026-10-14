@@ -576,6 +576,7 @@ async def handle_query(
     def generate():
         assistant_response = ""
         tool_results_for_chart = []
+        chart_intent = {}
         pending_tag = ""
 
         try:
@@ -594,6 +595,7 @@ async def handle_query(
                 policy_cfg=POLICY_CFG,
                 emb=emb,
                 tool_results_collector=tool_results_for_chart,
+                chart_intent_collector=chart_intent,
             ):
                 assistant_response += chunk
                 plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
@@ -625,6 +627,8 @@ async def handle_query(
                 query, rows_for_chart, assistant_response,
                 palette=detect_palette_from_query(query),
                 recent_had_chart=recent_had_chart, previous_query=previous_query,
+                want_chart=chart_intent.get("want_chart"),
+                router_chart_type=chart_intent.get("chart_type"),
             )
         except Exception as e:
             logger.error(f"Chart detection error: {e}")
@@ -645,7 +649,7 @@ async def handle_query(
         # chartable (e.g. the requested field doesn't exist for that entity,
         # like a task's "budget"). Without this, the model's text falsely
         # claims a chart is coming when none will ever show up.
-        if is_chart_request(query, recent_had_chart) and not chart_data:
+        if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
             assistant_response = (
                 "<p>I couldn't generate a chart for this — the data needed "
                 "for it wasn't found. It may not exist for what you asked "
@@ -764,6 +768,7 @@ async def websocket_chat(ws: WebSocket):
             # Stream response using async queue to avoid blocking the event loop
             assistant_response = ""
             tool_results_for_chart = []
+            chart_intent = {}
             pending_tag = ""
             async_q = asyncio.Queue()
             loop = asyncio.get_event_loop()
@@ -786,6 +791,7 @@ async def websocket_chat(ws: WebSocket):
                         policy_cfg=POLICY_CFG,
                         emb=emb,
                         tool_results_collector=tool_results_for_chart,
+                        chart_intent_collector=chart_intent,
                     ):
                         loop.call_soon_threadsafe(async_q.put_nowait, ("chunk", chunk))
                 except Exception as e:
@@ -823,6 +829,8 @@ async def websocket_chat(ws: WebSocket):
                     query, rows_for_chart, assistant_response,
                     palette=detect_palette_from_query(query),
                     recent_had_chart=recent_had_chart, previous_query=previous_query,
+                    want_chart=chart_intent.get("want_chart"),
+                    router_chart_type=chart_intent.get("chart_type"),
                 )
             except Exception as e:
                 logger.error(f"WS chart detection error: {e}")
@@ -838,7 +846,7 @@ async def websocket_chat(ws: WebSocket):
 
             # Same honest-fallback reasoning as the REST endpoint — see the
             # comment there.
-            if is_chart_request(query, recent_had_chart) and not chart_data:
+            if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
                 assistant_response = (
                     "<p>I couldn't generate a chart for this — the data needed "
                     "for it wasn't found. It may not exist for what you asked "

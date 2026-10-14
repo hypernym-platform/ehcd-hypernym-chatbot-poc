@@ -140,27 +140,35 @@ _CHART_CONTINUATION_RE = re.compile(
 )
 
 
-def is_chart_request(query: str, recent_had_chart: bool = False) -> bool:
+def is_chart_request(query: str, recent_had_chart: bool = False, want_chart: Optional[bool] = None) -> bool:
     """
-    True if the query's own wording asks for a chart/graph, independent of
-    whether chartable data actually exists. Shared with app.py so it can
-    tell when the model's response claims a chart is coming but
-    detect_chart_opportunity ended up unable to build one (e.g. the
-    requested field doesn't exist for that entity, like a task's "budget")
-    — the model has no way to know that in advance, since chart detection
-    runs after its response is already generated.
+    True if a chart/graph is wanted, independent of whether chartable data
+    actually exists. Shared with app.py so it can tell when the model's
+    response claims a chart is coming but detect_chart_opportunity ended
+    up unable to build one (e.g. the requested field doesn't exist for
+    that entity, like a task's "budget") — the model has no way to know
+    that in advance, since chart detection runs after its response is
+    already generated.
+
+    want_chart — the ROUTER's own decision (see _CHART_INTENT_PARAMS in
+    tools.py), passed through from the tool call it already made. This is
+    authoritative and wins outright when given: the router read the whole
+    conversation and decided directly, so there's nothing left to guess.
+    Falls back to the keyword/regex heuristics below only when the caller
+    doesn't have a router decision to pass (want_chart is None) — kept as
+    a safety net, not the primary path anymore, because it kept missing
+    real phrasings no fixed keyword list can fully anticipate: "change
+    the colours" (plural), "x axis should be name" (never says "chart"
+    at all), a style tweak with no chart word of its own.
 
     Uses word-boundary matching, not plain substring — a naive `"pie" in
     query` check previously fired on any word containing "pie" as a
     substring, e.g. "recipients" ("reci-PIE-nts"), turning an ordinary
     retrieval question into a false chart request.
-
-    recent_had_chart=True (the immediately preceding turn showed a chart)
-    additionally allows a short follow-up like "show in orange colour" or
-    "as a pie instead" to count, even though it never says "chart" itself
-    — without this, a color/type-only follow-up silently fell back to a
-    table because it looked like a plain data question in isolation.
     """
+    if want_chart is not None:
+        return want_chart
+
     query_lower = query.lower()
     if _CHART_WORD_RE.search(query_lower):
         return True
@@ -216,6 +224,8 @@ def detect_chart_opportunity(
     palette: str = DEFAULT_PALETTE,
     recent_had_chart: bool = False,
     previous_query: str = "",
+    want_chart: Optional[bool] = None,
+    router_chart_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Analyze query + tool results to determine if a chart is appropriate.
@@ -225,8 +235,16 @@ def detect_chart_opportunity(
     defaults to the brand's primary brown palette; pass "crimson" or
     "green" for either secondary palette instead.
 
+    `want_chart`/`router_chart_type` — the ROUTER's own decision (see
+    _CHART_INTENT_PARAMS in tools.py), from the tool call it already
+    made. Authoritative when given: it read the whole conversation and
+    decided directly, so nothing here needs to re-guess "should we chart
+    at all" or "which type" from keyword patterns. `recent_had_chart`/
+    `previous_query`-based heuristics below are the fallback for when no
+    router decision is available, not the primary path.
+
     `recent_had_chart` — see is_chart_request — lets a color/type-only
-    follow-up to a chart still count as a chart request.
+    follow-up to a chart still count as a chart request (fallback path).
 
     `previous_query` — the prior turn's query text, used only when THIS
     turn names no field of its own (see _extract_chart_data) and, for
@@ -246,9 +264,16 @@ def detect_chart_opportunity(
     # request ("email trends for the current month") can legitimately do
     # that too (trend/month aren't field names) and must never be
     # silently replaced by stale, unrelated wording from an earlier turn.
+    # The router's own want_chart (when given) replaces the regex as the
+    # "is this stylistically a continuation" signal — it already knows,
+    # from the full conversation, whether this turn is a bare style tweak
+    # rather than a new self-contained request.
+    is_style_continuation_signal = (
+        want_chart if want_chart is not None else bool(_CHART_CONTINUATION_RE.search(query_lower))
+    )
     is_pure_style_continuation = (
         recent_had_chart
-        and bool(_CHART_CONTINUATION_RE.search(query_lower))
+        and is_style_continuation_signal
         and not _CHART_WORD_RE.search(query_lower)
         and "compare budget" not in query_lower
         and not _DATE_BUCKET_RE.search(query_lower)
@@ -256,7 +281,7 @@ def detect_chart_opportunity(
     )
     field_fallback_query_lower = previous_query.lower() if is_pure_style_continuation and previous_query else None
 
-    if not is_chart_request(query, recent_had_chart):
+    if not is_chart_request(query, recent_had_chart, want_chart):
         return None
 
     # Most specific case first: a query naming BOTH a single budget metric
@@ -266,7 +291,7 @@ def detect_chart_opportunity(
     # all projects on one shared x-axis) can't produce. Handled separately
     # and returns its own complete payload; falls through to the normal
     # cases if the query isn't this specific or the grouped data is empty.
-    grouped_chart = _extract_grouped_budget_chart(query_lower, tool_results, colors, palette)
+    grouped_chart = _extract_grouped_budget_chart(query_lower, tool_results, colors, palette, router_chart_type)
     if grouped_chart:
         return grouped_chart
 
@@ -277,11 +302,14 @@ def detect_chart_opportunity(
 
     labels = chart_data["labels"]
     datasets = chart_data["datasets"]
-    # This turn's own explicit type always wins outright; only blend in
-    # the previous turn's words when THIS turn names no type at all, so
-    # a stale "line" from before can never override an explicit "bar"
-    # asked for now (see _query_names_chart_type).
-    if chart_data.get("chart_type"):
+    # The router's own type (when given) wins outright — it's the same
+    # authoritative decision as want_chart, not a guess. Otherwise this
+    # turn's own explicit type wins over blended-in previous-turn text
+    # (see _query_names_chart_type), so a stale "line" from before can
+    # never override an explicit "bar" asked for now.
+    if router_chart_type:
+        chart_type = router_chart_type
+    elif chart_data.get("chart_type"):
         chart_type = chart_data["chart_type"]
     elif _query_names_chart_type(query_lower):
         chart_type = _infer_chart_type(query_lower, labels)
@@ -457,7 +485,7 @@ def _entity_display_name(item: Dict) -> Optional[str]:
 
 def _extract_grouped_budget_chart(
     query_lower: str, tool_results: List[Dict], colors: List[str] = BROWN_COLORS,
-    palette_name: str = DEFAULT_PALETTE,
+    palette_name: str = DEFAULT_PALETTE, router_chart_type: Optional[str] = None,
 ) -> Optional[Dict]:
     """
     Handle queries naming a budget metric (or several, e.g. "spent vs
@@ -482,7 +510,7 @@ def _extract_grouped_budget_chart(
     if not metrics or not group_key:
         return None
 
-    chart_type = _infer_chart_type(query_lower, [])
+    chart_type = router_chart_type or _infer_chart_type(query_lower, [])
     dashed = any(w in query_lower for w in ["dotted", "dashed"])
 
     layout = {
@@ -831,6 +859,33 @@ def _match_field_by_value(query_lower: str, tool_results: List[Dict]) -> Optiona
     return best_key
 
 
+_COUNT_FRAMING_RE = re.compile(r"\b(number of|how many|count of)\b", re.IGNORECASE)
+_PROVENANCE_FILTER_FIELDS = ("status", "request_type", "priority", "readiness_status", "item_type", "project_manager")
+
+
+def _extract_single_subject_count_chart(query_lower: str, tool_results: List[Dict]) -> Optional[Dict]:
+    """
+    "number of projects X is included in"/"how many tasks does Y have" —
+    a plain count for ONE filtered subject, not a breakdown across
+    categories, so the usual "2+ distinct values" distribution logic
+    never fires for it (there's only one). tools.py backfills a resolved
+    _label for whichever filter the data was actually fetched under —
+    when every row shares that same single value, this is what it means:
+    one bar, that subject's name, the row count as its height.
+    """
+    if not _COUNT_FRAMING_RE.search(query_lower) or not tool_results:
+        return None
+    for filt in _PROVENANCE_FILTER_FIELDS:
+        key = f"{filt}_label"
+        values = {str(r.get(key)) for r in tool_results if isinstance(r, dict) and r.get(key)}
+        if len(values) == 1:
+            return {
+                "labels": [next(iter(values))],
+                "datasets": [{"label": "Count", "data": [len(tool_results)]}],
+            }
+    return None
+
+
 def _extract_chart_data(
     query_lower: str, tool_results: List[Dict], fallback_query_lower: Optional[str] = None
 ) -> Optional[Dict]:
@@ -937,6 +992,13 @@ def _extract_chart_data(
                     "labels": [k for k, _ in ranked],
                     "datasets": [{"label": "Count", "data": [v for _, v in ranked]}],
                 }
+
+    # Case 1b: a plain count for ONE filtered subject ("number of
+    # projects X is included in") — checked before budget below, which
+    # would otherwise unconditionally win on project/office rows.
+    subject_count_chart = _extract_single_subject_count_chart(query_lower, tool_results)
+    if subject_count_chart:
+        return subject_count_chart
 
     # Case 2: Budget comparison across multiple items (projects, SG offices)
     budget_items = []

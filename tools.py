@@ -9,7 +9,6 @@ import logging
 import queue
 import re
 import threading
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -49,6 +48,26 @@ logger = logging.getLogger(__name__)
 # Tool schema definitions (Azure OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
+# Spliced into each list_*/query_education_data tool's own properties below
+# (**_CHART_INTENT_PARAMS). The router decides THIS, directly, as part of
+# the same call it already builds filters in — not a second, separate
+# system guessing from the raw query text afterwards. That guesswork (a
+# regex over the user's words) is what kept missing real phrasings:
+# "change the colours" (plural), "x axis should be name" (never says
+# "chart" at all), a style-only follow-up with no chart word of its own.
+# The router already reads the full conversation, so it already knows.
+_CHART_INTENT_PARAMS = {
+    "want_chart": {
+        "type": "boolean",
+        "description": "Set true whenever a chart/graph/visualization is wanted — THIS turn, or a style/type tweak to one shown earlier in the conversation. Judge this from the whole conversation and the literal request, not just one keyword: 'chart', 'graph', describing x/y axes, 'change the colour', 'show it as a line instead', 'plot this' all mean true. Omit/false for a plain data question.",
+    },
+    "chart_type": {
+        "type": "string",
+        "enum": ["bar", "line", "pie"],
+        "description": "Only set when want_chart is true AND this turn names or implies a type. Omit to keep whatever type was used earlier in this conversation (or default to bar if none was ever specified) — never guess a type that wasn't actually asked for.",
+    },
+}
+
 TOOL_DEFINITIONS = [
     {
         "type": "function",
@@ -72,9 +91,9 @@ TOOL_DEFINITIONS = [
                         "description": "Filter by category name (partial match)",
                     },
                     "project_manager": {
-                                            "type": "string",
-                                            "description": "Filter by project_manager name (partial match)",
-                                        },
+                        "type": "string",
+                        "description": "Filter by a person's involvement in the project — matches if they're the manager OR a team member (partial/half name OK, e.g. 'Alzaabi' alone). Use for 'projects X manages', 'projects X is included in/part of', 'X's projects'.",
+                    },
                     "start_date": {
                         "type": "string",
                         "description": "Only projects whose start date is EXACTLY this full date (YYYY-MM-DD or MM-DD-YYYY) — not a range, not 'on or after'. If the user only named a month and/or year ('starting in September', 'started in 2026') and not a specific day, use start_month/start_year instead — do NOT guess a day here, it will almost never match a real row.",
@@ -112,6 +131,7 @@ TOOL_DEFINITIONS = [
                         "type": "integer",
                         "description": "Max number of projects to return. Set this to match the count the user asked for, e.g. 'the 3 latest projects' -> limit=3, 'the latest project' (singular) -> limit=1. Omit to return all matching projects — never omit it when the user named a specific number or asked for a single one.",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -264,6 +284,7 @@ TOOL_DEFINITIONS = [
                         "type": "integer",
                         "description": "Max number of emails to return, e.g. 'the 5 latest emails' -> limit=5. Omit to return all matching emails.",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -432,6 +453,7 @@ TOOL_DEFINITIONS = [
                     "limit": {
                         "type": "integer",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -623,6 +645,7 @@ TOOL_DEFINITIONS = [
                         "type": "integer",
                         "description": "Max number of meetings to return. Omit for name/organization searches — multiple meetings can share the same name, and a limit would silently hide the others.",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -753,6 +776,7 @@ TOOL_DEFINITIONS = [
                     "limit": {
                         "type": "integer",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -821,6 +845,7 @@ TOOL_DEFINITIONS = [
                     "limit": {
                         "type": "integer",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -862,6 +887,7 @@ TOOL_DEFINITIONS = [
                     "limit": {
                         "type": "integer",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -900,6 +926,7 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Filter by advisor name assigned to the task (partial match)",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -954,6 +981,7 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "Filter by responsible entity name (partial match)",
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": [],
             },
@@ -1011,6 +1039,7 @@ TOOL_DEFINITIONS = [
                             "GROUP BY year, region LIMIT 50"
                         ),
                     },
+                    **_CHART_INTENT_PARAMS,
                 },
                 "required": ["sql"],
             },
@@ -1610,6 +1639,8 @@ class ChatState(TypedDict):
     messages: list
     available_tools: list
     tool_results_for_chart: list
+    want_chart: bool
+    chart_type: Optional[str]
     tool_call_count: int
     needs_more_tools: bool
     final_response: str
@@ -1694,6 +1725,11 @@ def tool_executor_node(state: ChatState) -> dict:
         except json.JSONDecodeError:
             fn_args = {}
 
+        # want_chart/chart_type are the router's own chart decision, not
+        # real filters — pop them before the DB layer ever sees them.
+        want_chart = fn_args.pop("want_chart", None)
+        chart_type = fn_args.pop("chart_type", None)
+
         logger.info(f"Tool call: {fn_name}({fn_args})")
 
         # Each tool gets its own connection from the pool
@@ -1706,29 +1742,38 @@ def tool_executor_node(state: ChatState) -> dict:
                 policy_cfg=policy_cfg,
                 emb=emb_obj,
             )
-        return tool_call, fn_args, result_str
+        return tool_call, fn_args, result_str, want_chart, chart_type
 
     # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
         results = list(pool.map(_run_one_tool, tool_calls))
 
-    # Same tool called more than once in this turn (e.g. once per status
-    # value) means the distinguishing filter won't survive as a real field
-    # once every call's rows are flattened into one list below — charting
-    # that merged list then has nothing to group by. Backfill each row
-    # with the filter value it was fetched under, same shape as the real
-    # resolved _label columns, so the chart extractor can still use it.
-    _PROVENANCE_FILTERS = ("status", "request_type", "priority", "readiness_status", "item_type")
-    fn_name_counts = Counter(tc.function.name for tc, _, _ in results)
+    # Any call in this turn asking for a chart means the turn wants one —
+    # the router decided this directly, from the full conversation, not a
+    # regex over the user's words guessing after the fact. Last explicit
+    # chart_type wins; a null just means "keep whatever type was used
+    # before" (resolved later, in app.py, against the conversation history).
+    want_chart = any(w for _, _, _, w, _ in results)
+    chart_type = next((c for *_, c in results if c), None)
+
+    # The filter a result was fetched under doesn't always survive as a
+    # real field on the rows themselves (e.g. project_manager has no
+    # matching result column at all) — backfill it as a resolved _label,
+    # same shape as the real ones, so the chart extractor always has it.
+    # Matters most when the SAME tool is called per value (the merged
+    # list otherwise has nothing to group by) but also for a single call
+    # ("how many projects is X included in" needs to know X's name to
+    # label the one bar it draws), so this always runs, not just >1 calls.
+    _PROVENANCE_FILTERS = ("status", "request_type", "priority", "readiness_status", "item_type", "project_manager")
 
     # Append tool results to messages and collect for chart detection
-    for tool_call, fn_args, result_str in results:
+    for tool_call, fn_args, result_str, _, _ in results:
         try:
             parsed = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
             parsed = None
 
-        if fn_name_counts[tool_call.function.name] > 1 and isinstance(parsed, (list, dict)):
+        if isinstance(parsed, (list, dict)):
             for filt in _PROVENANCE_FILTERS:
                 val = fn_args.get(filt)
                 if val is None or not isinstance(val, str):
@@ -1787,6 +1832,11 @@ def tool_executor_node(state: ChatState) -> dict:
     return {
         "messages": messages,
         "tool_results_for_chart": tool_results_for_chart,
+        # OR/carry-forward across router rounds within this one turn — a
+        # later round with no explicit chart args shouldn't erase an
+        # earlier round's "yes, chart this" decision.
+        "want_chart": bool(state.get("want_chart")) or want_chart,
+        "chart_type": chart_type or state.get("chart_type"),
         "tool_call_count": state.get("tool_call_count", 0) + len(results),
     }
 
@@ -1845,6 +1895,13 @@ def answer_node(state: ChatState) -> dict:
         today=today,
     )
     answer_system += _verified_breakdown_counts(state.get("tool_results_for_chart"))
+    # Ground the model in its OWN router decision instead of letting it
+    # freely claim/deny a chart — it has no other way to know whether one
+    # will actually render below its text.
+    if state.get("want_chart"):
+        answer_system += "\n\nA chart WILL be shown below this response — fine to reference it (e.g. 'shown in the chart below')."
+    else:
+        answer_system += "\n\nNo chart will be shown below this response — do not say one is provided/shown/below."
 
     # Replace the system prompt with the leaner answer prompt
     answer_messages = [{"role": "system", "content": answer_system}] + messages[1:]
@@ -1978,6 +2035,7 @@ def run_chatbot_graph(
     policy_cfg=None,
     emb=None,
     tool_results_collector: list = None,
+    chart_intent_collector: dict = None,
 ):
     """
     Run the LangGraph chatbot and yield response chunks.
@@ -2046,6 +2104,8 @@ def run_chatbot_graph(
         "messages": messages,
         "available_tools": available_tools,
         "tool_results_for_chart": [],
+        "want_chart": False,
+        "chart_type": None,
         "tool_call_count": 0,
         "needs_more_tools": False,
         "final_response": "",
@@ -2078,3 +2138,6 @@ def run_chatbot_graph(
     # Copy tool results back for chart detection
     if tool_results_collector is not None and graph_result[0]:
         tool_results_collector.extend(graph_result[0].get("tool_results_for_chart") or [])
+    if chart_intent_collector is not None and graph_result[0]:
+        chart_intent_collector["want_chart"] = bool(graph_result[0].get("want_chart"))
+        chart_intent_collector["chart_type"] = graph_result[0].get("chart_type")
