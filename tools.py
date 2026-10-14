@@ -1766,6 +1766,33 @@ def tool_executor_node(state: ChatState) -> dict:
     # label the one bar it draws), so this always runs, not just >1 calls.
     _PROVENANCE_FILTERS = ("status", "request_type", "priority", "readiness_status", "item_type", "project_manager")
 
+    def _tool_sig(fn_name, args):
+        return (fn_name, tuple(sorted(
+            (k, str(v).lower()) for k, v in args.items() if k not in ("want_chart", "chart_type")
+        )))
+
+    # The router sometimes re-issues the exact same tool call (identical
+    # name + arguments) in a later round of the SAME turn — a DB read is
+    # deterministic, so this is never new data, just the model re-asking.
+    # Scanning the conversation so far catches it regardless of why it
+    # happened: without this, a true count of 3 gets summed into 6 purely
+    # because the same rows were fetched twice (seen live: "abdalla
+    # alzaabi" and "rashid" project counts both silently doubled on a
+    # chart because of exactly this).
+    prior_signatures = set()
+    for m in messages[:-1]:
+        tc_list = getattr(m, "tool_calls", None)
+        if not tc_list:
+            continue
+        for tc in tc_list:
+            try:
+                a = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                a = {}
+            prior_signatures.add(_tool_sig(tc.function.name, a))
+
+    seen_this_round = set()
+
     # Append tool results to messages and collect for chart detection
     for tool_call, fn_args, result_str, _, _ in results:
         try:
@@ -1773,7 +1800,11 @@ def tool_executor_node(state: ChatState) -> dict:
         except (json.JSONDecodeError, TypeError):
             parsed = None
 
-        if isinstance(parsed, (list, dict)):
+        sig = _tool_sig(tool_call.function.name, fn_args)
+        is_duplicate_call = sig in prior_signatures or sig in seen_this_round
+        seen_this_round.add(sig)
+
+        if isinstance(parsed, (list, dict)) and not is_duplicate_call:
             for filt in _PROVENANCE_FILTERS:
                 val = fn_args.get(filt)
                 if val is None or not isinstance(val, str):
@@ -1798,7 +1829,9 @@ def tool_executor_node(state: ChatState) -> dict:
             "content": tool_message_content,
         })
 
-        if isinstance(parsed, list):
+        if is_duplicate_call:
+            pass
+        elif isinstance(parsed, list):
             tool_results_for_chart.extend(parsed)
         elif isinstance(parsed, dict) and "error" not in parsed:
             if (
