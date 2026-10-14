@@ -1850,13 +1850,22 @@ def router_node(state: ChatState) -> dict:
     available_tools = state["available_tools"]
 
     try:
+        # Greedy, not creative — this call decides WHICH tool to call, with
+        # WHAT arguments, and whether a chart is wanted, not how to phrase
+        # anything. At 0.7 that decision is genuinely stochastic: the same
+        # "list all projects" after two prior filtered turns could roll
+        # either "call list_projects({}) fresh" or "I already have project
+        # data in context, skip the call" — the second path leaves
+        # answer_node nothing to ground on, so it completes the pattern
+        # from the prior turns' text instead (real hallucination, caused by
+        # unneeded sampling noise on what should be a deterministic
+        # decision). Prose quality/variety is answer_node's job, which
+        # keeps its own temperature — this one only ever outputs structure.
         api_kwargs = dict(
             model=model,
             messages=messages,
             max_tokens=4000,
-            temperature=0.7,
-            top_p=0.95,
-            frequency_penalty=0.2,
+            temperature=0,
             stream=False,
         )
         if available_tools:
