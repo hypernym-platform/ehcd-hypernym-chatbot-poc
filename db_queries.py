@@ -325,8 +325,20 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         params.extend([f"%{filters['category']}%", f"%{filters['category']}%"])
 
     if filters.get("project_manager"):
-        conditions.append("u.full_name_en ILIKE %s")
-        params.append(f"%{filters['project_manager']}%")
+        # Multi-word AND match, not one contiguous substring — a plain
+        # ILIKE on "Abdalla Alzaabi" never matches the real stored name
+        # "Abdalla Khalid Alzaabi" (middle name breaks it), and this also
+        # makes a half name ("Alzaabi" alone) work for free.
+        # "Included in"/"part of" means manager OR team member — a person
+        # can be on a project without managing it, and team_member rows
+        # have no user_id (name match only, see accessible_project_ids).
+        mgr_clause, mgr_p = _multi_word_ilike("u.full_name_en", filters["project_manager"])
+        tm_clause, tm_p = _multi_word_ilike("name_en", filters["project_manager"])
+        conditions.append(
+            f"({mgr_clause} OR p.id IN (SELECT project_id FROM project_management_teammember WHERE {tm_clause}))"
+        )
+        params.extend(mgr_p)
+        params.extend(tm_p)
 
     if filters.get("start_date"):
         conditions.append("p.start_date::date = %s")
@@ -335,6 +347,28 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     if filters.get("end_date"):
         conditions.append("p.end_date::date = %s")
         params.append(filters["end_date"])
+
+    # Month/year-only asks ("projects starting in September") have no exact
+    # day to match — forcing them through start_date's exact-equality check
+    # means the model has to guess a specific day, which almost never lands
+    # on a real row (e.g. real September starts here are the 11th/13th/25th/
+    # 30th, not the 1st) and silently returns zero results. These compare
+    # only the parts actually being asked about.
+    if filters.get("start_month"):
+        conditions.append("EXTRACT(MONTH FROM p.start_date) = %s")
+        params.append(filters["start_month"])
+
+    if filters.get("start_year"):
+        conditions.append("EXTRACT(YEAR FROM p.start_date) = %s")
+        params.append(filters["start_year"])
+
+    if filters.get("end_month"):
+        conditions.append("EXTRACT(MONTH FROM p.end_date) = %s")
+        params.append(filters["end_month"])
+
+    if filters.get("end_year"):
+        conditions.append("EXTRACT(YEAR FROM p.end_date) = %s")
+        params.append(filters["end_year"])
 
     if filters.get("overdue"):
         # Deterministic end_date-vs-today comparison in SQL — without this,
@@ -362,6 +396,23 @@ def list_projects(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(query, params)
         rows = cur.fetchall()
+
+    # A non-admin's view is scoped to their own projects (see
+    # accessible_project_ids above) — if they searched by a manager name
+    # and got nothing, that manager may genuinely have no projects, OR
+    # they're a real PM whose projects this user just can't see. Telling
+    # them "0 projects" either way states a false fact in the second
+    # case; check which it actually is and say so.
+    if not rows and not all_projects and filters.get("project_manager"):
+        clause, p = _multi_word_ilike("u.full_name_en", filters["project_manager"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM project_management_project p "
+                "LEFT JOIN user_management_user u ON u.id = p.project_manager_id "
+                f"WHERE {clause} LIMIT 1", p,
+            )
+            if cur.fetchone():
+                return {"error": "Access denied: you don't have visibility into another project manager's assigned projects."}
 
     # Batch-fetch budgets in one query instead of N+1
     budget_map = {}
