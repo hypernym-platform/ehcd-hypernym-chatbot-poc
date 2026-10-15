@@ -4,9 +4,12 @@ Inspects tool results and user query to determine if a chart/graph is appropriat
 then generates Chart.js-compatible JSON configuration.
 """
 
+import logging
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Brown color palette as specified
 BROWN_COLORS = [
@@ -1424,3 +1427,62 @@ def _build_plotly_config(
         layout["barmode"] = "group"
 
     return {"data": traces, "layout": layout}
+
+
+def validate_output_consistency(
+    chart_data: Optional[Dict], tool_results: Optional[List[Dict]], assistant_text: str
+) -> List[str]:
+    """Deterministic, log-only sanity checks comparing a chart's actual
+    numbers against the raw rows they were built from, and against the
+    text describing them. Returns warning strings for the caller to log —
+    never blocks or rewrites the response, since a false positive here
+    (e.g. the model paraphrased "no projects" instead of writing "0")
+    should never break a legitimate answer. This is observability, not a
+    gate: exactly the kind of check that would have caught the duplicate-
+    tool-call chart-doubling bug (a true count of 3 rendered as 6)
+    automatically instead of needing a human to spot a bad screenshot.
+
+    Reads the actual top-level shape detect_chart_opportunity returns —
+    chart_data["plotly_data"], a list of Plotly trace dicts (x/y for
+    bar/line, labels/values for pie, "name" for the series label) — not
+    the internal {"labels":[...], "datasets":[...]} shape some helpers
+    inside this module use before it gets converted; those never reach
+    the caller directly.
+    """
+    warnings: List[str] = []
+    if not chart_data or not isinstance(tool_results, list):
+        return warnings
+
+    row_count = len(tool_results)
+    text = assistant_text or ""
+
+    for trace in chart_data.get("plotly_data") or []:
+        trace_labels = trace.get("x") or trace.get("labels") or []
+        values = trace.get("y") or trace.get("values") or []
+        numeric_values = [v for v in values if isinstance(v, (int, float))]
+        if not numeric_values:
+            continue
+        # Only meaningful for literal per-row COUNTS — budgets/amounts are
+        # a different unit entirely; summing them against a row count
+        # would never mean anything. The trace's own name is how we know
+        # which kind this is (see _extract_subject_count_chart / the
+        # Case 1 distribution path in _extract_chart_data).
+        if str(trace.get("name", "")).strip().lower() != "count":
+            continue
+
+        total = sum(numeric_values)
+        if total > row_count:
+            warnings.append(
+                f"chart trace 'Count' sums to {total}, which EXCEEDS the "
+                f"{row_count} rows actually fetched this turn (labels={trace_labels}) "
+                f"— likely duplicate-counted data."
+            )
+
+        for label, val in zip(trace_labels, numeric_values):
+            if str(int(val)) not in text:
+                warnings.append(
+                    f"chart shows {label!r} = {val!r} but that number does not "
+                    f"appear anywhere in the response text — possible text/chart mismatch."
+                )
+
+    return warnings

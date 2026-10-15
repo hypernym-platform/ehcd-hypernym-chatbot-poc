@@ -48,10 +48,14 @@ from emb_pace import PacedEmbeddings
 
 # Modular imports
 from rbac import fetch_user_profile
-from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
+from tools import (
+    build_available_tools, run_chatbot_graph, render_tool_result_html,
+    detect_unsupported_action, UNSUPPORTED_ACTION_MESSAGE,
+)
 from chart_engine import (
     detect_chart_opportunity, is_chart_request, detect_palette_from_query,
     CHART_SHOWN_MARKER, recent_turn_had_chart, last_user_query, _encode_palette_marker,
+    validate_output_consistency,
 )
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -579,37 +583,49 @@ async def handle_query(
         chart_intent = {}
         pending_tag = ""
 
-        try:
-            for chunk in run_chatbot_graph(
-                query=query,
-                conversation_history=conversation_history,
-                available_tools=available_tools,
-                user_id=rbac_user_id,
-                user_name=user_name,
-                user_role=user_role,
-                user_email=user_email,
-                user_contact_no=user_contact_no,
-                client=client,
-                model=cfg.AZURE_OPENAI_DEPLOYMENT,
-                pg_conn_fn=pg_conn,
-                policy_cfg=POLICY_CFG,
-                emb=emb,
-                tool_results_collector=tool_results_for_chart,
-                chart_intent_collector=chart_intent,
-            ):
-                assistant_response += chunk
-                plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
-                if plain_text_chunk:
-                    yield plain_text_chunk
+        # Caught before any LLM call at all — this bot has no write tools,
+        # so a request to change/approve/delete/assign something can never
+        # be fulfilled. Declining explicitly here is strictly better than
+        # letting the router free-associate to an unrelated read question
+        # (seen live: "change the Chatbot project status" got answered as
+        # if it were about delayed projects) — faster, free, and certain.
+        if detect_unsupported_action(query):
+            assistant_response = UNSUPPORTED_ACTION_MESSAGE
+            plain_text_chunk, pending_tag = _strip_html_incremental(assistant_response, pending_tag)
+            if plain_text_chunk:
+                yield plain_text_chunk
+        else:
+            try:
+                for chunk in run_chatbot_graph(
+                    query=query,
+                    conversation_history=conversation_history,
+                    available_tools=available_tools,
+                    user_id=rbac_user_id,
+                    user_name=user_name,
+                    user_role=user_role,
+                    user_email=user_email,
+                    user_contact_no=user_contact_no,
+                    client=client,
+                    model=cfg.AZURE_OPENAI_DEPLOYMENT,
+                    pg_conn_fn=pg_conn,
+                    policy_cfg=POLICY_CFG,
+                    emb=emb,
+                    tool_results_collector=tool_results_for_chart,
+                    chart_intent_collector=chart_intent,
+                ):
+                    assistant_response += chunk
+                    plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
+                    if plain_text_chunk:
+                        yield plain_text_chunk
 
-        except Exception as e:
-            logger.error(f"Error in tool response generation: {e}")
-            error_msg = (
-                "I encountered an error processing your request. "
-                "Please try again or rephrase your question."
-            )
-            assistant_response = error_msg
-            yield error_msg
+            except Exception as e:
+                logger.error(f"Error in tool response generation: {e}")
+                error_msg = (
+                    "I encountered an error processing your request. "
+                    "Please try again or rephrase your question."
+                )
+                assistant_response = error_msg
+                yield error_msg
 
         # Detect chart opportunity and build final payload — computed
         # before saving history so CHART_SHOWN_MARKER (below) can record
@@ -635,6 +651,14 @@ async def handle_query(
             logger.error(f"Chart detection error: {e}")
         if chart_data and rows_for_chart:
             save_last_chart_rows(history_key, rows_for_chart)
+
+        # Log-only sanity check — never alters the response, just surfaces
+        # a chart/text/data mismatch for review (see validate_output_consistency).
+        try:
+            for warning in validate_output_consistency(chart_data, rows_for_chart, assistant_response):
+                logger.warning(f"[output-consistency] {warning}")
+        except Exception as e:
+            logger.error(f"Output consistency check error: {e}")
 
         # Save conversation history (plain-text — see _strip_html_for_history)
         history_text = _strip_html_for_history(assistant_response)
@@ -801,22 +825,31 @@ async def websocket_chat(ws: WebSocket):
                 finally:
                     loop.call_soon_threadsafe(async_q.put_nowait, ("done", None))
 
-            loop.run_in_executor(None, _run_graph_sync)
+            # Same reasoning as the REST endpoint — see there. Caught before
+            # the graph ever runs: no LLM call, no latency, no chance of
+            # misrouting a write request into an unrelated read answer.
+            if detect_unsupported_action(query):
+                assistant_response = UNSUPPORTED_ACTION_MESSAGE
+                plain, pending_tag = _strip_html_incremental(assistant_response, pending_tag)
+                if plain:
+                    await ws.send_json({"type": "chunk", "content": plain})
+            else:
+                loop.run_in_executor(None, _run_graph_sync)
 
-            # Consume chunks asynchronously — each chunk is sent immediately
-            while True:
-                msg_type, msg_data = await async_q.get()
-                if msg_type == "done":
-                    break
-                elif msg_type == "error":
-                    assistant_response = "I encountered an error processing your request."
-                    await ws.send_json({"type": "error", "message": assistant_response})
-                    break
-                elif msg_type == "chunk":
-                    assistant_response += msg_data
-                    plain, pending_tag = _strip_html_incremental(msg_data, pending_tag)
-                    if plain:
-                        await ws.send_json({"type": "chunk", "content": plain})
+                # Consume chunks asynchronously — each chunk is sent immediately
+                while True:
+                    msg_type, msg_data = await async_q.get()
+                    if msg_type == "done":
+                        break
+                    elif msg_type == "error":
+                        assistant_response = "I encountered an error processing your request."
+                        await ws.send_json({"type": "error", "message": assistant_response})
+                        break
+                    elif msg_type == "chunk":
+                        assistant_response += msg_data
+                        plain, pending_tag = _strip_html_incremental(msg_data, pending_tag)
+                        if plain:
+                            await ws.send_json({"type": "chunk", "content": plain})
 
             # Chart detection — computed before saving history so
             # CHART_SHOWN_MARKER can record whether this turn had one.
@@ -838,6 +871,13 @@ async def websocket_chat(ws: WebSocket):
                 logger.error(f"WS chart detection error: {e}")
             if chart_data and rows_for_chart:
                 save_last_chart_rows(history_key, rows_for_chart)
+
+            # Log-only sanity check — see the REST endpoint for the same.
+            try:
+                for warning in validate_output_consistency(chart_data, rows_for_chart, assistant_response):
+                    logger.warning(f"[output-consistency] {warning}")
+            except Exception as e:
+                logger.error(f"WS output consistency check error: {e}")
 
             # Save history (plain-text — see _strip_html_for_history)
             history_text = _strip_html_for_history(assistant_response)
