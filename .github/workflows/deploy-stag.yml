@@ -1,0 +1,157 @@
+# STAGING deploy (aks-ehcd-stag, namespace stag). Same flow as deploy-dev.yml.
+#
+# On every push to `staging`:
+#   1. passwordless OIDC login as id-gh-ehcd-stag-deploy (no stored credential)
+#   2. build the deps base image only if requirements.txt changed (skipped when the repo has no
+#      Dockerfile.base); the python base comes from acrehcdstag, never from the dev registry
+#   3. az acr build -> $IMAGE in acrehcdstag
+#   4. render env-stag.tmpl against the GitHub Environment `stag` -> apply as k8s Secret $SERVICE-secrets
+#   5. rollout restart -> picks up BOTH the new image and the new Secret
+#      (envFrom does NOT hot-reload; the restart is what applies config changes)
+#
+# Adding a config value: secret -> add it to the `stag` Environment and `KEY=${KEY}` to env-stag.tmpl.
+#
+# `environment: stag` makes the OIDC subject repo:<org>/<repo>:environment:stag. The matching
+# federated credentials are created by EHCD-Platform/scripts/setup-github-oidc-stag.sh; without them
+# azure/login fails with AADSTS70021.
+name: deploy-stag
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-stag
+  cancel-in-progress: true
+
+env:
+  # ---- EDIT THESE FOUR, nothing else --------------------------------------
+  SERVICE: ehcd-chatbot                 # k8s Deployment name; Secret is $SERVICE-secrets
+  IMAGE: ehcd-chatbot:stag-v1.0          # repo:tag inside the ACR below
+  BASE_REPO: ehcd-chatbot-base          # deps image repo (ignored without Dockerfile.base)
+  ENV_TMPL: env-stag.tmpl                # config template committed in the repo
+  # ---- shared staging-platform constants, same for every service ---------------
+  ACR: acrehcdstag
+  RG: rg-ehcd-stag
+  AKS: aks-ehcd-stag
+  NAMESPACE: stag
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment: stag         # source of the secrets/vars the render step reads
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Dependencies live in $BASE_REPO tagged with a hash of requirements.txt.
+      # Unchanged requirements -> the tag already exists -> the pip install is
+      # skipped entirely and the app build is just a COPY.
+      - name: Build deps base image if requirements.txt changed
+        id: base
+        run: |
+          set -euo pipefail
+          if [ ! -f Dockerfile.base ]; then
+            echo "no Dockerfile.base — single-stage build"
+            exit 0
+          fi
+          BASE_TAG="reqs-$(sha256sum requirements.txt | cut -c1-12)"
+          echo "tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+          if az acr repository show-tags -n "$ACR" --repository "$BASE_REPO" -o tsv 2>/dev/null | grep -qx "$BASE_TAG"; then
+            echo "deps base image current: $BASE_TAG"
+          else
+            az acr build -r "$ACR" -t "$BASE_REPO:$BASE_TAG" \
+              --build-arg "PYBASE=$ACR.azurecr.io/base/python:3.11-slim" \
+              -f Dockerfile.base --platform linux/amd64 .
+          fi
+
+      # No --build-arg APP_ENV: the image must NOT bake an env file. Config comes
+      # from the k8s Secret at runtime, so one image is valid in any environment.
+      - name: Build image in ACR
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "${{ steps.base.outputs.tag }}" ]; then
+            ARGS+=(--build-arg "BASE=$ACR.azurecr.io/$BASE_REPO:${{ steps.base.outputs.tag }}")
+          fi
+          az acr build -r "$ACR" -t "$IMAGE" --platform linux/amd64 "${ARGS[@]}" .
+
+      # Fills ${NAME} placeholders in $ENV_TMPL from the `stag` Environment.
+      # Generic on purpose: the whole secrets/vars context arrives as JSON, so a
+      # new key needs no edit here. Values are never printed — only key names.
+      #   ${NAME}    required -> missing/empty fails the run
+      #   ${NAME:-}  optional -> missing renders empty
+      - name: Render env file from GitHub Environment
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          tmpl_path = os.environ["ENV_TMPL"]
+          pool = {}
+          for blob in (os.environ["SECRETS_JSON"], os.environ["VARS_JSON"]):
+              pool.update(json.loads(blob))
+
+          # ${NAME} or ${NAME:-}. Anything else (a literal $ in a password, a shell
+          # snippet in a value) is passed through untouched — unlike envsubst.
+          PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:-)?\}")
+          missing, out = [], []
+
+          for raw in open(tmpl_path, encoding="utf-8").read().splitlines():
+              if not raw.strip() or raw.lstrip().startswith("#"):
+                  continue                      # --from-env-file wants bare KEY=VALUE
+              def sub(m):
+                  name, optional = m.group(1), m.group(2)
+                  val = pool.get(name)
+                  if val is None or val == "":
+                      if not optional:
+                          missing.append(name)
+                      return ""
+                  return val
+              out.append(PLACEHOLDER.sub(sub, raw))
+
+          if missing:
+              for n in sorted(set(missing)):
+                  print(f"::error::{n} is referenced by {tmpl_path} but is not set "
+                        f"in the 'stag' GitHub Environment")
+              sys.exit(1)
+
+          # A newline inside a value silently corrupts --from-env-file (it splits on
+          # newlines), so fail here rather than debug a half-populated Secret.
+          bad = [l.split("=", 1)[0] for l in out if "\n" in l or "=" not in l]
+          if bad:
+              print(f"::error::malformed or multi-line values: {bad}")
+              sys.exit(1)
+
+          open("env.rendered", "w", encoding="utf-8").write("\n".join(out) + "\n")
+          print("rendered keys:")
+          for l in out:
+              print("  " + l.split("=", 1)[0])
+          PY
+
+      # --file uploads into the run pod's working directory, so the command
+      # references the bare filename. The Secret manifest only ever exists inside
+      # the in-cluster pipe; the printed output is just "secret/... configured".
+      - name: Sync k8s Secret ${{ env.SERVICE }}-secrets
+        run: |
+          az aks command invoke -g "$RG" -n "$AKS" -o tsv \
+            --file env.rendered \
+            --command "kubectl -n $NAMESPACE create secret generic $SERVICE-secrets --from-env-file=env.rendered --dry-run=client -o yaml | kubectl apply -f -"
+
+      - name: Redeploy on staging AKS
+        run: |
+          az aks command invoke -g "$RG" -n "$AKS" -o tsv \
+            --command "kubectl -n $NAMESPACE rollout restart deploy/$SERVICE && kubectl -n $NAMESPACE rollout status deploy/$SERVICE --timeout=240s"

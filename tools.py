@@ -48,6 +48,63 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Unsupported-action detection — this bot is read-only (no write tools
+# exist at all), so a request to CHANGE something must be declined
+# explicitly, not silently misrouted into an unrelated read question. Seen
+# live: "change the Chatbot project status to ongoing" got answered as if
+# it were a question about delayed projects — the router had no tool that
+# fit the request, so it free-associated to something adjacent instead of
+# recognizing the request itself as out of scope. A deterministic check
+# ahead of the router removes that failure mode entirely for the clear
+# cases, at zero latency/cost (no LLM call at all) and zero hallucination
+# risk, rather than hoping the router recognizes its own limits.
+# ---------------------------------------------------------------------------
+
+# A query opening with one of these is virtually always a READ question,
+# even if an action-shaped word (e.g. "status", "created") appears later
+# in it ("what's the status of X", "which tasks were created this month",
+# "can you update me on X" = give me info, not a command). Checked first
+# so these never get flagged — false positives (blocking a real question)
+# are far worse than false negatives (an edge-case write request slipping
+# through to normal routing, same as before this check existed).
+_READ_QUESTION_STARTERS_RE = re.compile(
+    r"^\s*(who|what|which|how|why|when|where|is|are|was|were|does|do|did|"
+    r"can|could|would|should|show|list|give|tell|find|get|has|have)\b",
+    re.IGNORECASE,
+)
+
+# Each alternative requires an imperative verb + a plausible direct object
+# close by, not just the bare presence of a word like "status" or "create"
+# anywhere in the sentence — e.g. "change the colors" never matches (no
+# status/priority/budget/etc. object), "create me a graph about projects"
+# never matches (no "new project", a chart isn't a record).
+_UNSUPPORTED_ACTION_RE = re.compile(
+    r"\b(change|update|set|mark|modify|edit)\b[^.?!]{0,40}\b"
+    r"(status|priority|readiness|budget|manager|assignee|owner)\b[^.?!]{0,20}\b(to|as|=)\b"
+    r"|\b(approve|reject|cancel|delete|remove|close|reassign|assign)\b[^.?!]{0,40}\b"
+    r"(project|task|resolution|meeting|request|direction\s*item|email|office)\b"
+    r"|\bcreate\b[^.?!]{0,30}\bnew\s+(project|task|resolution|meeting|direction\s*item)\b",
+    re.IGNORECASE,
+)
+
+UNSUPPORTED_ACTION_MESSAGE = (
+    "<p>I can only retrieve and display information — I'm not able to make "
+    "changes like updating a status, approving, assigning, or creating "
+    "records. I can show you the current data on this instead, if that "
+    "helps.</p>"
+)
+
+
+def detect_unsupported_action(query: str) -> bool:
+    """True if the query asks the bot to MODIFY data rather than retrieve
+    it. Conservative by design — see the regexes above for the reasoning."""
+    q = query.strip()
+    if not q or _READ_QUESTION_STARTERS_RE.match(q):
+        return False
+    return bool(_UNSUPPORTED_ACTION_RE.search(q))
+
+
+# ---------------------------------------------------------------------------
 # Tool schema definitions (Azure OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
@@ -1730,7 +1787,7 @@ available in the conversation history.
 STRICT RULES:
 - NEVER invent or fabricate EHCD data — only use what the tool results contain.
 - If a tool returns an access denied error, tell the user they do not have permission to view that data.
-- If data is not found, say so clearly rather than guessing.
+- A technical failure (a tool/query error) and a legitimate zero-match result are NOT the same thing — never phrase either one as the other. A specific instruction for which applies to THIS turn is appended below when relevant; if neither is, still say plainly if data is not found rather than guessing.
 - When a tool result contains an explicit count such as total_count, treat that value as authoritative. Never calculate or infer the count by counting returned records.
 
 User information:
@@ -1830,6 +1887,8 @@ class ChatState(TypedDict):
     want_chart: bool
     chart_type: Optional[str]
     tool_call_count: int
+    had_technical_error: bool
+    had_empty_result: bool
     round_count: int
     needs_more_tools: bool
     final_response: str
@@ -2011,6 +2070,16 @@ def tool_executor_node(state: ChatState) -> dict:
 
     seen_this_round = set()
 
+    # Four distinct outcomes a tool call can have this turn, tracked
+    # separately so answer_node can say the RIGHT thing for each instead of
+    # every non-success case collapsing into the same vague "no data
+    # found" — a technical failure (DB error, rejected query) is not the
+    # same fact as a filter that legitimately matched zero real rows, and
+    # conflating them either hides a real problem behind "nothing exists"
+    # or makes a normal empty result sound like something broke.
+    had_technical_error = False
+    had_empty_result = False
+
     # Append tool results to messages and collect for chart detection
     for tool_call, fn_args, result_str, _, _ in results:
         try:
@@ -2021,6 +2090,19 @@ def tool_executor_node(state: ChatState) -> dict:
         sig = _tool_sig(tool_call.function.name, fn_args)
         is_duplicate_call = sig in prior_signatures or sig in seen_this_round
         seen_this_round.add(sig)
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            # Access-denied is already its own well-handled case (a
+            # dedicated ANSWER_SYSTEM_PROMPT rule tells the model exactly
+            # how to phrase it) — anything else here is a genuine technical
+            # failure (DB error, a rejected/invalid query, a tool exception),
+            # not "no data exists".
+            if not parsed["error"].lower().startswith("access denied"):
+                had_technical_error = True
+        elif isinstance(parsed, list) and len(parsed) == 0:
+            had_empty_result = True
+        elif isinstance(parsed, dict) and parsed.get("total_count") == 0:
+            had_empty_result = True
 
         if isinstance(parsed, (list, dict)) and not is_duplicate_call:
             for filt in _PROVENANCE_FILTERS:
@@ -2089,6 +2171,8 @@ def tool_executor_node(state: ChatState) -> dict:
         "want_chart": bool(state.get("want_chart")) or want_chart,
         "chart_type": chart_type or state.get("chart_type"),
         "tool_call_count": state.get("tool_call_count", 0) + len(results),
+        "had_technical_error": bool(state.get("had_technical_error")) or had_technical_error,
+        "had_empty_result": bool(state.get("had_empty_result")) or had_empty_result,
         "round_count": state.get("round_count", 0) + 1,
     }
 
@@ -2191,14 +2275,30 @@ def answer_node(state: ChatState) -> dict:
     else:
         answer_system += "\n\nNo chart will be shown below this response — do not say one is provided/shown/below."
 
-    # Replace the system prompt with the leaner answer prompt. Prior turns
-    # (if any) go between the system prompt and this turn's user/tool
-    # exchange so the model has real conversational context — previously
-    # this node saw only the current message, so a bare "no" or "but"
-    # replying to something said earlier had nothing to be "replying to".
-    answer_messages = (
-        [{"role": "system", "content": answer_system}] + history_messages + messages[1:]
-    )
+    # Same grounding principle, for which of three distinct outcomes this
+    # turn's data lookup actually had — without this the model has no way
+    # to tell "nothing matched your filter" (a real, legitimate fact) apart
+    # from "the lookup technically failed" (a problem on this end), and
+    # both can otherwise collapse into the same vague "no data found".
+    # Access-denied already has its own STRICT RULES line above — this is
+    # for the two cases that didn't.
+    if state.get("had_technical_error"):
+        answer_system += (
+            "\n\nOne of this turn's data lookups failed due to a technical "
+            "problem (not because the data doesn't exist) — tell the user "
+            "plainly that something went wrong retrieving the data and "
+            "they should try again or rephrase. Do not say 'no data found' "
+            "and do not guess at an answer from anything else in context."
+        )
+    elif state.get("had_empty_result"):
+        answer_system += (
+            "\n\nThis turn's data lookup succeeded but matched zero "
+            "records — this is a legitimate result, not a technical "
+            "problem. Say plainly that nothing matched the given criteria."
+        )
+
+    # Replace the system prompt with the leaner answer prompt
+    answer_messages = [{"role": "system", "content": answer_system}] + history_messages + messages[1:]
 
     full_text = ""
     _t0 = time.time()
@@ -2443,6 +2543,8 @@ def run_chatbot_graph(
         "want_chart": False,
         "chart_type": None,
         "tool_call_count": 0,
+        "had_technical_error": False,
+        "had_empty_result": False,
         "round_count": 0,
         "needs_more_tools": False,
         "final_response": "",

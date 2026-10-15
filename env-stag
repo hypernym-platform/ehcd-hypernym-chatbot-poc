@@ -1,43 +1,70 @@
 # env-stag — STAGING configuration for ehcd-chatbot.
 # Mirrors the be-hn-ehdc convention: Dockerfile does `cp env-${APP_ENV} .env`.
+# Staging configuration TEMPLATE — safe to commit, contains NO secret values.
+#
+# CI (.github/workflows/deploy-stag.yml (to be added with the staging CI)) runs this through `envsubst`, filling the
+# ${...} placeholders from the repo's GitHub Environment `stag`, and applies the
+# result as the k8s Secret `ehcd-chatbot-secrets` in namespace stag. The Deployment
+# consumes it with `envFrom.secretRef`.
 #
 # app.py:15 calls load_dotenv() with the default override=False, so real environment
 # variables WIN over this file. The `ehcd-chatbot-secrets` k8s Secret is the runtime
 # source of truth; this file is the committed fallback and key-list record.
+# Nothing here is baked into the image: the Dockerfile no longer copies an env
+# file, so the same image runs in any environment.
 #
 # PLACEHOLDERS ONLY — no staging environment exists yet. Fill when staging is built.
 # Present so that `--build-arg APP_ENV=stag` does not fail on a missing file.
 # Target state is Key Vault + CSI driver (checklist P10).
+# Adding a setting:
+#   non-secret -> write the literal value below
+#   secret     -> add ${NAME} below AND add NAME to the GitHub Environment
+#                 (scripts/sync-chatbot-env-secrets.sh in the hn_devops repo)
+#                 AND to the `env:` map + REQUIRED list of the render step.
+#
+# REDIS_HOST / REDIS_PORT are deliberately absent — the Deployment sets them
+# directly (k8s_yamls/staging/codebase_yamls/ehcd-chatbot.yaml), and a
+# container `env` entry wins over `envFrom`.
 
-# --- postgres — RBAC lookups against the ehcd-backend database ---
-PG_HOST=<fill>
-PG_DB=<fill>
-PG_USER=<fill>
-PG_PASS=<fill>
-PG_PORT=<fill>
-RBAC_USER_ROLES_TABLE=<fill>
-DB_SCHEMA=<fill>
+# --- postgres (postgres-ehcd-stag, database ehcd_be_stag) ----------------------
+PG_HOST=postgres-ehcd-stag.postgres.database.azure.com
+PG_DB=ehcd_be_stag
+PG_USER=ehcd_stag_app
+PG_PASS=${PG_PASS}
+PG_PORT=5432
 
-# --- azure openai ---
-ENDPOINT_URL=<fill>
-DEPLOYMENT_NAME=<fill>
-AZURE_OPENAI_API_KEY=<fill>
-AZURE_OPENAI_API_VERSION=<fill>
-AZURE_EMBEDDING_DEPLOYMENT=<fill>
+RBAC_USER_ROLES_TABLE=user_management_user_roles
+DB_SCHEMA=public
 
-# --- azure blob — education xlsx + policy pdfs (policy prefix is hardcoded "policies/") ---
-AZURE_BLOB_CONN_STR=<fill>
-AZURE_BLOB_CONTAINER=<fill>
-AZURE_BLOB_PREFIX=<fill>
+# --- azure openai ------------------------------------------------------------
+ENDPOINT_URL=https://app-openai-uae.cognitiveservices.azure.com/
+DEPLOYMENT_NAME=gpt-4o
+AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AZURE_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 
-# --- jwt — issued by ehcd-backend, verified here. MUST match the backend byte for byte ---
-JWT_SECRET=<fill>
-JWT_EXPIRY_HOURS=<fill>
-USER_ID_CLAIM=<fill>
+# --- blob storage (policy documents synced into DATA_ROOT) -------------------
+AZURE_BLOB_CONN_STR=${AZURE_BLOB_CONN_STR}
+# Staging reads from its own container, in its own storage account (saehcdstag),
+# so staging ingestion never touches the live policy corpus.
+AZURE_BLOB_CONTAINER=ehdc-test-bot-stag
+AZURE_BLOB_PREFIX=policies/
 
-# --- redis — in-cluster service (infra_yamls/redis.yaml) ---
-REDIS_HOST=<fill>
-REDIS_PORT=<fill>
+# --- auth --------------------------------------------------------------------
+# Shared with be-hn-ehdc once the backend signs its calls to /api/query.
+JWT_SECRET=${JWT_SECRET}
+JWT_EXPIRY_HOURS=24
+USER_ID_CLAIM=sub/user_id/id
 
-# --- storage ---
-DATA_ROOT=<fill>
+# --- elevenlabs voice (app.py /voice/*) --------------------------------------
+# Optional: leave the GitHub Environment secrets unset and these render empty,
+# which disables the voice endpoints. ELEVENLABS_CUSTOMLLM_SHARED_SECRET empty
+# makes the custom-LLM webhook reject every request (app.py fails closed).
+ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+ELEVENLABS_AGENT_ID=${ELEVENLABS_AGENT_ID}
+ELEVENLABS_CUSTOMLLM_SHARED_SECRET=${ELEVENLABS_CUSTOMLLM_SHARED_SECRET}
+
+# --- runtime -----------------------------------------------------------------
+# emptyDir volume in the Deployment; FAISS indexes + synced docs are rebuilt on
+# restart, so nothing here survives a rollout.
+DATA_ROOT=/app/data
