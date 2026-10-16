@@ -51,7 +51,11 @@ MEETING_STATUS_MAP = {
     1: "New", 2: "Under Review", 3: "Confirmed",
     4: "Completed", 5: "Rescheduled", 6: "Cancelled",
 }
-# "Upcoming" (shown as its own summary count in the UI) = Confirmed + Rescheduled.
+# "Upcoming" = Confirmed + Rescheduled AND not already past its scheduled
+# date (see the status=="upcoming" branch below, which ANDs both in) — the
+# dashboard's own "Upcoming" tile counts by status alone, but a Confirmed
+# meeting whose date has already passed isn't "upcoming" by any sense a
+# chat answer means the word, so the two diverge on purpose here.
 MEETING_UPCOMING_STATUSES = [3, 5]
 MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
 MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 3: "Delegation Visit", 4: "Facility Visit"}
@@ -1139,7 +1143,13 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         status_val = str(filters["status"]).lower().replace("_", " ")
         reverse_map = {v.lower(): k for k, v in MEETING_STATUS_MAP.items()}
         if status_val == "upcoming":
-            conditions.append("m.status = ANY(%s)")
+            # Status alone (Confirmed/Rescheduled) isn't enough — a
+            # Confirmed meeting whose date has already passed is not
+            # "upcoming" in any sense a chat user means by the word, even
+            # though the dashboard's own status-tile convention counted it
+            # that way. Both conditions together: still in an
+            # upcoming-shaped status AND not already in the past.
+            conditions.append("m.status = ANY(%s) AND m.scheduled_date >= (NOW() AT TIME ZONE 'Asia/Dubai')::date")
             params.append(MEETING_UPCOMING_STATUSES)
         elif status_val in reverse_map:
             conditions.append("m.status = %s")
@@ -1284,6 +1294,10 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
     if filters.get("created_after"):
         conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["created_after"])
+
+    if filters.get("created_before"):
+        conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date <= %s")
+        params.append(filters["created_before"])
 
     if filters.get("older_than_days"):
         conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date < ((NOW() AT TIME ZONE 'Asia/Dubai')::date - (%s || ' days')::interval)")

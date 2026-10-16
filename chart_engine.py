@@ -5,6 +5,7 @@ then generates Chart.js-compatible JSON configuration.
 """
 
 import logging
+import math
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -706,10 +707,17 @@ def _extract_grouped_budget_chart(
     }
 
 
+# "weekly" excludes "weekly action(s)" — that's this app's own entity name
+# (the Theyab-workspace module), not a request to bucket by week. Seen
+# live: "Weekly Actions by priority" false-triggered this case purely
+# because "weekly" appears in the entity's name, producing a date-grouped
+# chart instead of the requested priority breakdown — the text answer and
+# the actual chart ended up describing two completely different things.
 _DATE_BUCKET_RE = re.compile(
-    r"\b(per day|daily|each day|per week|weekly|per month|monthly|trend|trends|over time)\b",
+    r"\b(per day|daily|each day|per week|weekly(?!\s+actions?)|per month|monthly|trend|trends|over time)\b",
     re.IGNORECASE,
 )
+_WEEK_GRANULARITY_RE = re.compile(r"\b(per week|weekly(?!\s+actions?)|each week)\b", re.IGNORECASE)
 # Checked in this order — any of these present in a row is used as the
 # date to bucket by, first match wins.
 _DATE_FIELD_CANDIDATES = (
@@ -761,25 +769,61 @@ def _extract_date_bucket_chart(query_lower: str, tool_results: List[Dict]) -> Op
     # phrasing means bucket-by-that-size; everything else defaults to
     # daily buckets, the only granularity that's ever useful within a
     # single named month/week.
-    if any(p in query_lower for p in ("per week", "weekly", "each week")):
+    if _WEEK_GRANULARITY_RE.search(query_lower):
         granularity = "week"
     elif any(p in query_lower for p in ("per month", "monthly", "each month")):
         granularity = "month"
     else:
         granularity = "day"
 
+    def _bucket_key(parsed: datetime) -> str:
+        if granularity == "day":
+            return parsed.strftime("%Y-%m-%d")
+        if granularity == "week":
+            return (parsed - timedelta(days=parsed.weekday())).strftime("%Y-%m-%d")
+        return parsed.strftime("%Y-%m")
+
+    chart_type = "line" if "trend" in query_lower or granularity != "day" else "bar"
+
+    # Labels backfilled by tool_executor_node's boolean-provenance
+    # mechanism (_BOOLEAN_PROVENANCE_LABELS in tools.py) — when exactly 2
+    # distinct values are present, this is a two-series trend ("unread
+    # and read email trends"), not one merged count. Without this split,
+    # two separate is_read=True/False calls' rows land merged into a
+    # single misleading "Count" line that can't distinguish them at all.
+    for split_key in ("is_read_label", "workflow_started_label", "is_confirmed_label"):
+        split_values = sorted({
+            row[split_key] for row in tool_results
+            if isinstance(row, dict) and row.get(split_key)
+        })
+        if len(split_values) != 2:
+            continue
+        buckets_by_value: Dict[str, Dict[str, int]] = {v: {} for v in split_values}
+        for row in tool_results:
+            parsed = _parse_date(row.get(date_field))
+            val = row.get(split_key)
+            if not parsed or val not in buckets_by_value:
+                continue
+            key = _bucket_key(parsed)
+            buckets_by_value[val][key] = buckets_by_value[val].get(key, 0) + 1
+        all_keys = sorted({k for v in buckets_by_value.values() for k in v})
+        if len(all_keys) < 2:
+            break  # too sparse to chart as a trend — fall through to the merged series
+        return {
+            "labels": all_keys,
+            "datasets": [
+                {"label": v, "data": [buckets_by_value[v].get(k, 0) for k in all_keys]}
+                for v in split_values
+            ],
+            "chart_type": chart_type,
+        }
+
     buckets: Dict[str, int] = {}
     for row in tool_results:
         parsed = _parse_date(row.get(date_field))
         if not parsed:
             continue
-        if granularity == "day":
-            key = parsed.strftime("%Y-%m-%d")
-        elif granularity == "week":
-            key = (parsed - timedelta(days=parsed.weekday())).strftime("%Y-%m-%d")
-        else:
-            key = parsed.strftime("%Y-%m")
-        buckets[key] = buckets.get(key, 0) + 1
+        buckets[_bucket_key(parsed)] = buckets.get(_bucket_key(parsed), 0) + 1
 
     if len(buckets) < 2:
         return None
@@ -787,7 +831,7 @@ def _extract_date_bucket_chart(query_lower: str, tool_results: List[Dict]) -> Op
     return {
         "labels": sorted_keys,
         "datasets": [{"label": "Count", "data": [buckets[k] for k in sorted_keys]}],
-        "chart_type": "line" if "trend" in query_lower or granularity != "day" else "bar",
+        "chart_type": chart_type,
     }
 
 
@@ -1381,6 +1425,23 @@ def _query_names_chart_type(query: str) -> bool:
     return any(w in query for words in _CHART_TYPE_WORDS.values() for w in words)
 
 
+def _nice_integer_dtick(max_value: float) -> int:
+    """A whole-number Y-axis tick interval, so count data (never
+    fractional) shows gridlines like 1, 2, 3 instead of Plotly's default
+    auto-ticks for a small numeric range, which land on fractions like 1,
+    1.5, 2, 2.5 — not a missing label, just a confusing axis for a count
+    ("2.5 emails" means nothing)."""
+    if max_value <= 10:
+        return 1
+    raw_step = max_value / 8
+    magnitude = 10 ** math.floor(math.log10(raw_step))
+    for mult in (1, 2, 5, 10):
+        step = mult * magnitude
+        if step >= raw_step:
+            return int(step)
+    return int(magnitude * 10)
+
+
 def _build_plotly_config(
     chart_type: str, labels: List[str], datasets: List[Dict], palette_colors: List[str] = BROWN_COLORS
 ) -> Dict[str, Any]:
@@ -1425,6 +1486,20 @@ def _build_plotly_config(
 
     if chart_type == "bar":
         layout["barmode"] = "group"
+
+    # Budget figures (Allocated/Spent/Remaining) are already formatted by
+    # the frontend ("2M" etc.) — adding our own dtick/tickformat here
+    # risked clashing with that, so this is scoped to non-budget (count)
+    # charts only, by the one signal that reliably tells them apart: the
+    # budget triple's dataset labels are always exactly these three.
+    is_budget_chart = any(ds.get("label") in ("Allocated", "Spent", "Remaining") for ds in datasets)
+    if chart_type in ("bar", "line") and not is_budget_chart:
+        all_values = [v for ds in datasets for v in ds.get("data", []) if isinstance(v, (int, float))]
+        if all_values:
+            layout["yaxis"] = {
+                "dtick": _nice_integer_dtick(max(all_values)),
+                "rangemode": "tozero",
+            }
 
     return {"data": traces, "layout": layout}
 
