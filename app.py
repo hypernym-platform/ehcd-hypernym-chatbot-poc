@@ -351,6 +351,34 @@ def save_last_chart_rows(user_key: str, rows: list):
         logger.error(f"[CHART_ROWS][SAVE] Failed for key={redis_key}: {e}")
 
 
+def get_last_meeting_date_filter(user_key: str) -> dict:
+    """The date-constraining filter (scheduled_month, created_after, etc.)
+    actually used by the last list_sg_office_meetings call that had one.
+    A bare continuation reference ("show them please") carries no new
+    criteria of its own — the router sometimes re-calls with NO date
+    filter at all instead of re-applying the one still being discussed
+    (seen live: "26 meetings received 1-7 Oct" -> "show them please"
+    returned ALL meetings, Sept through Nov, not the 26). Raw tool-call
+    arguments are never part of persisted conversation history (only the
+    final text is), so this is the only place that filter survives
+    between turns."""
+    redis_key = f"user_{user_key}_meeting_date_filter"
+    try:
+        raw = redis_client.get(redis_key)
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.error(f"[MEETING_FILTER][GET] Failed for key={redis_key}: {e}")
+        return {}
+
+
+def save_last_meeting_date_filter(user_key: str, filters: dict):
+    redis_key = f"user_{user_key}_meeting_date_filter"
+    try:
+        redis_client.set(redis_key, json.dumps(filters, ensure_ascii=False, default=str), ex=3600)
+    except Exception as e:
+        logger.error(f"[MEETING_FILTER][SAVE] Failed for key={redis_key}: {e}")
+
+
 def save_conversation_history(user_key: str, history: list):
     redis_key = f"user_{user_key}_history"
 
@@ -620,6 +648,8 @@ async def handle_query(
         assistant_response = ""
         tool_results_for_chart = []
         chart_intent = {}
+        meeting_date_filter = {}
+        cached_meeting_filter = get_last_meeting_date_filter(history_key)
         pending_tag = ""
 
         # Caught before any LLM call at all — this bot has no write tools,
@@ -652,6 +682,8 @@ async def handle_query(
                     redis_client=redis_client,
                     tool_results_collector=tool_results_for_chart,
                     chart_intent_collector=chart_intent,
+                    cached_meeting_date_filter=cached_meeting_filter,
+                    meeting_date_filter_collector=meeting_date_filter,
                 ):
                     assistant_response += chunk
                     plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
@@ -705,6 +737,7 @@ async def handle_query(
         # failed first attempt.
         if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
             retry_tool_results, retry_chart_intent, retry_response = [], {}, ""
+            retry_meeting_filter = {}
             try:
                 for chunk in run_chatbot_graph(
                     query=query, conversation_history=conversation_history,
@@ -715,6 +748,8 @@ async def handle_query(
                     policy_cfg=POLICY_CFG, emb=emb,
                     tool_results_collector=retry_tool_results,
                     chart_intent_collector=retry_chart_intent,
+                    cached_meeting_date_filter=cached_meeting_filter,
+                    meeting_date_filter_collector=retry_meeting_filter,
                 ):
                     retry_response += chunk
             except Exception as e:
@@ -741,8 +776,17 @@ async def handle_query(
                     rows_for_chart = retry_rows
                     chart_data = retry_chart_data
                     chart_palette = retry_palette
+                    if retry_meeting_filter:
+                        meeting_date_filter = retry_meeting_filter
                     if rows_for_chart:
                         save_last_chart_rows(history_key, rows_for_chart)
+
+        # Cache this turn's actual meeting date filter (if any) for a
+        # bare continuation reference next turn — see
+        # get_last_meeting_date_filter for why this can't be reconstructed
+        # from conversation history alone.
+        if meeting_date_filter:
+            save_last_meeting_date_filter(history_key, meeting_date_filter)
 
         # Log-only sanity check — never alters the response, just surfaces
         # a chart/text/data mismatch for review (see validate_output_consistency).
@@ -1048,6 +1092,8 @@ async def websocket_chat(ws: WebSocket):
             assistant_response = ""
             tool_results_for_chart = []
             chart_intent = {}
+            meeting_date_filter = {}
+            cached_meeting_filter = get_last_meeting_date_filter(history_key)
             pending_tag = ""
             async_q = asyncio.Queue()
             loop = asyncio.get_event_loop()
@@ -1072,6 +1118,8 @@ async def websocket_chat(ws: WebSocket):
                         redis_client=redis_client,
                         tool_results_collector=tool_results_for_chart,
                         chart_intent_collector=chart_intent,
+                        cached_meeting_date_filter=cached_meeting_filter,
+                        meeting_date_filter_collector=meeting_date_filter,
                     ):
                         loop.call_soon_threadsafe(async_q.put_nowait, ("chunk", chunk))
                 except Exception as e:
@@ -1134,6 +1182,7 @@ async def websocket_chat(ws: WebSocket):
             # streaming needed here, just the final text.
             if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
                 retry_tool_results, retry_chart_intent = [], {}
+                retry_meeting_filter = {}
 
                 def _run_retry_sync():
                     text = ""
@@ -1146,6 +1195,8 @@ async def websocket_chat(ws: WebSocket):
                         policy_cfg=POLICY_CFG, emb=emb,
                         tool_results_collector=retry_tool_results,
                         chart_intent_collector=retry_chart_intent,
+                        cached_meeting_date_filter=cached_meeting_filter,
+                        meeting_date_filter_collector=retry_meeting_filter,
                     ):
                         text += c
                     return text
@@ -1177,8 +1228,15 @@ async def websocket_chat(ws: WebSocket):
                         rows_for_chart = retry_rows
                         chart_data = retry_chart_data
                         chart_palette = retry_palette
+                        if retry_meeting_filter:
+                            meeting_date_filter = retry_meeting_filter
                         if rows_for_chart:
                             save_last_chart_rows(history_key, rows_for_chart)
+
+            # Cache this turn's actual meeting date filter — see the REST
+            # endpoint for the same.
+            if meeting_date_filter:
+                save_last_meeting_date_filter(history_key, meeting_date_filter)
 
             # Log-only sanity check — see the REST endpoint for the same.
             try:
