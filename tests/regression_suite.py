@@ -68,16 +68,23 @@ class Harness:
             self.superadmin_tools = build_available_tools(conn, SUPERADMIN_ID)
             self.marwan_tools = build_available_tools(conn, MARWAN_ID)
 
-    def run_turn(self, query, history, user_id=SUPERADMIN_ID, user_name=SUPERADMIN_NAME, tools=None):
+    def run_turn(self, query, history, user_id=SUPERADMIN_ID, user_name=SUPERADMIN_NAME, tools=None, meeting_filter_cache=None):
         """Runs one live turn through the real graph, mirroring app.py's own
         pipeline (router -> tools -> answer -> chart detection) exactly, so
-        a pass here means the real app would behave the same way."""
+        a pass here means the real app would behave the same way.
+
+        meeting_filter_cache — pass the SAME dict across calls within one
+        logical conversation to mirror app.py's Redis-backed
+        get/save_last_meeting_date_filter cache (see there for why this
+        can't be reconstructed from conversation history alone). Omit for
+        tests that don't involve a meeting-date continuation reference."""
         tools = tools or self.superadmin_tools
         recent_had_chart = recent_turn_had_chart(history)
         previous_query = last_user_query(history)
         history.append({"role": "user", "content": query})
         tool_results = []
         chart_intent = {}
+        meeting_filter_out = {}
         resp = ""
         for chunk in run_chatbot_graph(
             query=query, conversation_history=history, available_tools=tools,
@@ -85,8 +92,13 @@ class Harness:
             client=app.client, model=app.cfg.AZURE_OPENAI_DEPLOYMENT, pg_conn_fn=app.pg_conn,
             policy_cfg=app.POLICY_CFG, emb=app.emb, tool_results_collector=tool_results,
             chart_intent_collector=chart_intent,
+            cached_meeting_date_filter=meeting_filter_cache or {},
+            meeting_date_filter_collector=meeting_filter_out,
         ):
             resp += chunk
+        if meeting_filter_cache is not None and meeting_filter_out:
+            meeting_filter_cache.clear()
+            meeting_filter_cache.update(meeting_filter_out)
         palette = detect_palette_from_query(query, history)
         chart_data = None
         try:
@@ -426,6 +438,34 @@ def test_all_meetings_in_month_keeps_date_not_status(h):
     assert len(r.tool_results) == expected, (
         f"expected {expected} (October-scoped), got {len(r.tool_results)} — "
         f"the 'all X' and month-enforcement guards may be conflicting"
+    )
+
+
+@test("date_filters")
+def test_bare_continuation_reuses_meeting_date_filter(h):
+    """Live bug: "26 meetings received 1-7 Oct" -> "show them please"
+    returned ALL meetings (Sept through Nov), not the 26 — a bare
+    continuation reference carries no new criteria of its own, and raw
+    tool-call arguments are never part of persisted conversation history,
+    so the router had nothing to rebuild the original filter from. Fixed
+    with a Redis-backed last-filter cache (get/save_last_meeting_date_filter
+    in app.py) threaded through run_chatbot_graph; meeting_filter_cache
+    here mirrors that across the two run_turn calls."""
+    cache = {}
+    history = []
+    r1 = h.run_turn(
+        "How many meetings were received from 1 Oct to 7 Oct 2026 using system timezone?",
+        history, meeting_filter_cache=cache,
+    )
+    history = r1.history
+    assert cache, "expected the first turn's date filter to be captured into the cache"
+    first_count = len(r1.tool_results)
+    assert first_count > 0, "test precondition failed: no meetings matched 1-7 Oct at all"
+
+    r2 = h.run_turn("show them please", history, meeting_filter_cache=cache)
+    assert len(r2.tool_results) == first_count, (
+        f"'show them please' should reuse the same {first_count}-row filter from the prior turn, "
+        f"got {len(r2.tool_results)} rows — the continuation-cache fix may have regressed"
     )
 
 

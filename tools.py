@@ -1767,6 +1767,8 @@ class ChatState(TypedDict):
     had_technical_error: bool
     had_empty_result: bool
     all_items_unfiltered: bool
+    cached_meeting_date_filter: dict
+    meeting_date_filter: dict
     needs_more_tools: bool
     final_response: str
     chunk_queue: Any
@@ -1886,10 +1888,23 @@ _MONTH_NAME_RE = re.compile(
 )
 _YEAR_NEAR_MONTH_RE = re.compile(r"\b(20\d{2})\b")
 _MEETING_DATE_FILTER_KEYS = {
-    "scheduled_month", "scheduled_after", "scheduled_before", "scheduled_on",
+    "scheduled_month", "scheduled_year", "scheduled_after", "scheduled_before", "scheduled_on",
     "scheduled_today", "scheduled_this_week", "scheduled_tomorrow",
-    "scheduled_this_month", "date_filters",
+    "scheduled_this_month", "date_filters", "created_after", "created_before",
 }
+
+# A bare reference back to "the same thing we were just discussing"
+# ("show them please", "please show them only") carries no new criteria
+# of its own — raw tool-call arguments from a prior turn are never part
+# of persisted conversation history (only the final text is), so without
+# an explicit cache the router has nothing to reconstruct the original
+# filter from and sometimes just drops it, returning everything instead
+# of the subset still being discussed. Proximity-based (verb near
+# pronoun) rather than anchored to the start of the string, since "please
+# show them only" and "show them please" both need to match.
+_BARE_CONTINUATION_RE = re.compile(
+    r"\b(show|list|display|give)\b.{0,12}\b(them|it|those|these)\b", re.IGNORECASE
+)
 
 
 def tool_executor_node(state: ChatState) -> dict:
@@ -1963,6 +1978,24 @@ def tool_executor_node(state: ChatState) -> dict:
             if year_match:
                 fn_args["scheduled_year"] = int(year_match.group(1))
 
+        effective_meeting_date_filter = {}
+        if (
+            fn_name == "list_sg_office_meetings"
+            and not (_MEETING_DATE_FILTER_KEYS & set(fn_args))
+            and _BARE_CONTINUATION_RE.search(current_query_lower)
+            and state.get("cached_meeting_date_filter")
+        ):
+            # Live bug: "26 meetings received 1-7 Oct" -> "show them
+            # please" returned ALL meetings (Sept through Nov), not the
+            # 26 — this turn names no new criteria, so there's nothing
+            # for the router to rebuild the original filter from. Reapply
+            # the filter that actually produced the data being discussed.
+            fn_args.update(state["cached_meeting_date_filter"])
+        if fn_name == "list_sg_office_meetings":
+            effective_meeting_date_filter = {
+                k: v for k, v in fn_args.items() if k in _MEETING_DATE_FILTER_KEYS
+            }
+
         valid_keys = _VALID_ARG_KEYS_BY_TOOL.get(fn_name)
         if valid_keys is not None:
             unknown = set(fn_args) - valid_keys
@@ -1984,7 +2017,7 @@ def tool_executor_node(state: ChatState) -> dict:
                 policy_cfg=policy_cfg,
                 emb=emb_obj,
             )
-        return tool_call, fn_args, result_str, want_chart, chart_type, forced_all_unfiltered
+        return tool_call, fn_args, result_str, want_chart, chart_type, forced_all_unfiltered, effective_meeting_date_filter
 
     # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
@@ -1995,15 +2028,21 @@ def tool_executor_node(state: ChatState) -> dict:
     # regex over the user's words guessing after the fact. Last explicit
     # chart_type wins; a null just means "keep whatever type was used
     # before" (resolved later, in app.py, against the conversation history).
-    want_chart = any(w for _, _, _, w, _, _ in results)
-    chart_type = next((c for _, _, _, _, c, _ in results if c), None)
+    want_chart = any(w for _, _, _, w, _, _, _ in results)
+    chart_type = next((c for _, _, _, _, c, _, _ in results if c), None)
     # True whenever this turn's "all X" guard above actually stripped a
     # filter — grounds answer_node so its own prose can't echo a narrower
     # qualifier ("upcoming") from earlier conversation history even
     # though the data itself is correctly unfiltered (seen live: the
     # chart was right, 28/28 meetings, but the text still said "all
     # upcoming external meetings" — a prose-only echo, not a data bug).
-    all_items_unfiltered = any(f for _, _, _, _, _, f in results)
+    all_items_unfiltered = any(f for _, _, _, _, _, f, _ in results)
+    # Whichever date filter actually constrained this turn's meeting
+    # query (router-chosen, month-enforced, or continuation-cache-reused)
+    # — carried out to app.py so it can be cached for the NEXT turn's
+    # own continuation references. Last non-empty one wins; normally only
+    # one list_sg_office_meetings call happens per turn anyway.
+    meeting_date_filter = next((m for *_, m in results if m), {})
 
     # The filter a result was fetched under doesn't always survive as a
     # real field on the rows themselves (e.g. project_manager has no
@@ -2077,7 +2116,7 @@ def tool_executor_node(state: ChatState) -> dict:
     had_empty_result = False
 
     # Append tool results to messages and collect for chart detection
-    for tool_call, fn_args, result_str, _, _, _ in results:
+    for tool_call, fn_args, result_str, _, _, _, _ in results:
         try:
             parsed = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
@@ -2184,6 +2223,7 @@ def tool_executor_node(state: ChatState) -> dict:
         "had_technical_error": bool(state.get("had_technical_error")) or had_technical_error,
         "had_empty_result": bool(state.get("had_empty_result")) or had_empty_result,
         "all_items_unfiltered": bool(state.get("all_items_unfiltered")) or all_items_unfiltered,
+        "meeting_date_filter": meeting_date_filter or state.get("meeting_date_filter") or {},
     }
 
 
@@ -2421,6 +2461,8 @@ def run_chatbot_graph(
     emb=None,
     tool_results_collector: list = None,
     chart_intent_collector: dict = None,
+    cached_meeting_date_filter: dict = None,
+    meeting_date_filter_collector: dict = None,
 ):
     """
     Run the LangGraph chatbot and yield response chunks.
@@ -2495,6 +2537,8 @@ def run_chatbot_graph(
         "had_technical_error": False,
         "had_empty_result": False,
         "all_items_unfiltered": False,
+        "cached_meeting_date_filter": cached_meeting_date_filter or {},
+        "meeting_date_filter": {},
         "needs_more_tools": False,
         "final_response": "",
         "chunk_queue": chunk_q,
@@ -2529,3 +2573,5 @@ def run_chatbot_graph(
     if chart_intent_collector is not None and graph_result[0]:
         chart_intent_collector["want_chart"] = bool(graph_result[0].get("want_chart"))
         chart_intent_collector["chart_type"] = graph_result[0].get("chart_type")
+    if meeting_date_filter_collector is not None and graph_result[0]:
+        meeting_date_filter_collector.update(graph_result[0].get("meeting_date_filter") or {})
