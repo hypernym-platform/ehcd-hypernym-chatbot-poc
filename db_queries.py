@@ -163,10 +163,28 @@ MEETING_DEFAULT_FIELDS = (
     "readiness_summary",
 )
 MEETING_COLUMN_ORDER = (
-    "meeting", "requester", "status_label", "scheduled_date",
+    "meeting", "requester", "status_label", "received_date", "scheduled_date",
     "scheduled_time", "venue_label", "priority_label", "coordinator_name",
     "facilities_summary", "readiness_summary", "visitor_arrival_summary",
 )
+
+
+def _filters_by_received_date(filters: dict) -> bool:
+    """True when the query actually constrains created_at ("received")
+    rather than scheduled_date — created_after/created_before, or the
+    generic date_filters escape hatch pointed at the created_at column.
+    Used to decide whether "Received Date" needs to be in the default
+    table, since scheduled_date and created_at are different dates (a
+    meeting can be received in one week and scheduled for a date weeks
+    later) and a table showing only scheduled_date looks "wrong" to a
+    reader who filtered by received date, even though the filter itself
+    was applied correctly."""
+    if filters.get("created_after") or filters.get("created_before"):
+        return True
+    for d in filters.get("date_filters") or []:
+        if isinstance(d, dict) and d.get("column") == "created_at":
+            return True
+    return False
 
 # Preset for "meetings with incomplete visitor readiness" (visitors_not_ready
 # filter) — one row per meeting; the Visitor column lists ONLY the visitors
@@ -1178,7 +1196,8 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
                 WHERE v.meeting_request_id = m.id AND v.readiness_status != 3) AS incomplete_visitor_names,
                (SELECT ARRAY_AGG(DISTINCT f.facility ORDER BY f.facility)
                 FROM sg_office_meetingrequestfacility f
-                WHERE f.meeting_request_id = m.id AND f.status != 3) AS pending_facility_codes
+                WHERE f.meeting_request_id = m.id AND f.status != 3) AS pending_facility_codes,
+               (m.created_at AT TIME ZONE 'Asia/Dubai')::date AS received_date
         FROM sg_office_meetingrequest m
         LEFT JOIN user_management_user co ON co.id = m.coordinator_id
         LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
@@ -1473,6 +1492,9 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             chosen_fields, keep = list(MEETING_PENDING_FACILITIES_FIELDS), ("meeting",)
         else:
             chosen_fields, keep = list(MEETING_DEFAULT_FIELDS), ("requester", "meeting", "scheduled_date")
+            if _filters_by_received_date(filters):
+                chosen_fields = chosen_fields + ["received_date"]
+                keep = keep + ("received_date",)
         item = _apply_fields(item, chosen_fields, always_keep=keep)
         item = _reorder_item(item, MEETING_COLUMN_ORDER)
         result.append(item)
