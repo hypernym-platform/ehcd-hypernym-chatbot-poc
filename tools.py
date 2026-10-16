@@ -652,6 +652,42 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Set true for 'meetings this month' — computed server-side as the current calendar month, don't compute the date range yourself.",
                     },
+                    "scheduled_month": {
+                        "type": "integer",
+                        "description": "Set for 'meetings scheduled for <month name>' (e.g. 'October' -> 10) — ANY year, not just the current one (use scheduled_this_month instead for 'this month' specifically). Computed server-side as 1-12 — do NOT instead try to compute that month's first/last day yourself and pass them as scheduled_after/scheduled_before, you will get it wrong or skip the filter entirely. Combine with scheduled_year only if a specific year was named too.",
+                    },
+                    "scheduled_year": {
+                        "type": "integer",
+                        "description": "Only meaningful combined with scheduled_month (e.g. 'October 2025' specifically) — omit for 'October' alone, which should match any year.",
+                    },
+                    "date_filters": {
+                        "type": "array",
+                        "description": "Generic date comparisons for anything the named filters above don't cover (e.g. 'meetings created after 11am today', 'scheduled before 2026-12-01') — prefer a named filter when one fits (scheduled_month, scheduled_today, created_after, etc.), since those are simpler; use this only for ad-hoc comparisons. Each item filters independently (ANDed together).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "column": {
+                                    "type": "string",
+                                    "enum": ["scheduled_date", "created_at"],
+                                    "description": "Which date column — scheduled_date is when the meeting happens, created_at is when the request was submitted.",
+                                },
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["eq", "gte", "lte", "gt", "lt", "between"],
+                                    "description": "eq=exactly on, gte/lte=on or after/before, gt/lt=strictly after/before, between=needs value AND value2.",
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "ISO date or datetime (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS). Never compute a relative date (\"today\", \"this month\") yourself here — use the dedicated named filter for that instead.",
+                                },
+                                "value2": {
+                                    "type": "string",
+                                    "description": "Only for op=between — the upper bound.",
+                                },
+                            },
+                            "required": ["column", "op", "value"],
+                        },
+                    },
                     "not_ready": {
                         "type": "boolean",
                         "description": "Set true for 'meetings that aren't ready yet' or 'meetings with pending facility requests' — at least one of its facility prep tasks isn't Confirmed. Computed server-side from the facility tracker. Each result row's `facilities_summary` field already lists which facility types (Room, Parking, etc.) were requested for that meeting — don't call list_sg_office_meeting_facilities just to see what facilities a meeting needs.",
@@ -1830,6 +1866,31 @@ _MEETING_STATUS_WORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Enforcement for a proven failure: "list meetings scheduled for October"
+# dropped its date constraint entirely, 3/3 live trials — not occasional,
+# every time, because the schema had no deterministic way to express a
+# named month (only scheduled_after/scheduled_before, which need the
+# model to compute exact day boundaries itself). scheduled_month now
+# exists for exactly this, but a schema addition alone doesn't guarantee
+# the router remembers to use it on a given sample — this is the actual
+# guarantee: parse the month directly from the query text and inject it
+# if the tool call came back with no date constraint of any kind.
+_MONTH_NAME_TO_NUM = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_NAME_RE = re.compile(
+    r"\b(" + "|".join(sorted(_MONTH_NAME_TO_NUM, key=len, reverse=True)) + r")\b", re.IGNORECASE
+)
+_YEAR_NEAR_MONTH_RE = re.compile(r"\b(20\d{2})\b")
+_MEETING_DATE_FILTER_KEYS = {
+    "scheduled_month", "scheduled_after", "scheduled_before", "scheduled_on",
+    "scheduled_today", "scheduled_this_week", "scheduled_tomorrow",
+    "scheduled_this_month", "date_filters",
+}
+
 
 def tool_executor_node(state: ChatState) -> dict:
     """Execute ALL pending tool calls in parallel."""
@@ -1872,11 +1933,35 @@ def tool_executor_node(state: ChatState) -> dict:
             # anything, just invented under long-context conditions.
             # Keep only presentation args (never real filters) and drop
             # everything else; "all" is as unambiguous as scope gets.
+            # Exception: "all meetings in October" means "don't filter by
+            # STATUS", not "don't filter by date" — a named month in the
+            # query means the date constraint is wanted and must survive.
             _NON_FILTER_ARGS = {"limit", "sort_by", "fields"}
+            if _MONTH_NAME_RE.search(current_query_lower):
+                _NON_FILTER_ARGS = _NON_FILTER_ARGS | _MEETING_DATE_FILTER_KEYS
             for key in list(fn_args.keys()):
                 if key not in _NON_FILTER_ARGS:
                     fn_args.pop(key, None)
             forced_all_unfiltered = True
+
+        if (
+            fn_name == "list_sg_office_meetings"
+            and _MONTH_NAME_RE.search(current_query_lower)
+            and not (_MEETING_DATE_FILTER_KEYS & set(fn_args))
+        ):
+            # The proven failure: "list meetings scheduled for October"
+            # dropped the date constraint entirely, 3/3 live trials, not
+            # occasional — the schema had no deterministic way to express
+            # a named month (scheduled_month now exists, but a schema
+            # addition alone doesn't guarantee the router reaches for it
+            # on a given sample). Parsed directly from the query text and
+            # injected here so the result is correct regardless of what
+            # the router did or didn't include.
+            month_match = _MONTH_NAME_RE.search(current_query_lower)
+            fn_args["scheduled_month"] = _MONTH_NAME_TO_NUM[month_match.group(1).lower()]
+            year_match = _YEAR_NEAR_MONTH_RE.search(current_query_lower)
+            if year_match:
+                fn_args["scheduled_year"] = int(year_match.group(1))
 
         valid_keys = _VALID_ARG_KEYS_BY_TOOL.get(fn_name)
         if valid_keys is not None:
