@@ -266,6 +266,53 @@ def _multi_word_ilike(column: str, text: str):
     return "(" + " AND ".join(clauses) + ")", params
 
 
+# Generic (column, operator, value) date-filter escape hatch — see each
+# list_* function's "date_filters" handling for why. Both pieces
+# user-controlled data could influence (the column, the operator) are
+# matched against a fixed whitelist before ever reaching the query
+# string; only the comparison VALUE is interpolated, and always as a
+# parameterized %s. Safe to extend to other tools' own date columns by
+# adding another {alias: {logical_name: real_column}} entry.
+_DATE_FILTER_OPS = {"eq", "gte", "lte", "gt", "lt", "between"}
+
+
+def _build_date_filter_conditions(date_filters, table_alias: str, allowed_columns: dict):
+    """`date_filters` is a list of {"column": str, "op": str, "value": str,
+    "value2": str (only for "between")} dicts, as supplied by the model.
+    `allowed_columns` maps the logical column names the model is allowed
+    to name (e.g. "scheduled_date") to this table's real qualified column
+    (e.g. "m.scheduled_date") — anything not in this map is silently
+    skipped, never passed through. Returns (sql_fragment, params); the
+    fragment is "" (no filtering) if nothing valid was given."""
+    clauses, params = [], []
+    if not isinstance(date_filters, list):
+        return "", []
+    for spec in date_filters:
+        if not isinstance(spec, dict):
+            continue
+        real_col = allowed_columns.get(spec.get("column"))
+        op = spec.get("op")
+        value = spec.get("value")
+        if not real_col or op not in _DATE_FILTER_OPS or not value:
+            continue
+        if op == "between":
+            value2 = spec.get("value2")
+            if not value2:
+                continue
+            clauses.append(f"{real_col} BETWEEN %s AND %s")
+            params.extend([value, value2])
+        else:
+            sql_op = {"eq": "=", "gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}[op]
+            clauses.append(f"{real_col} {sql_op} %s")
+            params.append(value)
+    if not clauses:
+        return "", []
+    return "(" + " AND ".join(clauses) + ")", params
+
+
+_MEETING_DATE_COLUMNS = {"scheduled_date": "m.scheduled_date", "created_at": "m.created_at"}
+
+
 def _status_label(val) -> str:
     try:
         return STATUS_MAP_EN.get(int(val), str(val))
@@ -1248,6 +1295,38 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             "m.scheduled_date BETWEEN date_trunc('month', (NOW() AT TIME ZONE 'Asia/Dubai')::date)::date "
             "AND (date_trunc('month', (NOW() AT TIME ZONE 'Asia/Dubai')::date) + INTERVAL '1 month - 1 day')::date"
         )
+
+    if filters.get("scheduled_month"):
+        # "Scheduled for October" (any year, not necessarily THIS month —
+        # that's scheduled_this_month above) had no deterministic filter
+        # at all, only scheduled_after/scheduled_before, which require the
+        # model to compute the month's exact day boundaries itself. Live
+        # testing showed it doesn't even attempt that — it just drops the
+        # date constraint entirely and returns everything unfiltered,
+        # 3/3 trials, not occasional. A named month number removes the
+        # computation (and thus the failure) outright, same principle as
+        # scheduled_today/scheduled_this_week above.
+        conditions.append("EXTRACT(MONTH FROM m.scheduled_date) = %s")
+        params.append(filters["scheduled_month"])
+        if filters.get("scheduled_year"):
+            conditions.append("EXTRACT(YEAR FROM m.scheduled_date) = %s")
+            params.append(filters["scheduled_year"])
+
+    if filters.get("date_filters"):
+        # Generic (column, operator, value) escape hatch — instead of a
+        # new named filter for every possible comparison forever
+        # (scheduled_after/before/on/today/this_week/this_month/tomorrow,
+        # created_after/before, ... and the model still sometimes drops
+        # the constraint entirely rather than reach for the right one —
+        # see scheduled_month above), expose the two real date columns
+        # with a small whitelisted operator set. Column and operator are
+        # checked against fixed sets before ever touching the query
+        # string; only the comparison VALUE is model-supplied, and it
+        # only ever reaches SQL as a parameterized %s, never interpolated.
+        clause, p = _build_date_filter_conditions(filters["date_filters"], "m", _MEETING_DATE_COLUMNS)
+        if clause:
+            conditions.append(clause)
+            params.extend(p)
 
     if filters.get("not_ready"):
         # At least one facility prep task isn't Confirmed yet (status != 3).

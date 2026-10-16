@@ -357,6 +357,78 @@ def test_upcoming_meetings_excludes_past_dates(h):
         )
 
 
+@test("date_filters")
+def test_named_month_filter_matches_ground_truth(h):
+    """Direct check of the scheduled_month filter itself (see the live
+    end-to-end version below for the router-level enforcement)."""
+    with app.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sg_office_meetingrequest WHERE EXTRACT(MONTH FROM scheduled_date) = 10")
+            expected = cur.fetchone()[0]
+        result = list_sg_office_meetings(conn, SUPERADMIN_ID, filters={"scheduled_month": 10})
+    assert result.get("total_count") == expected, f"expected {expected}, got {result.get('total_count')}"
+
+
+@test("date_filters")
+def test_generic_date_filter_rejects_unknown_column(h):
+    """The (column, operator, value) escape hatch's safety property: a
+    column name outside the whitelist must be silently ignored, never
+    reach the query string — confirms there's no injection surface, not
+    just that valid input works."""
+    with app.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sg_office_meetingrequest")
+            expected_total = cur.fetchone()[0]
+        result = list_sg_office_meetings(conn, SUPERADMIN_ID, filters={
+            "date_filters": [{"column": "status; DROP TABLE x; --", "op": "eq", "value": "2026-10-01"}]
+        })
+    assert result.get("total_count") == expected_total, (
+        f"an unwhitelisted column should be silently ignored (all {expected_total} rows), "
+        f"got {result.get('total_count')} — the filter may be reaching the query unvalidated"
+    )
+
+
+@test("date_filters")
+def test_october_meetings_live_enforcement(h):
+    """Live bug, reproduced 3/3 trials: "list meetings scheduled for
+    October" dropped the date constraint entirely — the schema had no
+    deterministic way to express a named month, only scheduled_after/
+    scheduled_before, which need the model to compute exact day
+    boundaries itself (it didn't even try). Fixed two ways: a new
+    scheduled_month filter (removes the need for the model to compute
+    anything), AND a deterministic enforcement check in
+    tool_executor_node that parses the month from the query text directly
+    and injects it if the tool call came back with no date constraint at
+    all — so this holds regardless of what the router does on a given
+    sample, not just usually."""
+    with app.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sg_office_meetingrequest WHERE EXTRACT(MONTH FROM scheduled_date) = 10")
+            expected = cur.fetchone()[0]
+    r = h.run_turn("List all meetings scheduled for October with date, requester, venue and status.", [])
+    assert len(r.tool_results) == expected, (
+        f"expected {expected} October meetings, got {len(r.tool_results)} — "
+        f"the date constraint was likely dropped again"
+    )
+
+
+@test("date_filters")
+def test_all_meetings_in_month_keeps_date_not_status(h):
+    """Edge case between the two deterministic guards: "all meetings in
+    October" must keep the month scope (named month present) while still
+    meaning "no status filter" — not collapse to either all 28 unfiltered
+    or an empty result from the two guards fighting each other."""
+    with app.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sg_office_meetingrequest WHERE EXTRACT(MONTH FROM scheduled_date) = 10")
+            expected = cur.fetchone()[0]
+    r = h.run_turn("Create a chart of all external meetings in October.", [])
+    assert len(r.tool_results) == expected, (
+        f"expected {expected} (October-scoped), got {len(r.tool_results)} — "
+        f"the 'all X' and month-enforcement guards may be conflicting"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Category: rbac — direct db_queries calls, no LLM needed (fast, reliable)
 # ---------------------------------------------------------------------------
