@@ -652,6 +652,58 @@ async def handle_query(
         if chart_data and rows_for_chart:
             save_last_chart_rows(history_key, rows_for_chart)
 
+        # One retry when a chart was wanted but the pipeline produced
+        # none — this path is only ever reached for a query that already
+        # looked chart-shaped (is_chart_request), never for an ordinary
+        # query like "list tasks", so this adds zero latency to normal
+        # traffic. Demonstrated live that an identical failing request
+        # can succeed on a fresh sample (the router's tool-call choice is
+        # genuinely stochastic, not deterministic) — worth a few extra
+        # seconds on a request that's otherwise a guaranteed "couldn't
+        # generate a chart" apology. Runs before history is saved, so a
+        # successful retry is what actually gets persisted, not the
+        # failed first attempt.
+        if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
+            retry_tool_results, retry_chart_intent, retry_response = [], {}, ""
+            try:
+                for chunk in run_chatbot_graph(
+                    query=query, conversation_history=conversation_history,
+                    available_tools=available_tools, user_id=rbac_user_id,
+                    user_name=user_name, user_role=user_role, user_email=user_email,
+                    user_contact_no=user_contact_no, client=client,
+                    model=cfg.AZURE_OPENAI_DEPLOYMENT, pg_conn_fn=pg_conn,
+                    policy_cfg=POLICY_CFG, emb=emb,
+                    tool_results_collector=retry_tool_results,
+                    chart_intent_collector=retry_chart_intent,
+                ):
+                    retry_response += chunk
+            except Exception as e:
+                logger.error(f"Chart retry error: {e}")
+
+            if retry_response:
+                retry_rows = retry_tool_results
+                if not retry_rows and recent_had_chart:
+                    retry_rows = get_last_chart_rows(history_key)
+                retry_palette = detect_palette_from_query(query, conversation_history)
+                retry_chart_data = None
+                try:
+                    retry_chart_data = detect_chart_opportunity(
+                        query, retry_rows, retry_response, palette=retry_palette,
+                        recent_had_chart=recent_had_chart, previous_query=previous_query,
+                        want_chart=retry_chart_intent.get("want_chart"),
+                        router_chart_type=retry_chart_intent.get("chart_type"),
+                    )
+                except Exception as e:
+                    logger.error(f"Chart retry detection error: {e}")
+                if retry_chart_data:
+                    assistant_response = retry_response
+                    tool_results_for_chart = retry_tool_results
+                    rows_for_chart = retry_rows
+                    chart_data = retry_chart_data
+                    chart_palette = retry_palette
+                    if rows_for_chart:
+                        save_last_chart_rows(history_key, rows_for_chart)
+
         # Log-only sanity check — never alters the response, just surfaces
         # a chart/text/data mismatch for review (see validate_output_consistency).
         try:
@@ -673,7 +725,8 @@ async def handle_query(
         # after its response is already generated, ended up finding nothing
         # chartable (e.g. the requested field doesn't exist for that entity,
         # like a task's "budget"). Without this, the model's text falsely
-        # claims a chart is coming when none will ever show up.
+        # claims a chart is coming when none will ever show up. (The retry
+        # above already had its shot — this only fires if that failed too.)
         if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
             assistant_response = (
                 "<p>I couldn't generate a chart for this — the data needed "
@@ -872,6 +925,59 @@ async def websocket_chat(ws: WebSocket):
             if chart_data and rows_for_chart:
                 save_last_chart_rows(history_key, rows_for_chart)
 
+            # One retry when a chart was wanted but none was produced —
+            # same reasoning as the REST endpoint, see there. Run via
+            # run_in_executor since run_chatbot_graph is a blocking sync
+            # generator and this must not block the event loop; no live
+            # streaming needed here, just the final text.
+            if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
+                retry_tool_results, retry_chart_intent = [], {}
+
+                def _run_retry_sync():
+                    text = ""
+                    for c in run_chatbot_graph(
+                        query=query, conversation_history=conversation_history,
+                        available_tools=available_tools, user_id=rbac_user_id,
+                        user_name=user_name, user_role=user_role, user_email=user_email,
+                        user_contact_no=user_contact_no, client=client,
+                        model=cfg.AZURE_OPENAI_DEPLOYMENT, pg_conn_fn=pg_conn,
+                        policy_cfg=POLICY_CFG, emb=emb,
+                        tool_results_collector=retry_tool_results,
+                        chart_intent_collector=retry_chart_intent,
+                    ):
+                        text += c
+                    return text
+
+                retry_response = ""
+                try:
+                    retry_response = await loop.run_in_executor(None, _run_retry_sync)
+                except Exception as e:
+                    logger.error(f"WS chart retry error: {e}")
+
+                if retry_response:
+                    retry_rows = retry_tool_results
+                    if not retry_rows and recent_had_chart:
+                        retry_rows = get_last_chart_rows(history_key)
+                    retry_palette = detect_palette_from_query(query, conversation_history)
+                    retry_chart_data = None
+                    try:
+                        retry_chart_data = detect_chart_opportunity(
+                            query, retry_rows, retry_response, palette=retry_palette,
+                            recent_had_chart=recent_had_chart, previous_query=previous_query,
+                            want_chart=retry_chart_intent.get("want_chart"),
+                            router_chart_type=retry_chart_intent.get("chart_type"),
+                        )
+                    except Exception as e:
+                        logger.error(f"WS chart retry detection error: {e}")
+                    if retry_chart_data:
+                        assistant_response = retry_response
+                        tool_results_for_chart = retry_tool_results
+                        rows_for_chart = retry_rows
+                        chart_data = retry_chart_data
+                        chart_palette = retry_palette
+                        if rows_for_chart:
+                            save_last_chart_rows(history_key, rows_for_chart)
+
             # Log-only sanity check — see the REST endpoint for the same.
             try:
                 for warning in validate_output_consistency(chart_data, rows_for_chart, assistant_response):
@@ -887,7 +993,8 @@ async def websocket_chat(ws: WebSocket):
             save_conversation_history(history_key, conversation_history)
 
             # Same honest-fallback reasoning as the REST endpoint — see the
-            # comment there.
+            # comment there. (The retry above already had its shot — this
+            # only fires if that failed too.)
             if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
                 assistant_response = (
                     "<p>I couldn't generate a chart for this — the data needed "

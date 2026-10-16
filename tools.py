@@ -577,7 +577,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "Filter by status. Use 'upcoming' ONLY when the user says just 'upcoming meetings' with no other status named — it means Confirmed OR Rescheduled combined (matches the UI's 'Upcoming' count). If the user names a SPECIFIC status too (e.g. 'upcoming confirmed meetings'), use that specific status here instead (e.g. 'confirmed') and set upcoming_only=true — do NOT use 'upcoming' here, it would silently include Rescheduled ones too.",
+                        "description": "Filter by status. Use 'upcoming' ONLY when the user says just 'upcoming meetings' with no other status named — it means Confirmed OR Rescheduled, AND not already past its scheduled date (both required server-side; a Confirmed meeting whose date has passed is never 'upcoming'). If the user names a SPECIFIC status too (e.g. 'upcoming confirmed meetings'), use that specific status here instead (e.g. 'confirmed') and set upcoming_only=true — do NOT use 'upcoming' here, it would silently include Rescheduled ones too.",
                         "enum": ["new", "under_review", "confirmed", "completed", "rescheduled", "cancelled", "upcoming"],
                     },
                     "upcoming_only": {
@@ -675,6 +675,10 @@ TOOL_DEFINITIONS = [
                     "created_after": {
                         "type": "string",
                         "description": "Only requests created on or after this date.",
+                    },
+                    "created_before": {
+                        "type": "string",
+                        "description": "Only requests created on or before this date — combine with created_after for a 'received between X and Y' range. For 'meetings scheduled/happening between X and Y' instead, use scheduled_after/scheduled_before, not these — \"received\"/\"submitted\"/\"requested\" means created_*, \"scheduled\"/\"happening\"/\"taking place\" means scheduled_*.",
                     },
                     "older_than_days": {
                         "type": "integer",
@@ -1128,6 +1132,21 @@ TOOL_DEFINITIONS = [
 # Build name→definition lookup
 TOOL_DEFS_BY_NAME = {t["function"]["name"]: t for t in TOOL_DEFINITIONS}
 
+# Which argument names each tool actually recognizes — used to catch the
+# router emitting a plausible-sounding but nonexistent parameter (seen
+# live: 'created_before' on list_sg_office_meetings, which wasn't in this
+# tool's schema OR handled in db_queries.py, so it silently did nothing —
+# the date range's upper bound just never applied, with no error anywhere
+# to notice it by). None of these schemas set additionalProperties:false,
+# so the API never rejects an unknown key either; this is the only thing
+# that catches it. Logged, not stripped — an unknown key already has zero
+# effect once it reaches db_queries.py, so there's nothing to correct,
+# only something to make visible.
+_VALID_ARG_KEYS_BY_TOOL = {
+    name: set(defn["function"]["parameters"]["properties"].keys())
+    for name, defn in TOOL_DEFS_BY_NAME.items()
+}
+
 
 # ---------------------------------------------------------------------------
 # Tool dispatcher (unchanged)
@@ -1548,6 +1567,16 @@ described (if several rows match, pick the one whose details — name/org/
 subject/purpose — genuinely match, never just the first one), and call
 "get details" with that id then. Never invent or guess an id that didn't
 literally appear in a tool result.
+11. "Call fresh" (rule 7) means rebuild the filter ARGUMENTS from THIS
+turn's wording too, not just re-issue the same call. A filter from a
+previous turn's call NEVER carries over into this turn's call unless this
+turn's own wording still asks for it. In particular, "all X" / "every X" /
+"X" with no criteria named means NO filters at all this time — even if the
+previous turn filtered that same entity by status, name, or anything else.
+Seen going wrong: "list upcoming meetings" (status=upcoming) followed by
+"create a chart of all external meetings" re-used status=upcoming instead
+of dropping it — "all" explicitly means unfiltered, and the second
+question never said "upcoming" itself.
 User information:
 - Name: {user_name}
 - Role: {user_role}
@@ -1701,6 +1730,7 @@ class ChatState(TypedDict):
     tool_call_count: int
     had_technical_error: bool
     had_empty_result: bool
+    all_items_unfiltered: bool
     needs_more_tools: bool
     final_response: str
     chunk_queue: Any
@@ -1785,6 +1815,22 @@ def router_node(state: ChatState) -> dict:
 # Node 2: Tool Executor — parallel execution of all tool calls
 # ---------------------------------------------------------------------------
 
+#  A prompt rule alone ("rebuild filters from this turn's wording") was
+# tried for this and still failed on repeat — the router can simply re-
+# sample the wrong branch, same as every other stochastic failure found
+# this session. Verified live: "list upcoming meetings" (status=upcoming)
+# followed by "create a chart of ALL external meetings" kept re-using
+# status=upcoming 2 of 3 times even with the rule in place. This is the
+# deterministic backstop — scoped narrowly to the one proven case rather
+# than guessed generically, since a wrong strip (dropping a filter the
+# user DID want) is its own kind of bug.
+_BROADENING_RE = re.compile(r"\b(all|every)\b", re.IGNORECASE)
+_MEETING_STATUS_WORDS_RE = re.compile(
+    r"\b(upcoming|new|under\s*review|confirmed|completed|rescheduled|cancelled|canceled)\b",
+    re.IGNORECASE,
+)
+
+
 def tool_executor_node(state: ChatState) -> dict:
     """Execute ALL pending tool calls in parallel."""
     messages = list(state["messages"])
@@ -1793,6 +1839,7 @@ def tool_executor_node(state: ChatState) -> dict:
     policy_cfg = state["policy_cfg"]
     emb_obj = state["emb"]
     tool_results_for_chart = list(state.get("tool_results_for_chart") or [])
+    current_query_lower = (state.get("query") or "").lower()
 
     # Last message is assistant with tool_calls
     last_msg = messages[-1]
@@ -1809,6 +1856,36 @@ def tool_executor_node(state: ChatState) -> dict:
         # real filters — pop them before the DB layer ever sees them.
         want_chart = fn_args.pop("want_chart", None)
         chart_type = fn_args.pop("chart_type", None)
+        forced_all_unfiltered = False
+
+        if (
+            fn_name == "list_sg_office_meetings"
+            and _BROADENING_RE.search(current_query_lower)
+            and not _MEETING_STATUS_WORDS_RE.search(current_query_lower)
+        ):
+            # "all X" means NO filters, not just no status filter — found
+            # a case this narrower, status-only version of the guard
+            # missed: 13 turns into an unrelated conversation, "create a
+            # chart of ALL external meetings" got a completely fabricated
+            # request_type='official_visit' filter, never mentioned
+            # anywhere in the conversation — not carried over from
+            # anything, just invented under long-context conditions.
+            # Keep only presentation args (never real filters) and drop
+            # everything else; "all" is as unambiguous as scope gets.
+            _NON_FILTER_ARGS = {"limit", "sort_by", "fields"}
+            for key in list(fn_args.keys()):
+                if key not in _NON_FILTER_ARGS:
+                    fn_args.pop(key, None)
+            forced_all_unfiltered = True
+
+        valid_keys = _VALID_ARG_KEYS_BY_TOOL.get(fn_name)
+        if valid_keys is not None:
+            unknown = set(fn_args) - valid_keys
+            if unknown:
+                logger.warning(
+                    f"[unknown-arg] {fn_name} called with {sorted(unknown)}, not in this "
+                    f"tool's schema — had no effect on the query. full args: {fn_args}"
+                )
 
         logger.info(f"Tool call: {fn_name}({fn_args})")
 
@@ -1822,7 +1899,7 @@ def tool_executor_node(state: ChatState) -> dict:
                 policy_cfg=policy_cfg,
                 emb=emb_obj,
             )
-        return tool_call, fn_args, result_str, want_chart, chart_type
+        return tool_call, fn_args, result_str, want_chart, chart_type, forced_all_unfiltered
 
     # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
@@ -1833,8 +1910,15 @@ def tool_executor_node(state: ChatState) -> dict:
     # regex over the user's words guessing after the fact. Last explicit
     # chart_type wins; a null just means "keep whatever type was used
     # before" (resolved later, in app.py, against the conversation history).
-    want_chart = any(w for _, _, _, w, _ in results)
-    chart_type = next((c for *_, c in results if c), None)
+    want_chart = any(w for _, _, _, w, _, _ in results)
+    chart_type = next((c for _, _, _, _, c, _ in results if c), None)
+    # True whenever this turn's "all X" guard above actually stripped a
+    # filter — grounds answer_node so its own prose can't echo a narrower
+    # qualifier ("upcoming") from earlier conversation history even
+    # though the data itself is correctly unfiltered (seen live: the
+    # chart was right, 28/28 meetings, but the text still said "all
+    # upcoming external meetings" — a prose-only echo, not a data bug).
+    all_items_unfiltered = any(f for _, _, _, _, _, f in results)
 
     # The filter a result was fetched under doesn't always survive as a
     # real field on the rows themselves (e.g. project_manager has no
@@ -1845,6 +1929,30 @@ def tool_executor_node(state: ChatState) -> dict:
     # ("how many projects is X included in" needs to know X's name to
     # label the one bar it draws), so this always runs, not just >1 calls.
     _PROVENANCE_FILTERS = ("status", "request_type", "priority", "readiness_status", "item_type", "project_manager")
+    # Boolean filters never qualified before (the loop below explicitly
+    # required isinstance(val, str)) — so a query like "workflow started
+    # versus Not Started" split into two calls (workflow_started=True/
+    # False) had no way to tell which call a row came from, and charting
+    # fell back to grouping by whatever other categorical field existed
+    # (seen live: a 72-slice pie of sender names instead of a 2-slice
+    # Started/Not Started one). Each value needs its own readable label,
+    # not just str(bool).title(), so this is a separate map rather than
+    # reusing the string-filter display logic above.
+    _BOOLEAN_PROVENANCE_LABELS = {
+        "is_read": {True: "Read", False: "Unread"},
+        # Matches db_queries.py's own pre-existing CASE expression for
+        # this exact column (list_sg_office_emails' workflow_label) —
+        # "Started" was a guess that didn't match the app's own already-
+        # established terminology, caught live: the router sometimes
+        # fetches this same data via the native workflow_label field
+        # instead of this boolean filter, and the two disagreed ("In
+        # Workflow" vs "Started") for what's actually the same value.
+        "workflow_started": {True: "In Workflow", False: "Not Started"},
+        "is_confirmed": {True: "Confirmed", False: "Not Confirmed"},
+        "overdue": {True: "Overdue", False: "Not Overdue"},
+        "not_ready": {True: "Not Ready", False: "Ready"},
+        "visitors_not_ready": {True: "Visitors Not Ready", False: "Visitors Ready"},
+    }
 
     def _tool_sig(fn_name, args):
         return (fn_name, tuple(sorted(
@@ -1884,7 +1992,7 @@ def tool_executor_node(state: ChatState) -> dict:
     had_empty_result = False
 
     # Append tool results to messages and collect for chart detection
-    for tool_call, fn_args, result_str, _, _ in results:
+    for tool_call, fn_args, result_str, _, _, _ in results:
         try:
             parsed = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
@@ -1914,6 +2022,20 @@ def tool_executor_node(state: ChatState) -> dict:
                     continue
                 label_key = f"{filt}_label"
                 display = val.replace("_", " ").title()
+                rows = parsed if isinstance(parsed, list) else (
+                    next((v for v in parsed.values() if isinstance(v, list)), [])
+                )
+                for row in rows:
+                    if isinstance(row, dict) and label_key not in row:
+                        row[label_key] = display
+            for filt, value_labels in _BOOLEAN_PROVENANCE_LABELS.items():
+                val = fn_args.get(filt)
+                if not isinstance(val, bool):
+                    continue
+                display = value_labels.get(val)
+                if display is None:
+                    continue
+                label_key = f"{filt}_label"
                 rows = parsed if isinstance(parsed, list) else (
                     next((v for v in parsed.values() if isinstance(v, list)), [])
                 )
@@ -1976,6 +2098,7 @@ def tool_executor_node(state: ChatState) -> dict:
         "tool_call_count": state.get("tool_call_count", 0) + len(results),
         "had_technical_error": bool(state.get("had_technical_error")) or had_technical_error,
         "had_empty_result": bool(state.get("had_empty_result")) or had_empty_result,
+        "all_items_unfiltered": bool(state.get("all_items_unfiltered")) or all_items_unfiltered,
     }
 
 
@@ -2061,6 +2184,23 @@ def answer_node(state: ChatState) -> dict:
             "\n\nThis turn's data lookup succeeded but matched zero "
             "records — this is a legitimate result, not a technical "
             "problem. Say plainly that nothing matched the given criteria."
+        )
+
+    if state.get("all_items_unfiltered"):
+        # Seen live: the chart/data was correctly unfiltered (all 28
+        # meetings) but the model's own prose still said "all UPCOMING
+        # external meetings" — an echo of an earlier turn's framing still
+        # sitting in conversation history, even though this turn's own
+        # query said "all" and the data backing this answer has zero
+        # filters applied. The data fix alone doesn't stop the text from
+        # drifting independently, so this is told directly, not inferred.
+        answer_system += (
+            "\n\nThis turn's data has NO status/date/type filter applied — "
+            "the user asked for ALL of them. Describe it that way. Do NOT "
+            "describe it using a narrower word (e.g. 'upcoming', 'confirmed', "
+            "a specific status or date range) just because an earlier turn "
+            "in this conversation used one — that word does not apply to "
+            "this turn's actual data."
         )
 
     # Replace the system prompt with the leaner answer prompt
@@ -2269,6 +2409,7 @@ def run_chatbot_graph(
         "tool_call_count": 0,
         "had_technical_error": False,
         "had_empty_result": False,
+        "all_items_unfiltered": False,
         "needs_more_tools": False,
         "final_response": "",
         "chunk_queue": chunk_q,

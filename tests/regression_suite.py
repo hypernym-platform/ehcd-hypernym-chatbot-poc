@@ -43,7 +43,7 @@ from chart_engine import (
     last_user_query, CHART_SHOWN_MARKER, _encode_palette_marker,
     validate_output_consistency,
 )
-from db_queries import list_projects
+from db_queries import list_projects, list_sg_office_meetings
 from edu_pg import execute_education_sql
 
 VERBOSE = False
@@ -334,6 +334,30 @@ def test_empty_result_phrased_distinctly(h):
 
 
 # ---------------------------------------------------------------------------
+# Category: date_filters — direct db_queries calls, no LLM needed
+# ---------------------------------------------------------------------------
+
+@test("date_filters")
+def test_upcoming_meetings_excludes_past_dates(h):
+    """Live bug: status='upcoming' meant Confirmed/Rescheduled ONLY, with
+    no date check at all — a Confirmed meeting from weeks ago still showed
+    up as 'upcoming'. Fixed by ANDing the date condition into the status
+    branch in list_sg_office_meetings (see MEETING_UPCOMING_STATUSES)."""
+    with app.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT (NOW() AT TIME ZONE 'Asia/Dubai')::date")
+            today = cur.fetchone()[0]
+        result = list_sg_office_meetings(conn, SUPERADMIN_ID, filters={"status": "upcoming"})
+    assert "error" not in result, f"unexpected error: {result}"
+    for row in result.get("data", []):
+        d = row.get("scheduled_date")
+        assert d is None or d >= today, (
+            f"'upcoming' returned a meeting dated {d}, which is before today ({today}) — "
+            f"the date check regressed. row={row.get('organization')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Category: rbac — direct db_queries calls, no LLM needed (fast, reliable)
 # ---------------------------------------------------------------------------
 
@@ -524,6 +548,30 @@ def test_list_all_projects_resets_after_filtered_queries(h):
     )
 
 
+@test("context_reset")
+def test_all_meetings_resets_after_upcoming_filter(h):
+    """Live bug, reproduced 2/3 times even with a router prompt rule added
+    against it — fixed with a deterministic post-hoc strip in
+    tool_executor_node (see _BROADENING_RE / _MEETING_STATUS_WORDS_RE),
+    since the prompt rule alone wasn't reliable. This test is what would
+    catch that guard breaking again."""
+    with app.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sg_office_meetingrequest")
+            expected_total = cur.fetchone()[0]
+    history = []
+    r1 = h.run_turn("list all upcoming external meetings", history)
+    history = r1.history
+    r2 = h.run_turn("Create a chart of all external meetings", history)
+    assert len(r2.tool_results) == expected_total, (
+        f"'all external meetings' after an 'upcoming' turn should fetch all {expected_total} meetings "
+        f"fresh, got {len(r2.tool_results)} — the status='upcoming' filter likely leaked from the prior turn"
+    )
+    assert "upcoming" not in r2.resp.lower(), (
+        f"response should not describe this as 'upcoming' — that word was never in this turn's query: {r2.resp!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Category: readiness_charts / budget_charts — live, structural checks
 # ---------------------------------------------------------------------------
@@ -544,6 +592,195 @@ def test_budget_chart_has_three_series(h):
     assert r.chart_data, "expected a chart"
     names = {t.get("name") for t in r.chart_data.get("plotly_data", [])}
     assert {"Allocated", "Spent", "Remaining"} <= names, f"expected Allocated/Spent/Remaining, got: {names}"
+
+
+# ---------------------------------------------------------------------------
+# Category: sg_office_charts — live, three real bugs found and fixed in
+# one batch (Email/Memo/Weekly Action modules)
+# ---------------------------------------------------------------------------
+
+@test("sg_office_charts")
+def test_weekly_actions_entity_name_does_not_trigger_date_bucketing(h):
+    """Live bug: "Weekly Actions" (this app's own module name) contains
+    the literal word "weekly", which false-triggered the date-bucket
+    chart case — "Weekly Actions by priority" got charted by date instead
+    of by priority, with the text describing a priority breakdown that
+    didn't match the actual chart at all. Fixed with a negative lookahead
+    (weekly(?!\\s+actions?)) in chart_engine._DATE_BUCKET_RE."""
+    r = h.run_turn("Create a pie chart showing Weekly Actions by priority: Low, Medium and High.", [])
+    assert r.chart_data, "expected a chart"
+    t0 = r.chart_data["plotly_data"][0]
+    labels = set(t0.get("labels") or t0.get("x") or [])
+    assert {"Low", "Medium", "High"} <= labels, (
+        f"expected Low/Medium/High priority labels, got {labels} — likely charted by date again"
+    )
+
+
+@test("sg_office_charts")
+def test_boolean_filter_split_produces_two_slices_not_raw_field(h):
+    """Live bug: a query split into two boolean-filtered calls
+    (workflow_started=True/False) had no way to tell which call a row
+    came from — provenance backfill only handled string filter values,
+    not booleans — so the chart fell back to grouping by an unrelated
+    field (seen live: a 72-slice pie of sender names). Fixed by adding
+    _BOOLEAN_PROVENANCE_LABELS in tools.py's tool_executor_node.
+
+    Label is "In Workflow", not "Started" — matches db_queries.py's own
+    pre-existing CASE expression for this column (list_sg_office_emails'
+    workflow_label); the router sometimes fetches this same data via that
+    native field instead of the boolean filter, and an earlier version of
+    this fix used a guessed label ("Started") that disagreed with it."""
+    r = h.run_turn("Create a pie chart showing emails with workflow started versus Not Started.", [])
+    assert r.chart_data, "expected a chart"
+    t0 = r.chart_data["plotly_data"][0]
+    labels = set(t0.get("labels") or t0.get("x") or [])
+    assert labels == {"In Workflow", "Not Started"}, (
+        f"expected exactly 2 slices (In Workflow/Not Started), got {len(labels)}: {labels}"
+    )
+
+
+@test("sg_office_charts")
+def test_boolean_filter_trend_splits_into_two_series(h):
+    """Same root cause as the pie-chart case above, but for a date-bucket
+    trend: "unread and read email trends" needs two separate lines, not
+    one merged count. Fixed in chart_engine._extract_date_bucket_chart by
+    splitting on a 2-valued boolean-provenance label when present."""
+    r = h.run_turn("Create a line chart showing unread and read email trends for the current month.", [])
+    assert r.chart_data, "expected a chart"
+    names = {t.get("name") for t in r.chart_data["plotly_data"]}
+    assert names == {"Read", "Unread"}, f"expected exactly 'Read' and 'Unread' series, got: {names}"
+
+
+# ---------------------------------------------------------------------------
+# Category: long_conversation — a single 15-turn conversation mixing five
+# different domains (projects, tasks, meetings, memos, emails, budgets),
+# asserting ground truth at checkpoints throughout. Everything else in
+# this suite tests 1-3 turn conversations; this is the one test that
+# stress-tests context dilution over a realistically long chat — the
+# original client complaint from the very start of this engagement was
+# "testing everything in one chat causes hallucination", and that
+# scenario was never directly verified until now. Checkpoints near the
+# end deliberately re-test earlier fixes (subject-count, context-reset,
+# boolean-provenance split) under long-history conditions, not just the
+# short conversations they were originally verified against.
+# ---------------------------------------------------------------------------
+
+@test("long_conversation")
+def test_15_turn_mixed_domain_conversation_stays_accurate(h):
+    with app.pg_conn() as conn:
+        total_projects = ground_truth_total_projects(conn)
+        alzaabi_count = ground_truth_project_count(conn, "abdalla alzaabi")
+        rashid_count = ground_truth_project_count(conn, "rashid")
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sg_office_meetingrequest")
+            total_meetings = cur.fetchone()[0]
+
+    history = []
+    failures = []
+
+    def check(label, condition, detail):
+        if not condition:
+            failures.append(f"{label}: {detail}")
+
+    # Turn 1-2: baseline project facts
+    r = h.run_turn("list all projects", history); history = r.history
+    check("t1_list_all_projects", len(r.tool_results) == total_projects,
+          f"expected {total_projects} rows, got {len(r.tool_results)}")
+
+    r = h.run_turn("how many projects does Abdalla Khalid manage", history); history = r.history
+
+    # Turn 3-4: a chart, then a style-only follow-up
+    r = h.run_turn("create a bar chart of projects vs status", history); history = r.history
+    check("t3_chart_produced", r.chart_data is not None, "expected a chart")
+
+    r = h.run_turn("change the colors", history); history = r.history
+    check("t4_chart_still_produced", r.chart_data is not None, "expected the chart to persist through a style-only follow-up")
+
+    # Turn 5: switch domain entirely — tasks
+    r = h.run_turn("list all tasks", history); history = r.history
+    check("t5_no_chart_for_plain_list", r.chart_data is None, "a plain list should not produce a chart")
+
+    # Turn 6: switch domain again — SG office meetings readiness
+    r = h.run_turn("generate a chart of meetings vs readiness status", history); history = r.history
+    if r.chart_data:
+        names = {t.get("name") for t in r.chart_data["plotly_data"]}
+        check("t6_readiness_two_series", "Facility Readiness" in names and "Visitor Readiness" in names,
+              f"expected both readiness series, got {names}")
+    else:
+        failures.append("t6_readiness_two_series: expected a chart, got none")
+
+    # Turn 7: switch domain again — memos
+    r = h.run_turn("How many memos are in each status? Provide every status separately.", history); history = r.history
+
+    # Turn 8: re-verify today's boolean-provenance fix survives under long history
+    r = h.run_turn("Create a pie chart showing emails with workflow started versus Not Started.", history); history = r.history
+    if r.chart_data:
+        t0 = r.chart_data["plotly_data"][0]
+        labels = set(t0.get("labels") or t0.get("x") or [])
+        check("t8_workflow_pie_two_slices", labels == {"In Workflow", "Not Started"},
+              f"expected exactly In Workflow/Not Started, got {labels} — boolean-provenance split may not survive long history")
+    else:
+        failures.append("t8_workflow_pie_two_slices: expected a chart, got none")
+
+    # Turn 9: budgets
+    r = h.run_turn("show me a chart of project budgets", history); history = r.history
+    if r.chart_data:
+        names = {t.get("name") for t in r.chart_data["plotly_data"]}
+        check("t9_budget_three_series", {"Allocated", "Spent", "Remaining"} <= names, f"got {names}")
+    else:
+        failures.append("t9_budget_three_series: expected a chart, got none")
+
+    # Turn 10-11: filtered meetings, then a bare continuation reference
+    r = h.run_turn("list all upcoming external meetings", history); history = r.history
+    upcoming_count = len(r.tool_results)
+
+    r = h.run_turn("Please show them only", history); history = r.history
+    check("t11_continuation_keeps_filter", len(r.tool_results) == upcoming_count,
+          f"'show them only' should keep the {upcoming_count}-row upcoming filter, got {len(r.tool_results)} rows")
+
+    # Turn 12: re-verify today's context-reset fix survives under long history —
+    # this is the exact "all external meetings" bug fixed earlier, now
+    # tested 11 turns deep instead of in a fresh 2-turn conversation.
+    r = h.run_turn("Create a chart of all external meetings", history); history = r.history
+    check("t12_all_meetings_resets", len(r.tool_results) == total_meetings,
+          f"'all external meetings' after a filtered turn should fetch all {total_meetings}, got {len(r.tool_results)} "
+          f"— context-reset fix may not hold under long history")
+
+    # Turn 13-14: jump back to projects after 11 turns of unrelated domains
+    r = h.run_turn(
+        "based on the projects i want to see the number of projects abdalla Alzaabi and rashid are included in. "
+        "I want the x axis to represent their name, while the y axis represent the number of projects they are included in",
+        history,
+    )
+    history = r.history
+    if r.chart_data:
+        t0 = r.chart_data["plotly_data"][0]
+        labels = t0.get("x") or t0.get("labels") or []
+        values = t0.get("y") or t0.get("values") or []
+        by_label = {str(l).lower(): v for l, v in zip(labels, values)}
+        alzaabi_val = next((v for k, v in by_label.items() if "alzaabi" in k), None)
+        rashid_val = next((v for k, v in by_label.items() if "rashid" in k), None)
+        check("t13_subject_count_still_correct",
+              alzaabi_val == alzaabi_count and rashid_val == rashid_count,
+              f"expected Alzaabi={alzaabi_count}, Rashid={rashid_count}, got Alzaabi={alzaabi_val}, Rashid={rashid_val} "
+              f"— 11 turns of unrelated domains in between may have corrupted this")
+    else:
+        failures.append("t13_subject_count_still_correct: expected a chart, got none")
+
+    r = h.run_turn("list all projects", history); history = r.history
+    check("t14_list_all_projects_still_correct", len(r.tool_results) == total_projects,
+          f"after 13 turns across 5 domains, 'list all projects' should still fetch all {total_projects} fresh, "
+          f"got {len(r.tool_results)} — this is the core 'testing everything in one chat causes hallucination' scenario")
+
+    # Turn 15: one more domain switch, re-verifying the weekly-actions fix
+    r = h.run_turn("Create a bar chart showing overdue Weekly Actions by owner.", history); history = r.history
+    if r.chart_data:
+        t0 = r.chart_data["plotly_data"][0]
+        labels = t0.get("x") or t0.get("labels") or []
+        check("t15_weekly_action_owner_labels", all(not str(l).isdigit() for l in labels),
+              f"expected real owner names, got what looks like raw indices: {labels}")
+
+    assert not failures, "Long-conversation checkpoint failures:\n" + "\n".join(f"  - {f}" for f in failures)
 
 
 # ---------------------------------------------------------------------------
