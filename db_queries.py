@@ -51,7 +51,11 @@ MEETING_STATUS_MAP = {
     1: "New", 2: "Under Review", 3: "Confirmed",
     4: "Completed", 5: "Rescheduled", 6: "Cancelled",
 }
-# "Upcoming" (shown as its own summary count in the UI) = Confirmed + Rescheduled.
+# "Upcoming" = Confirmed + Rescheduled AND not already past its scheduled
+# date (see the status=="upcoming" branch below, which ANDs both in) — the
+# dashboard's own "Upcoming" tile counts by status alone, but a Confirmed
+# meeting whose date has already passed isn't "upcoming" by any sense a
+# chat answer means the word, so the two diverge on purpose here.
 MEETING_UPCOMING_STATUSES = [3, 5]
 MEETING_PRIORITY_MAP = {1: "High", 2: "Medium", 3: "Low"}
 MEETING_REQUEST_TYPE_MAP = {1: "Meeting", 2: "Official Visit", 3: "Delegation Visit", 4: "Facility Visit"}
@@ -159,10 +163,28 @@ MEETING_DEFAULT_FIELDS = (
     "readiness_summary",
 )
 MEETING_COLUMN_ORDER = (
-    "meeting", "requester", "status_label", "scheduled_date",
+    "meeting", "requester", "status_label", "received_date", "scheduled_date",
     "scheduled_time", "venue_label", "priority_label", "coordinator_name",
     "facilities_summary", "readiness_summary", "visitor_arrival_summary",
 )
+
+
+def _filters_by_received_date(filters: dict) -> bool:
+    """True when the query actually constrains created_at ("received")
+    rather than scheduled_date — created_after/created_before, or the
+    generic date_filters escape hatch pointed at the created_at column.
+    Used to decide whether "Received Date" needs to be in the default
+    table, since scheduled_date and created_at are different dates (a
+    meeting can be received in one week and scheduled for a date weeks
+    later) and a table showing only scheduled_date looks "wrong" to a
+    reader who filtered by received date, even though the filter itself
+    was applied correctly."""
+    if filters.get("created_after") or filters.get("created_before"):
+        return True
+    for d in filters.get("date_filters") or []:
+        if isinstance(d, dict) and d.get("column") == "created_at":
+            return True
+    return False
 
 # Preset for "meetings with incomplete visitor readiness" (visitors_not_ready
 # filter) — one row per meeting; the Visitor column lists ONLY the visitors
@@ -260,6 +282,53 @@ def _multi_word_ilike(column: str, text: str):
     clauses = [f"{column} ILIKE %s" for _ in words]
     params = [f"%{w}%" for w in words]
     return "(" + " AND ".join(clauses) + ")", params
+
+
+# Generic (column, operator, value) date-filter escape hatch — see each
+# list_* function's "date_filters" handling for why. Both pieces
+# user-controlled data could influence (the column, the operator) are
+# matched against a fixed whitelist before ever reaching the query
+# string; only the comparison VALUE is interpolated, and always as a
+# parameterized %s. Safe to extend to other tools' own date columns by
+# adding another {alias: {logical_name: real_column}} entry.
+_DATE_FILTER_OPS = {"eq", "gte", "lte", "gt", "lt", "between"}
+
+
+def _build_date_filter_conditions(date_filters, table_alias: str, allowed_columns: dict):
+    """`date_filters` is a list of {"column": str, "op": str, "value": str,
+    "value2": str (only for "between")} dicts, as supplied by the model.
+    `allowed_columns` maps the logical column names the model is allowed
+    to name (e.g. "scheduled_date") to this table's real qualified column
+    (e.g. "m.scheduled_date") — anything not in this map is silently
+    skipped, never passed through. Returns (sql_fragment, params); the
+    fragment is "" (no filtering) if nothing valid was given."""
+    clauses, params = [], []
+    if not isinstance(date_filters, list):
+        return "", []
+    for spec in date_filters:
+        if not isinstance(spec, dict):
+            continue
+        real_col = allowed_columns.get(spec.get("column"))
+        op = spec.get("op")
+        value = spec.get("value")
+        if not real_col or op not in _DATE_FILTER_OPS or not value:
+            continue
+        if op == "between":
+            value2 = spec.get("value2")
+            if not value2:
+                continue
+            clauses.append(f"{real_col} BETWEEN %s AND %s")
+            params.extend([value, value2])
+        else:
+            sql_op = {"eq": "=", "gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}[op]
+            clauses.append(f"{real_col} {sql_op} %s")
+            params.append(value)
+    if not clauses:
+        return "", []
+    return "(" + " AND ".join(clauses) + ")", params
+
+
+_MEETING_DATE_COLUMNS = {"scheduled_date": "m.scheduled_date", "created_at": "m.created_at"}
 
 
 def _status_label(val) -> str:
@@ -1127,7 +1196,8 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
                 WHERE v.meeting_request_id = m.id AND v.readiness_status != 3) AS incomplete_visitor_names,
                (SELECT ARRAY_AGG(DISTINCT f.facility ORDER BY f.facility)
                 FROM sg_office_meetingrequestfacility f
-                WHERE f.meeting_request_id = m.id AND f.status != 3) AS pending_facility_codes
+                WHERE f.meeting_request_id = m.id AND f.status != 3) AS pending_facility_codes,
+               (m.created_at AT TIME ZONE 'Asia/Dubai')::date AS received_date
         FROM sg_office_meetingrequest m
         LEFT JOIN user_management_user co ON co.id = m.coordinator_id
         LEFT JOIN user_management_user cb ON cb.id = m.created_by_id
@@ -1139,7 +1209,13 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
         status_val = str(filters["status"]).lower().replace("_", " ")
         reverse_map = {v.lower(): k for k, v in MEETING_STATUS_MAP.items()}
         if status_val == "upcoming":
-            conditions.append("m.status = ANY(%s)")
+            # Status alone (Confirmed/Rescheduled) isn't enough — a
+            # Confirmed meeting whose date has already passed is not
+            # "upcoming" in any sense a chat user means by the word, even
+            # though the dashboard's own status-tile convention counted it
+            # that way. Both conditions together: still in an
+            # upcoming-shaped status AND not already in the past.
+            conditions.append("m.status = ANY(%s) AND m.scheduled_date >= (NOW() AT TIME ZONE 'Asia/Dubai')::date")
             params.append(MEETING_UPCOMING_STATUSES)
         elif status_val in reverse_map:
             conditions.append("m.status = %s")
@@ -1239,6 +1315,38 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             "AND (date_trunc('month', (NOW() AT TIME ZONE 'Asia/Dubai')::date) + INTERVAL '1 month - 1 day')::date"
         )
 
+    if filters.get("scheduled_month"):
+        # "Scheduled for October" (any year, not necessarily THIS month —
+        # that's scheduled_this_month above) had no deterministic filter
+        # at all, only scheduled_after/scheduled_before, which require the
+        # model to compute the month's exact day boundaries itself. Live
+        # testing showed it doesn't even attempt that — it just drops the
+        # date constraint entirely and returns everything unfiltered,
+        # 3/3 trials, not occasional. A named month number removes the
+        # computation (and thus the failure) outright, same principle as
+        # scheduled_today/scheduled_this_week above.
+        conditions.append("EXTRACT(MONTH FROM m.scheduled_date) = %s")
+        params.append(filters["scheduled_month"])
+        if filters.get("scheduled_year"):
+            conditions.append("EXTRACT(YEAR FROM m.scheduled_date) = %s")
+            params.append(filters["scheduled_year"])
+
+    if filters.get("date_filters"):
+        # Generic (column, operator, value) escape hatch — instead of a
+        # new named filter for every possible comparison forever
+        # (scheduled_after/before/on/today/this_week/this_month/tomorrow,
+        # created_after/before, ... and the model still sometimes drops
+        # the constraint entirely rather than reach for the right one —
+        # see scheduled_month above), expose the two real date columns
+        # with a small whitelisted operator set. Column and operator are
+        # checked against fixed sets before ever touching the query
+        # string; only the comparison VALUE is model-supplied, and it
+        # only ever reaches SQL as a parameterized %s, never interpolated.
+        clause, p = _build_date_filter_conditions(filters["date_filters"], "m", _MEETING_DATE_COLUMNS)
+        if clause:
+            conditions.append(clause)
+            params.extend(p)
+
     if filters.get("not_ready"):
         # At least one facility prep task isn't Confirmed yet (status != 3).
         conditions.append(
@@ -1284,6 +1392,10 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
     if filters.get("created_after"):
         conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date >= %s")
         params.append(filters["created_after"])
+
+    if filters.get("created_before"):
+        conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date <= %s")
+        params.append(filters["created_before"])
 
     if filters.get("older_than_days"):
         conditions.append("(m.created_at AT TIME ZONE 'Asia/Dubai')::date < ((NOW() AT TIME ZONE 'Asia/Dubai')::date - (%s || ' days')::interval)")
@@ -1380,6 +1492,9 @@ def list_sg_office_meetings(conn, user_id: int, filters: dict = None) -> Dict[st
             chosen_fields, keep = list(MEETING_PENDING_FACILITIES_FIELDS), ("meeting",)
         else:
             chosen_fields, keep = list(MEETING_DEFAULT_FIELDS), ("requester", "meeting", "scheduled_date")
+            if _filters_by_received_date(filters):
+                chosen_fields = chosen_fields + ["received_date"]
+                keep = keep + ("received_date",)
         item = _apply_fields(item, chosen_fields, always_keep=keep)
         item = _reorder_item(item, MEETING_COLUMN_ORDER)
         result.append(item)

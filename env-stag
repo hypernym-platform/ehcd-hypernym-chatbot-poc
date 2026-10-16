@@ -1,3 +1,5 @@
+# env-stag — STAGING configuration for ehcd-chatbot.
+# Mirrors the be-hn-ehdc convention: Dockerfile does `cp env-${APP_ENV} .env`.
 # Staging configuration TEMPLATE — safe to commit, contains NO secret values.
 #
 # CI (.github/workflows/deploy-stag.yml (to be added with the staging CI)) runs this through `envsubst`, filling the
@@ -5,9 +7,15 @@
 # result as the k8s Secret `ehcd-chatbot-secrets` in namespace stag. The Deployment
 # consumes it with `envFrom.secretRef`.
 #
+# app.py:15 calls load_dotenv() with the default override=False, so real environment
+# variables WIN over this file. The `ehcd-chatbot-secrets` k8s Secret is the runtime
+# source of truth; this file is the committed fallback and key-list record.
 # Nothing here is baked into the image: the Dockerfile no longer copies an env
 # file, so the same image runs in any environment.
 #
+# PLACEHOLDERS ONLY — no staging environment exists yet. Fill when staging is built.
+# Present so that `--build-arg APP_ENV=stag` does not fail on a missing file.
+# Target state is Key Vault + CSI driver (checklist P10).
 # Adding a setting:
 #   non-secret -> write the literal value below
 #   secret     -> add ${NAME} below AND add NAME to the GitHub Environment
