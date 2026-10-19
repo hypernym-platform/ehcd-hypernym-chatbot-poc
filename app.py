@@ -379,6 +379,43 @@ def save_last_meeting_date_filter(user_key: str, filters: dict):
         logger.error(f"[MEETING_FILTER][SAVE] Failed for key={redis_key}: {e}")
 
 
+def get_last_listed_names(user_key: str) -> dict:
+    """{"project": [...], "task": [...], "resolution": [...]} — the real
+    names from the last list_projects/list_tasks/list_resolutions call of
+    each type. Demo failure this covers: "list all projects" then "give
+    detail about [one of the names from that table]" came back "no
+    project named X found" — not because X doesn't exist, but because raw
+    tool-call arguments are never part of persisted conversation history
+    (only the final text is), so the router has to retype X from memory
+    and/or re-guess which of the three detail tools applies. Resolving
+    the NEXT turn's name-based detail lookup against this cache instead
+    (see tools.py's _match_cached_entity_name) is deterministic and costs
+    no extra DB call — it substitutes the already-known-real name into
+    the one lookup that was always going to happen."""
+    redis_key = f"user_{user_key}_listed_names"
+    try:
+        raw = redis_client.get(redis_key)
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.error(f"[LISTED_NAMES][GET] Failed for key={redis_key}: {e}")
+        return {}
+
+
+def save_last_listed_names(user_key: str, names_by_type: dict):
+    """Merged with whatever's already cached, not overwritten — listing
+    tasks in turn 3 shouldn't erase projects listed back in turn 1; the
+    two entity types' continuation references are independent facts."""
+    if not names_by_type:
+        return
+    redis_key = f"user_{user_key}_listed_names"
+    try:
+        existing = get_last_listed_names(user_key)
+        existing.update(names_by_type)
+        redis_client.set(redis_key, json.dumps(existing, ensure_ascii=False, default=str), ex=3600)
+    except Exception as e:
+        logger.error(f"[LISTED_NAMES][SAVE] Failed for key={redis_key}: {e}")
+
+
 def save_conversation_history(user_key: str, history: list):
     redis_key = f"user_{user_key}_history"
 
@@ -650,6 +687,8 @@ async def handle_query(
         chart_intent = {}
         meeting_date_filter = {}
         cached_meeting_filter = get_last_meeting_date_filter(history_key)
+        listed_names = {}
+        cached_listed_names = get_last_listed_names(history_key)
         pending_tag = ""
 
         # Caught before any LLM call at all — this bot has no write tools,
@@ -684,6 +723,8 @@ async def handle_query(
                     chart_intent_collector=chart_intent,
                     cached_meeting_date_filter=cached_meeting_filter,
                     meeting_date_filter_collector=meeting_date_filter,
+                    cached_listed_names=cached_listed_names,
+                    listed_names_collector=listed_names,
                 ):
                     assistant_response += chunk
                     plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
@@ -738,6 +779,7 @@ async def handle_query(
         if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
             retry_tool_results, retry_chart_intent, retry_response = [], {}, ""
             retry_meeting_filter = {}
+            retry_listed_names = {}
             try:
                 for chunk in run_chatbot_graph(
                     query=query, conversation_history=conversation_history,
@@ -750,6 +792,8 @@ async def handle_query(
                     chart_intent_collector=retry_chart_intent,
                     cached_meeting_date_filter=cached_meeting_filter,
                     meeting_date_filter_collector=retry_meeting_filter,
+                    cached_listed_names=cached_listed_names,
+                    listed_names_collector=retry_listed_names,
                 ):
                     retry_response += chunk
             except Exception as e:
@@ -778,6 +822,8 @@ async def handle_query(
                     chart_palette = retry_palette
                     if retry_meeting_filter:
                         meeting_date_filter = retry_meeting_filter
+                    if retry_listed_names:
+                        listed_names = retry_listed_names
                     if rows_for_chart:
                         save_last_chart_rows(history_key, rows_for_chart)
 
@@ -787,6 +833,11 @@ async def handle_query(
         # from conversation history alone.
         if meeting_date_filter:
             save_last_meeting_date_filter(history_key, meeting_date_filter)
+        # Same idea for project/task/resolution names this turn actually
+        # listed — see get_last_listed_names for the exact demo failure
+        # this exists to prevent.
+        if listed_names:
+            save_last_listed_names(history_key, listed_names)
 
         # Log-only sanity check — never alters the response, just surfaces
         # a chart/text/data mismatch for review (see validate_output_consistency).
@@ -1094,6 +1145,8 @@ async def websocket_chat(ws: WebSocket):
             chart_intent = {}
             meeting_date_filter = {}
             cached_meeting_filter = get_last_meeting_date_filter(history_key)
+            listed_names = {}
+            cached_listed_names = get_last_listed_names(history_key)
             pending_tag = ""
             async_q = asyncio.Queue()
             loop = asyncio.get_event_loop()
@@ -1120,6 +1173,8 @@ async def websocket_chat(ws: WebSocket):
                         chart_intent_collector=chart_intent,
                         cached_meeting_date_filter=cached_meeting_filter,
                         meeting_date_filter_collector=meeting_date_filter,
+                        cached_listed_names=cached_listed_names,
+                        listed_names_collector=listed_names,
                     ):
                         loop.call_soon_threadsafe(async_q.put_nowait, ("chunk", chunk))
                 except Exception as e:
@@ -1183,6 +1238,7 @@ async def websocket_chat(ws: WebSocket):
             if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
                 retry_tool_results, retry_chart_intent = [], {}
                 retry_meeting_filter = {}
+                retry_listed_names = {}
 
                 def _run_retry_sync():
                     text = ""
@@ -1197,6 +1253,8 @@ async def websocket_chat(ws: WebSocket):
                         chart_intent_collector=retry_chart_intent,
                         cached_meeting_date_filter=cached_meeting_filter,
                         meeting_date_filter_collector=retry_meeting_filter,
+                        cached_listed_names=cached_listed_names,
+                        listed_names_collector=retry_listed_names,
                     ):
                         text += c
                     return text
@@ -1230,6 +1288,8 @@ async def websocket_chat(ws: WebSocket):
                         chart_palette = retry_palette
                         if retry_meeting_filter:
                             meeting_date_filter = retry_meeting_filter
+                        if retry_listed_names:
+                            listed_names = retry_listed_names
                         if rows_for_chart:
                             save_last_chart_rows(history_key, rows_for_chart)
 
@@ -1237,6 +1297,8 @@ async def websocket_chat(ws: WebSocket):
             # endpoint for the same.
             if meeting_date_filter:
                 save_last_meeting_date_filter(history_key, meeting_date_filter)
+            if listed_names:
+                save_last_listed_names(history_key, listed_names)
 
             # Log-only sanity check — see the REST endpoint for the same.
             try:
