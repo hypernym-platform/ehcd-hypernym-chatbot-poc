@@ -342,8 +342,29 @@ def _fmt_jsonb(j: Any) -> str:
     if j is None:
         return ""
     if isinstance(j, (dict, list)):
+        if not j:
+            return ""
         return json.dumps(j, ensure_ascii=False, indent=2)
     return str(j)
+
+
+def _flatten_detail_result(result: dict) -> dict:
+    """Shared cleanup for get_*_details results (project/task/resolution):
+    format any still-nested JSONB-shaped column into readable text (catches
+    any such column by shape, not a hardcoded field-name list that can
+    silently miss one — e.g. an _ar variant added later), then drop any
+    key whose value is empty entirely, rather than leaving a visible but
+    blank row. An empty Summary Heading or Notes field isn't information —
+    it's the DB saying this was never filled in, so the row shouldn't
+    exist in the table at all. 0/False survive (never falsy-equal to None/
+    ""/[]/{{}} ), so a real zero value is never dropped."""
+    for key, val in list(result.items()):
+        if isinstance(val, (dict, list)):
+            result[key] = _fmt_jsonb(val)
+    for key, val in list(result.items()):
+        if val is None or val == "" or val == [] or val == {}:
+            result.pop(key)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -544,15 +565,24 @@ def get_project_details(conn, user_id: int, project_id: int = None,
                 WHERE p.id = %s
             """, (project_id,))
         elif project_name:
-            cur.execute("""
+            # Multi-word ILIKE (ANDs each word, any order) instead of one
+            # contiguous substring — a plain ILIKE zeroes out on any
+            # wording/punctuation mismatch between what the router passes
+            # and the DB's literal name (an em dash, reordered words, an
+            # extra word), which silently turns a real project into a
+            # false "not found". Same fix already used by list_projects'
+            # own name/org/subject filters elsewhere in this file.
+            clause_en, params_en = _multi_word_ilike("p.project_name_en", project_name)
+            clause_ar, params_ar = _multi_word_ilike("p.project_name_ar", project_name)
+            cur.execute(f"""
                 SELECT p.*, COALESCE(c.category_name_en, c.category_name_ar) AS category_name,
                        u.full_name_en AS manager_name
                 FROM project_management_project p
                 LEFT JOIN project_management_projectcategory c ON c.id = p.project_category_id
                 LEFT JOIN user_management_user u ON u.id = p.project_manager_id
-                WHERE p.project_name_en ILIKE %s OR p.project_name_ar ILIKE %s
+                WHERE ({clause_en} OR {clause_ar})
                 LIMIT 1
-            """, (f"%{project_name}%", f"%{project_name}%"))
+            """, params_en + params_ar)
         else:
             return {"error": "project_id or project_name is required"}
 
@@ -567,43 +597,64 @@ def get_project_details(conn, user_id: int, project_id: int = None,
             if not user_can_access_project(conn, user_id, pid):
                 return {"error": "Access denied to this project"}
 
-        result = {
-            "project": dict(project),
-            "status_en": _status_label(project.get("status_en")),
-        }
+        # One flat dict, not {"project": {...}, "budget": {...}, "team":
+        # [...]} — nesting budget/team as their own dict/list made
+        # render_tool_result_html's _is_detail_wrapper() check fail (it
+        # requires EVERY top-level value to be dict/list, and this shape's
+        # own top-level "status_en" is a plain string), which fell through
+        # to the generic path that renders any dict/list value as a nested
+        # <table> inside a single cell — a full sub-table for Budget, one
+        # for Team, instead of one single table. Flattening everything to
+        # scalars (below) means there's nothing left to recurse into, and
+        # also fixes a second bug this exposed: the nested "project" dict
+        # kept its own RAW status_en code (e.g. "3") sitting right next to
+        # the resolved "Status (EN)" label value outside it — overwriting
+        # the same key in one merged dict removes that raw duplicate too.
+        result = dict(project)
+        result["status_en"] = _status_label(project.get("status_en"))
+        if project.get("status_ar") is not None:
+            result["status_ar"] = STATUS_MAP_AR.get(project["status_ar"], str(project["status_ar"]))
 
-        # Budget
+        # Budget — one readable line instead of a nested sub-table;
+        # created_at/updated_at on the budget row are internal bookkeeping
+        # a "project details" question never asked for.
         if budget_ok:
             cur.execute("""
-                SELECT allocated_budget, spent_budget, budget_left, created_at,
-                       updaed_at AS updated_at
+                SELECT allocated_budget, spent_budget, budget_left
                 FROM project_management_projectbudget WHERE project_id = %s LIMIT 1
             """, (pid,))
-            result["budget"] = dict(cur.fetchone()) if cur.rowcount else None
+            b = cur.fetchone()
+            result["budget"] = (
+                f"Allocated: {b['allocated_budget']}, Spent: {b['spent_budget']}, "
+                f"Remaining: {b['budget_left']}"
+            ) if b else None
 
-        # Team
+        # Team — same flattening, same reason.
         cur.execute("""
-            SELECT id, name_en, name_ar, designation_en, designation_ar, created_at, updated_at
+            SELECT name_en, designation_en
             FROM project_management_teammember WHERE project_id = %s ORDER BY id
         """, (pid,))
-        result["team"] = [dict(r) for r in cur.fetchall()]
+        team_rows = cur.fetchall()
+        result["team"] = ", ".join(
+            f"{m['name_en']} ({m['designation_en']})" if m.get("designation_en") else m["name_en"]
+            for m in team_rows
+        ) if team_rows else None
 
-        # Notes (only user's own notes)
+        # Notes (only user's own notes) — same flattening.
         if notes_ok:
             cur.execute("""
-                SELECT id, title, note, user_id, date, created_at, updated_at
+                SELECT title, note
                 FROM project_management_projectnotes
                 WHERE project_id = %s AND user_id = %s
                 ORDER BY created_at DESC NULLS LAST, id DESC
             """, (pid, user_id))
-            result["notes"] = [dict(r) for r in cur.fetchall()]
+            note_rows = cur.fetchall()
+            result["notes"] = "; ".join(
+                f"{n['title']}: {n['note']}" if n.get("title") else n["note"]
+                for n in note_rows
+            ) if note_rows else None
 
-        # Format JSONB fields for readability
-        for key in ["summary_heading_en", "summary_description_en", "progress_to_date_en",
-                     "next_step_en", "next_step_due_date"]:
-            val = project.get(key)
-            if val:
-                result["project"][key] = _fmt_jsonb(val)
+        result = _flatten_detail_result(result)
 
     return result
 
@@ -1979,6 +2030,17 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
         )""")
         params.extend([f"%{filters['entity_name']}%", f"%{filters['entity_name']}%"])
 
+    if filters.get("task_name"):
+        # Real gap, not just a router-routing workaround: this tool had NO
+        # way at all to filter by the task's OWN name, only by the
+        # organizational entity_name — so even a correctly-phrased "list
+        # tasks with 'grant' in the name" had nowhere to go. Multi-word
+        # ILIKE, same convention as every other name filter in this file.
+        clause_en, p_en = _multi_word_ilike("t.task_name", filters["task_name"])
+        clause_ar, p_ar = _multi_word_ilike("t.task_name_ar", filters["task_name"])
+        conditions.append(f"({clause_en} OR {clause_ar})")
+        params.extend(p_en + p_ar)
+
     if filters.get("requires_presentation") is not None:
         conditions.append("t.requires_presentation_to_main_council = %s")
         params.append(filters["requires_presentation"])
@@ -2034,7 +2096,13 @@ def get_task_details(conn, user_id: int, task_id: int = None,
                 WHERE t.id = %s
             """, (task_id,))
         elif task_name:
-            cur.execute("""
+            # Multi-word ILIKE (ANDs each word, any order) — see
+            # get_project_details' own fix above for why a plain
+            # contiguous ILIKE silently turns a real task into a false
+            # "not found" on any wording/punctuation mismatch.
+            clause_en, params_en = _multi_word_ilike("t.task_name", task_name)
+            clause_ar, params_ar = _multi_word_ilike("t.task_name_ar", task_name)
+            cur.execute(f"""
                 SELECT t.*,
                        u.full_name_en AS owner_name,
                        c.category_name_en AS category_name,
@@ -2045,9 +2113,9 @@ def get_task_details(conn, user_id: int, task_id: int = None,
                 LEFT JOIN project_management_projectcategory c ON c.id = t.category_id
                 LEFT JOIN task_management_committee cm ON cm.id = t.proposed_committee_id
                 LEFT JOIN project_management_projectentity e ON e.id = t.entity_id
-                WHERE t.task_name ILIKE %s OR t.task_name_ar ILIKE %s
+                WHERE ({clause_en} OR {clause_ar})
                 LIMIT 1
-            """, (f"%{task_name}%", f"%{task_name}%"))
+            """, params_en + params_ar)
         else:
             return {"error": "task_id or task_name is required"}
 
@@ -2060,37 +2128,56 @@ def get_task_details(conn, user_id: int, task_id: int = None,
         if not user_can_access_task(conn, user_id, tid):
             return {"error": "Access denied to this task"}
 
-        result = {"task": dict(task), "status_label": _status_label(task.get("status_en"))}
+        # One flat dict — see get_project_details above for why nesting
+        # {"task": {...}, "advisors": [...], ...} produced nested
+        # sub-tables instead of one single table.
+        # Overwrite status_en/status_ar IN PLACE with resolved labels
+        # (rather than adding a separate "status_label" key alongside the
+        # still-raw numeric code) — same reasoning as get_project_details:
+        # one merged dict with one key per fact, not a raw code and its
+        # resolved label both visible as separate rows.
+        result = dict(task)
+        result["status_en"] = _status_label(task.get("status_en"))
+        if task.get("status_ar") is not None:
+            result["status_ar"] = STATUS_MAP_AR.get(task["status_ar"], str(task["status_ar"]))
 
-        # Advisors
+        # Advisors — one readable line instead of a nested sub-table.
         cur.execute("""
-            SELECT id, name_en, name_ar, designation_en, designation_ar, created_at
+            SELECT name_en, designation_en
             FROM task_management_taskadvisor WHERE task_id = %s ORDER BY id
         """, (tid,))
-        result["advisors"] = [dict(r) for r in cur.fetchall()]
+        advisor_rows = cur.fetchall()
+        result["advisors"] = ", ".join(
+            f"{a['name_en']} ({a['designation_en']})" if a.get("designation_en") else a["name_en"]
+            for a in advisor_rows
+        ) if advisor_rows else None
 
-        # Committee members (if task has a proposed committee)
+        # Committee members (if task has a proposed committee) — same.
         if task.get("proposed_committee_id"):
             cur.execute("""
-                SELECT cm.id, u.full_name_en AS member_name, u.email, u.designation
+                SELECT u.full_name_en AS member_name, u.designation
                 FROM task_management_committeemember cm
                 JOIN user_management_user u ON u.id = cm.user_id
                 WHERE cm.committee_id = %s ORDER BY cm.id
             """, (task["proposed_committee_id"],))
-            result["committee_members"] = [dict(r) for r in cur.fetchall()]
+            member_rows = cur.fetchall()
+            result["committee_members"] = ", ".join(
+                f"{m['member_name']} ({m['designation']})" if m.get("designation") else m["member_name"]
+                for m in member_rows
+            ) if member_rows else None
 
-        # Subtasks
+        # Subtasks — one line per subtask ("Name (Status)"), not a nested
+        # table of their own.
         cur.execute("""
-            SELECT id, task_name, task_name_ar, status_en, status_ar,
-                   date_of_request, status_detail_en
+            SELECT task_name, status_en
             FROM task_management_task WHERE subtask_id = %s ORDER BY id
         """, (tid,))
-        subtasks = cur.fetchall()
-        result["subtasks"] = []
-        for st in subtasks:
-            d = dict(st)
-            d["status_label"] = _status_label(d.get("status_en"))
-            result["subtasks"].append(d)
+        subtask_rows = cur.fetchall()
+        result["subtasks"] = ", ".join(
+            f"{st['task_name']} ({_status_label(st.get('status_en'))})" for st in subtask_rows
+        ) if subtask_rows else None
+
+        result = _flatten_detail_result(result)
 
     return result
 
@@ -2176,7 +2263,10 @@ def get_resolution_details(conn, user_id: int, resolution_id: int = None,
                 WHERE r.resolution_id = %s
             """, (resolution_id,))
         elif resolution_topic:
-            cur.execute("""
+            # Multi-word ILIKE — see get_project_details' own fix above.
+            clause_en, params_en = _multi_word_ilike("r.resolution_topic_en", resolution_topic)
+            clause_ar, params_ar = _multi_word_ilike("r.resolution_topic_ar", resolution_topic)
+            cur.execute(f"""
                 SELECT r.*,
                        u.full_name_en AS owner_name,
                        e.entity_name_en AS entity_name,
@@ -2185,9 +2275,9 @@ def get_resolution_details(conn, user_id: int, resolution_id: int = None,
                 LEFT JOIN user_management_user u ON u.id = r.resolution_owner_id
                 LEFT JOIN project_management_projectentity e ON e.id = r.responsible_entity_id
                 LEFT JOIN user_management_user cb ON cb.id = r.created_by_id
-                WHERE r.resolution_topic_en ILIKE %s OR r.resolution_topic_ar ILIKE %s
+                WHERE ({clause_en} OR {clause_ar})
                 LIMIT 1
-            """, (f"%{resolution_topic}%", f"%{resolution_topic}%"))
+            """, params_en + params_ar)
         else:
             return {"error": "resolution_id or resolution_topic is required"}
 
@@ -2200,36 +2290,45 @@ def get_resolution_details(conn, user_id: int, resolution_id: int = None,
         if not user_can_access_resolution(conn, user_id, rid):
             return {"error": "Access denied to this resolution"}
 
-        result = {
-            "resolution": dict(resolution),
-            "status_label": _status_label(resolution.get("resolution_status")),
-        }
+        # One flat dict — see get_project_details above for why nesting
+        # {"resolution": {...}, "details": [...], ...} produced nested
+        # sub-tables instead of one single table. resolution_status is
+        # overwritten in place with its resolved label, not added as a
+        # separate "status_label" key next to the still-raw code.
+        result = dict(resolution)
+        result["resolution_status"] = _status_label(resolution.get("resolution_status"))
 
-        # Details
+        # Details — one readable line instead of a nested sub-table.
         cur.execute("""
-            SELECT id, detail_en, detail_ar, created_at
-            FROM resolution_management_resolutiondetail
+            SELECT detail_en FROM resolution_management_resolutiondetail
             WHERE resolution_id = %s ORDER BY id
         """, (rid,))
-        result["details"] = [dict(r) for r in cur.fetchall()]
+        detail_rows = cur.fetchall()
+        result["details"] = "; ".join(d["detail_en"] for d in detail_rows if d.get("detail_en")) or None
 
-        # Committees
+        # Committees — same flattening.
         cur.execute("""
-            SELECT rc.id, c.committee_name_en, c.committee_name_ar
+            SELECT c.committee_name_en
             FROM resolution_management_resolutioncommittee rc
             JOIN task_management_committee c ON c.id = rc.committee_id
             WHERE rc.resolution_id = %s ORDER BY rc.id
         """, (rid,))
-        result["committees"] = [dict(r) for r in cur.fetchall()]
+        committee_rows = cur.fetchall()
+        result["committees"] = ", ".join(c["committee_name_en"] for c in committee_rows) or None
 
-        # Supporting team
+        # Supporting team — same flattening.
         cur.execute("""
-            SELECT st.id, u.full_name_en AS member_name, u.email,
-                   u.designation, u.department
+            SELECT u.full_name_en AS member_name, u.designation
             FROM resolution_management_resolutionsupportingteam st
             JOIN user_management_user u ON u.id = st.user_id
             WHERE st.resolution_id = %s ORDER BY st.id
         """, (rid,))
-        result["supporting_team"] = [dict(r) for r in cur.fetchall()]
+        team_rows = cur.fetchall()
+        result["supporting_team"] = ", ".join(
+            f"{m['member_name']} ({m['designation']})" if m.get("designation") else m["member_name"]
+            for m in team_rows
+        ) if team_rows else None
+
+        result = _flatten_detail_result(result)
 
     return result
