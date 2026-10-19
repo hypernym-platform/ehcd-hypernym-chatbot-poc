@@ -2264,6 +2264,36 @@ def _verified_breakdown_counts(tool_results) -> str:
     )
 
 
+def _memo_draft_exclusion_note(tool_results) -> str:
+    """Draft memos don't count toward this office's "total memos" — see
+    db_queries.py's list_sg_office_direction_items, which already excludes
+    Draft from total_count for a single unfiltered memo call. But a "total
+    memos?" question doesn't always reach that function as one unfiltered
+    call — live testing showed the router sometimes fans out into one call
+    PER status instead, and then adds the per-call total_counts back up
+    itself (Draft's own 1 included), landing right back on the wrong total
+    regardless of what db_queries.py returned. tool_results_for_chart ends
+    up holding the full row set either way (one call's data, or the union
+    of several), so counting Draft rows directly here catches both call
+    patterns. Only fires when a Draft row is actually present among this
+    turn's memo rows — no note, no behavior change, for any other query."""
+    if not isinstance(tool_results, list):
+        return ""
+    memo_rows = [r for r in tool_results if isinstance(r, dict) and r.get("item_type_label") == "Memo"]
+    if len(memo_rows) < 2:
+        return ""
+    non_draft_count = sum(1 for r in memo_rows if r.get("status_label") != "Draft")
+    if non_draft_count == len(memo_rows):
+        return ""
+    return (
+        f"\n\nThis office's own convention does not count Draft memos "
+        f"toward a \"total\" — if asked for the total number of memos "
+        f"(across all statuses), state {non_draft_count}, not "
+        f"{len(memo_rows)}. Still show Draft's own count normally in any "
+        f"per-status breakdown."
+    )
+
+
 def answer_node(state: ChatState) -> dict:
     """Generate final streamed answer. ALL responses go through this node."""
     client = state["client"]
@@ -2281,6 +2311,7 @@ def answer_node(state: ChatState) -> dict:
         today=today,
     )
     answer_system += _verified_breakdown_counts(state.get("tool_results_for_chart"))
+    answer_system += _memo_draft_exclusion_note(state.get("tool_results_for_chart"))
     # Ground the model in its OWN router decision instead of letting it
     # freely claim/deny a chart — it has no other way to know whether one
     # will actually render below its text.
