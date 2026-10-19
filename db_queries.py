@@ -1049,7 +1049,22 @@ def list_sg_office_direction_items(conn, user_id: int, filters: dict = None) -> 
         item = _reorder_item(item, DIRECTION_ITEM_COLUMN_ORDER)
         result.append(item)
 
-    return {"total_count": len(result), "data": result}
+    total_count = len(result)
+    if filters.get("item_type") and not filters.get("status"):
+        reverse_map = {v.lower().replace(" ", "_"): k for k, v in DIRECTION_ITEM_TYPE_MAP.items()}
+        it = reverse_map.get(str(filters["item_type"]).lower().replace(" ", "_"))
+        if it == 2:
+            # Draft memos aren't counted toward "total memos" in this
+            # office's own reporting convention — a memo isn't official
+            # until it leaves Draft. Each Draft item still appears in
+            # `data` (so a per-status breakdown built from it still shows
+            # Draft's own count), only the aggregate total excludes them.
+            # Doesn't apply when the caller explicitly filtered to a
+            # status (e.g. "how many Draft memos" should report the Draft
+            # count itself, not 0).
+            total_count = sum(1 for r in rows if r.get("status") != 1)
+
+    return {"total_count": total_count, "data": result}
 
 
 def get_sg_office_direction_item_details(conn, user_id: int, item_id: int = None,
