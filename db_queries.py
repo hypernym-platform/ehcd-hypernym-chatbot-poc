@@ -285,6 +285,36 @@ def _multi_word_ilike(column: str, text: str):
     return "(" + " AND ".join(clauses) + ")", params
 
 
+def _resolve_unique_name_match(rows, query_text: str, *name_fields: str):
+    """Given rows that all matched a name-based ILIKE search (a
+    _multi_word_ilike WHERE clause has no concept of "best" match, only
+    "matches"), pick the single correct one deterministically instead of
+    taking whichever the DB happens to return first. Seen live: "give
+    detail of Test" silently returned "Test Project" even though a
+    project literally named "test" ALSO exists — a plain LIMIT 1 with no
+    ORDER BY has no way to prefer the exact match over the
+    merely-contains one, however much longer/more title-like the other
+    candidate looks. An exact (case-insensitive) match on any of the
+    given name fields always wins.
+
+    Returns (row, None) on a clean resolution (0 or 1 rows, or exactly
+    one exact match among several). Returns (None, [candidate names])
+    when it's still genuinely ambiguous — more than one row, no single
+    exact match — so the caller can surface that list instead of
+    guessing."""
+    if len(rows) <= 1:
+        return (rows[0] if rows else None), None
+    q = (query_text or "").strip().lower()
+    exact = [
+        r for r in rows
+        if any((r.get(f) or "").strip().lower() == q for f in name_fields)
+    ]
+    if len(exact) == 1:
+        return exact[0], None
+    candidates = [r.get(name_fields[0]) for r in rows]
+    return None, candidates
+
+
 # Generic (column, operator, value) date-filter escape hatch — see each
 # list_* function's "date_filters" handling for why. Both pieces
 # user-controlled data could influence (the column, the operator) are
@@ -717,12 +747,20 @@ def get_project_details(conn, user_id: int, project_id: int = None,
                 LEFT JOIN project_management_projectcategory c ON c.id = p.project_category_id
                 LEFT JOIN user_management_user u ON u.id = p.project_manager_id
                 WHERE ({clause_en} OR {clause_ar})
-                LIMIT 1
             """, params_en + params_ar)
         else:
             return {"error": "project_id or project_name is required"}
 
-        project = cur.fetchone()
+        if project_id:
+            project = cur.fetchone()
+        else:
+            project, ambiguous = _resolve_unique_name_match(
+                cur.fetchall(), project_name, "project_name_en", "project_name_ar")
+            if project is None and ambiguous:
+                return {
+                    "error": f"Multiple projects match '{project_name}': "
+                             f"{', '.join(ambiguous)}. Please specify which one you mean."
+                }
         if not project:
             return {"error": "Project not found"}
 
@@ -2217,7 +2255,17 @@ def list_tasks(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
     result = []
     for r in rows:
         item = dict(r)
-        item["status_label"] = _status_label(item.get("status_en"))
+        # Overwrite status_en/status_ar IN PLACE with resolved labels,
+        # same convention as get_task_details — adding a separate
+        # "status_label" key here left the raw numeric status_en
+        # sitting right next to it, and unlike list_projects/
+        # list_resolutions (whose raw field names happen to be covered
+        # by the renderer's own hardcoded drop list), "status_en" as a
+        # RAW key isn't, so it rendered as its own "Status (EN): 1"
+        # column alongside "Status Label: In progress" — seen live.
+        item["status_en"] = _status_label(item.get("status_en"))
+        if item.get("status_ar") is not None:
+            item["status_ar"] = STATUS_MAP_AR.get(item["status_ar"], str(item["status_ar"]))
         item["date_of_request"] = str(item["date_of_request"]) if item.get("date_of_request") else None
         result.append(item)
     return {"total_count": len(result), "data": result}
@@ -2260,12 +2308,20 @@ def get_task_details(conn, user_id: int, task_id: int = None,
                 LEFT JOIN task_management_committee cm ON cm.id = t.proposed_committee_id
                 LEFT JOIN project_management_projectentity e ON e.id = t.entity_id
                 WHERE ({clause_en} OR {clause_ar})
-                LIMIT 1
             """, params_en + params_ar)
         else:
             return {"error": "task_id or task_name is required"}
 
-        task = cur.fetchone()
+        if task_id:
+            task = cur.fetchone()
+        else:
+            task, ambiguous = _resolve_unique_name_match(
+                cur.fetchall(), task_name, "task_name", "task_name_ar")
+            if task is None and ambiguous:
+                return {
+                    "error": f"Multiple tasks match '{task_name}': "
+                             f"{', '.join(ambiguous)}. Please specify which one you mean."
+                }
         if not task:
             return {"error": "Task not found"}
 
@@ -2322,6 +2378,11 @@ def get_task_details(conn, user_id: int, task_id: int = None,
         result["subtasks"] = ", ".join(
             f"{st['task_name']} ({_status_label(st.get('status_en'))})" for st in subtask_rows
         ) if subtask_rows else None
+
+        # Same reason as get_project_details' project_file removal —
+        # tasks have their own equivalent file column, missed the first
+        # time since it's not the same column name.
+        result.pop("task_file", None)
 
         result = _flatten_detail_result(result)
 
@@ -2422,12 +2483,20 @@ def get_resolution_details(conn, user_id: int, resolution_id: int = None,
                 LEFT JOIN project_management_projectentity e ON e.id = r.responsible_entity_id
                 LEFT JOIN user_management_user cb ON cb.id = r.created_by_id
                 WHERE ({clause_en} OR {clause_ar})
-                LIMIT 1
             """, params_en + params_ar)
         else:
             return {"error": "resolution_id or resolution_topic is required"}
 
-        resolution = cur.fetchone()
+        if resolution_id:
+            resolution = cur.fetchone()
+        else:
+            resolution, ambiguous = _resolve_unique_name_match(
+                cur.fetchall(), resolution_topic, "resolution_topic_en", "resolution_topic_ar")
+            if resolution is None and ambiguous:
+                return {
+                    "error": f"Multiple resolutions match '{resolution_topic}': "
+                             f"{', '.join(ambiguous)}. Please specify which one you mean."
+                }
         if not resolution:
             return {"error": "Resolution not found"}
 
