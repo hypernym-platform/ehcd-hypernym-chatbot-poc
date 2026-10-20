@@ -29,6 +29,7 @@ from db_queries import (
     get_task_details,
     list_resolutions,
     get_resolution_details,
+    get_all_entity_names,
     list_sg_office_emails,
     get_sg_office_email_details,
     list_sg_office_meetings,
@@ -145,7 +146,7 @@ TOOL_DEFINITIONS = [
                     },
                     "category": {
                         "type": "string",
-                        "description": "Filter by category name (partial match)",
+                        "description": "Filter by the project's broad classification/category (e.g. 'Education', 'Infrastructure', 'Research and Innovation') — a general grouping tag, never a specific project's own name or title. If the user named one particular project, use project_name on get_project_details instead, not this.",
                     },
                     "project_manager": {
                         "type": "string",
@@ -1625,18 +1626,15 @@ Seen going wrong: "list upcoming meetings" (status=upcoming) followed by
 "create a chart of all external meetings" re-used status=upcoming instead
 of dropping it — "all" explicitly means unfiltered, and the second
 question never said "upcoming" itself.
-12. "Give me details of X" (or similar) doesn't always say whether X is a
-project, a task, or a resolution — there are three separate "get details"
-tools, one per type, and guessing wrong gets the user a false "not found"
-for a record that's real, just under a different tool. If the conversation
-already makes the type clear — the user said "project"/"task"/"resolution",
-or X was just shown in a list_projects/list_tasks/list_resolutions result
-earlier in this conversation — call the matching tool directly, no need to
-ask. Only when it's genuinely unclear which type X is, and nothing in this
-conversation disambiguates it, do NOT guess and do NOT call any of the
-three "get details" tools — instead respond with a short plain-text
-question asking the user which one they mean (e.g. "Is that a project, a
-task, or a resolution?").
+12. "Give me details of X" doesn't always say whether X is a project, a
+task, or a resolution. Don't withhold the tool call to hedge against
+guessing wrong — call whichever of get_project_details/get_task_details/
+get_resolution_details looks like the best fit (conversation context,
+wording, anything you have). A wrong guess here is NOT a dead end: it is
+caught and corrected automatically downstream from a real "not found", so
+guessing and being wrong costs nothing — but making NO tool call at all
+for a named-record question is never correct, since nothing downstream
+can recover from that.
 User information:
 - Name: {user_name}
 - Role: {user_role}
@@ -1795,6 +1793,8 @@ class ChatState(TypedDict):
     meeting_date_filter: dict
     cached_listed_names: dict
     listed_names: dict
+    failed_detail_lookup: Optional[dict]
+    needs_entity_clarification: bool
     needs_more_tools: bool
     final_response: str
     chunk_queue: Any
@@ -2131,6 +2131,20 @@ def tool_executor_node(state: ChatState) -> dict:
         "get_task_details": "task_name",
         "get_resolution_details": "resolution_topic",
     }
+    # (list_* tool -> the one filter param a confused router plausibly
+    # stuffs a specific record's own name into instead of calling the
+    # matching get_*_details tool) — list_projects has no entity_name
+    # equivalent, only category; list_tasks/list_resolutions have no
+    # category equivalent, only entity_name. Deliberately NOT every
+    # string filter on each tool (status/project_manager/advisor/owner
+    # are people/status names, not evidenced as a misuse target, and
+    # checking them risks misreading a genuinely empty search as a
+    # missed entity lookup).
+    _LIST_TOOL_NAME_LIKE_FILTERS = {
+        "list_projects": "category",
+        "list_tasks": "entity_name",
+        "list_resolutions": "entity_name",
+    }
 
     # Any call in this turn asking for a chart means the turn wants one —
     # the router decided this directly, from the full conversation, not a
@@ -2223,6 +2237,14 @@ def tool_executor_node(state: ChatState) -> dict:
     # or makes a normal empty result sound like something broke.
     had_technical_error = False
     had_empty_result = False
+    # Set when a name-based get_project_details/get_task_details/
+    # get_resolution_details call this round came back "not found" — read
+    # by after_tools (the conditional edge below) to route to
+    # entity_resolver_node instead of straight to router/answer. Last
+    # such failure in the round wins if more than one happened (rare);
+    # handling the common single-failure case cleanly matters more than
+    # a multi-failure edge case that's never been seen live.
+    failed_detail_lookup = None
     # This turn's own project/task/resolution names, captured from any
     # list_projects/list_tasks/list_resolutions call that actually ran —
     # surfaced below as "listed_names" so app.py can cache it (merged with
@@ -2273,12 +2295,50 @@ def tool_executor_node(state: ChatState) -> dict:
                 pass
             elif "not found" in err_lower:
                 had_empty_result = True
+                name_key = _DETAIL_LOOKUP_TOOLS.get(tool_call.function.name)
+                name_value = fn_args.get(name_key) if name_key else None
+                if name_value:
+                    # A real miss under THIS entity type — but "give
+                    # detail of X" often never says which of the three
+                    # types X is, so this could just be the wrong guess,
+                    # not proof X doesn't exist anywhere (seen live: a
+                    # real TASK, asked about with no type named, got
+                    # routed to get_project_details and reported "not
+                    # found"). entity_resolver_node checks the other two
+                    # types before accepting that.
+                    failed_detail_lookup = {
+                        "tool_call_id": tool_call.id,
+                        "fn_name": tool_call.function.name,
+                        "name_key": name_key,
+                        "name_value": name_value,
+                    }
             else:
                 had_technical_error = True
         elif isinstance(parsed, list) and len(parsed) == 0:
             had_empty_result = True
         elif isinstance(parsed, dict) and parsed.get("total_count") == 0:
             had_empty_result = True
+            # Same recovery as the "not found" branch above, for a
+            # different shape of the same mistake: instead of calling
+            # get_project_details/get_task_details/get_resolution_details
+            # at all, the router sometimes stuffs a specific record's own
+            # name into a LISTING tool's nearest-sounding filter instead
+            # (seen live: list_projects({'category': 'Vocational
+            # curriculum review'}) — that's a real TASK's name, not a
+            # category, and the project listing came back legitimately
+            # empty). Only the filters known to plausibly take a name
+            # this way are checked, not every string filter, so a
+            # genuinely empty project_manager/advisor/status search isn't
+            # misread as a missed entity lookup.
+            name_key = _LIST_TOOL_NAME_LIKE_FILTERS.get(tool_call.function.name)
+            name_value = fn_args.get(name_key) if name_key else None
+            if name_value:
+                failed_detail_lookup = {
+                    "tool_call_id": tool_call.id,
+                    "fn_name": tool_call.function.name,
+                    "name_key": name_key,
+                    "name_value": name_value,
+                }
 
         if isinstance(parsed, (list, dict)) and not is_duplicate_call:
             for filt in _PROVENANCE_FILTERS:
@@ -2370,6 +2430,115 @@ def tool_executor_node(state: ChatState) -> dict:
         # overwrite; a type listed in an earlier round of the same turn
         # survives untouched into later rounds.
         "listed_names": {**(state.get("listed_names") or {}), **listed_names},
+        # This round's own finding only (never OR'd/carried-forward like
+        # the flags above) — entity_resolver_node clears it once handled,
+        # and a round with no failure of its own must not re-trigger on a
+        # stale failure from an earlier round of the same turn.
+        "failed_detail_lookup": failed_detail_lookup,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2.5: Entity Resolver — runs only when tool_executor's round included
+# a name-based get_project_details/get_task_details/get_resolution_details
+# call that came back "not found" (see after_tools below for the routing).
+# ---------------------------------------------------------------------------
+
+ENTITY_CLARIFICATION_MESSAGE = (
+    "<p>I couldn't find anything by that name under projects, tasks, or "
+    "resolutions. Could you clarify what you're asking about — a project, "
+    "a task, an SG Office meeting, an email, or a resolution?</p>"
+)
+
+
+def entity_resolver_node(state: ChatState) -> dict:
+    """"Give detail of X" doesn't say which entity type X is, and a
+    name-based get_*_details call failing under its first guess doesn't
+    mean X doesn't exist — it might just be the WRONG type (seen live: a
+    real TASK, "Vocational curriculum review", asked about with no type
+    named at all, got routed to get_project_details and reported "not
+    found" — it's a task, not a project, and genuinely exists). Runs a
+    cheap, GLOBAL name-only search (get_all_entity_names — two plain
+    columns per entity, no joins) across all three types, not just what
+    THIS conversation happened to list earlier (that's the separate,
+    narrower cached_listed_names mechanism in tool_executor_node, for
+    continuation references like "the one named X" after a listing).
+
+    On a match: re-executes the correct tool and replaces the failed
+    call's own message content in place (same tool_call_id — the OpenAI
+    API only checks that id matches a real entry from the assistant's
+    tool_calls, never that the content "matches" what that tool nominally
+    returns, so swapping content under the original id is protocol-safe;
+    inventing a brand-new id here would not be, since nothing in the
+    conversation ever requested it).
+
+    On no match anywhere: sets needs_entity_clarification so answer_node
+    short-circuits with a deterministic question instead of letting the
+    model improvise a second, equally-unreliable "not found" guess at
+    phrasing — asking the LLM to recognize when to ask for clarification
+    has already been tried (a router prompt rule) and didn't hold up live."""
+    failure = state.get("failed_detail_lookup")
+    if not failure:
+        return {}
+
+    pg_conn_fn = state["pg_conn_fn"]
+    user_id = state["user_id"]
+    policy_cfg = state["policy_cfg"]
+    emb_obj = state["emb"]
+
+    with pg_conn_fn() as conn:
+        all_names = get_all_entity_names(conn, user_id)
+
+    match = _match_cached_entity_name(failure["name_value"], all_names)
+    if not match:
+        logger.info(
+            f"[entity-resolver] {failure['fn_name']}({failure['name_key']}="
+            f"{failure['name_value']!r}) not found under any entity type — asking user to clarify."
+        )
+        return {"failed_detail_lookup": None, "needs_entity_clarification": True}
+
+    matched_type, exact_name = match
+    target_tool, target_key = _ENTITY_TYPE_TO_DETAIL_TOOL[matched_type]
+    logger.info(
+        f"[entity-resolver] {failure['fn_name']}({failure['name_key']}="
+        f"{failure['name_value']!r}) not found, but a global search matched "
+        f"{target_tool}({target_key}={exact_name!r}) — using that instead."
+    )
+
+    with pg_conn_fn() as conn:
+        result_str = execute_tool(
+            target_tool, {target_key: exact_name}, conn, user_id,
+            policy_cfg=policy_cfg, emb=emb_obj,
+        )
+    try:
+        parsed = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    if not isinstance(parsed, dict) or "error" in parsed:
+        # The global index said this name exists, but re-fetching its
+        # full detail failed anyway (e.g. access was revoked between the
+        # listing and this call) — fall back to asking, same as no match.
+        return {"failed_detail_lookup": None, "needs_entity_clarification": True}
+
+    messages = list(state["messages"])
+    tool_message_content = render_tool_result_html(parsed)
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") == failure["tool_call_id"]:
+            m["content"] = tool_message_content
+            break
+
+    tool_results_for_chart = list(state.get("tool_results_for_chart") or [])
+    tool_results_for_chart.append(parsed)
+
+    return {
+        "messages": messages,
+        "tool_results_for_chart": tool_results_for_chart,
+        "failed_detail_lookup": None,
+        "needs_entity_clarification": False,
+        # The original failed call looked like an empty result — it
+        # wasn't, it was the wrong guess, now corrected with real data.
+        "had_empty_result": False,
     }
 
 
@@ -2476,6 +2645,15 @@ def answer_node(state: ChatState) -> dict:
     model = state["model"]
     messages = state["messages"]
     chunk_queue = state["chunk_queue"]
+
+    if state.get("needs_entity_clarification"):
+        # Deterministic, not left to the model to improvise — a plain
+        # router-prompt instruction to "ask when ambiguous" was tried
+        # first and didn't hold up live (see entity_resolver_node), so
+        # this bypasses the LLM call entirely for the exact wording.
+        chunk_queue.put(ENTITY_CLARIFICATION_MESSAGE)
+        chunk_queue.put(None)
+        return {"final_response": ENTITY_CLARIFICATION_MESSAGE}
 
     # Build answer-specific system prompt (no tool schemas)
     today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
@@ -2598,8 +2776,12 @@ def should_continue(state: ChatState) -> str:
 
 
 def after_tools(state: ChatState) -> str:
-    """After tool_executor: route back to router for multi-step reasoning,
-    or go to answer if we've already done enough rounds (max 3)."""
+    """After tool_executor: resolve a failed name-based get_*_details
+    lookup first (takes priority — see entity_resolver_node), otherwise
+    route back to router for multi-step reasoning, or go to answer if
+    we've already done enough rounds (max 3)."""
+    if state.get("failed_detail_lookup"):
+        return "entity_resolver"
     if state.get("tool_call_count", 0) >= 8:
         return "answer"
     return "router"
@@ -2614,6 +2796,7 @@ def _build_graph():
 
     graph.add_node("router", router_node)
     graph.add_node("tool_executor", tool_executor_node)
+    graph.add_node("entity_resolver", entity_resolver_node)
     graph.add_node("answer", answer_node)
 
     graph.set_entry_point("router")
@@ -2627,8 +2810,12 @@ def _build_graph():
     graph.add_conditional_edges(
         "tool_executor",
         after_tools,
-        {"router": "router", "answer": "answer"},
+        {"router": "router", "answer": "answer", "entity_resolver": "entity_resolver"},
     )
+    # Always straight to answer — entity_resolver has already either
+    # fixed the failed call in place or set needs_entity_clarification,
+    # nothing more to decide.
+    graph.add_edge("entity_resolver", "answer")
     graph.add_edge("answer", END)
 
     return graph.compile()
@@ -2764,6 +2951,8 @@ def run_chatbot_graph(
         "meeting_date_filter": {},
         "cached_listed_names": cached_listed_names or {},
         "listed_names": {},
+        "failed_detail_lookup": None,
+        "needs_entity_clarification": False,
         "needs_more_tools": False,
         "final_response": "",
         "chunk_queue": chunk_q,
