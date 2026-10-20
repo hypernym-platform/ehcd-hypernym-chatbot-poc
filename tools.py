@@ -2009,12 +2009,32 @@ def _match_cached_entity_name(name_value: str, cached_names: dict):
     strings instead of SQL — these names already came from a real DB
     listing, so resolving against them needs no extra DB round trip, and
     it's immune to whatever the router's own recall of the exact spelling
-    does, since the cached string IS the real spelling. Returns
-    (entity_type, exact_cached_name) for the best (longest / most
-    specific) match, or None if nothing in the cache qualifies."""
+    does, since the cached string IS the real spelling.
+
+    An EXACT (case-insensitive) match always wins outright over a merely
+    "contains all these words" one, however much longer/more title-like
+    the other candidate looks — seen live: "give detail of Test" has to
+    resolve to the record literally named "test" when one also exists,
+    not a longer "Test Project" that just happens to contain the word
+    "test" too (same exact-match-first rule as db_queries.py's own
+    _resolve_unique_name_match, for the same reason). Returns
+    (entity_type, exact_cached_name) for a confident match, or None when
+    there's no match, or more than one exact match (genuinely ambiguous
+    across types — don't guess)."""
     if not cached_names or not name_value:
         return None
-    words = [w for w in re.split(r"\W+", name_value.lower()) if w]
+    q = name_value.strip().lower()
+    exact = [
+        (entity_type, cached)
+        for entity_type, names in cached_names.items()
+        for cached in (names or [])
+        if cached.strip().lower() == q
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    words = [w for w in re.split(r"\W+", q) if w]
     if not words:
         return None
     best = None
@@ -2173,6 +2193,53 @@ def tool_executor_node(state: ChatState) -> dict:
     # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
         results = list(pool.map(_run_one_tool, tool_calls))
+
+    _LIST_TO_DETAIL_TOOL = {
+        "list_projects": "get_project_details",
+        "list_tasks": "get_task_details",
+        "list_resolutions": "get_resolution_details",
+    }
+
+    def _find_redundant_list_call_ids(results):
+        """When a round calls BOTH list_X and get_X_details, and list_X's
+        own result turns out to be just the SAME single record
+        get_X_details already resolved in full, the model was handed two
+        separate full tables describing one entity — seen live: "give
+        detail of Testing Task" rendered a thin list_tasks row AND the
+        full get_task_details record side by side, both as their own
+        "Download as XLSX" table. Identity is checked by row id, not
+        name (names can collide — see _resolve_unique_name_match — ids
+        can't), so this only ever fires on a genuine, confirmed
+        duplicate, never a legitimate "list some things AND show one in
+        detail" compound question."""
+        detail_ids_by_tool = {}
+        for tool_call, fn_args, result_str, *_ in results:
+            if tool_call.function.name not in _LIST_TO_DETAIL_TOOL.values():
+                continue
+            try:
+                parsed = json.loads(result_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict) and "error" not in parsed and parsed.get("id") is not None:
+                detail_ids_by_tool[tool_call.function.name] = parsed["id"]
+
+        redundant = set()
+        for tool_call, fn_args, result_str, *_ in results:
+            detail_tool = _LIST_TO_DETAIL_TOOL.get(tool_call.function.name)
+            if not detail_tool or detail_tool not in detail_ids_by_tool:
+                continue
+            try:
+                parsed = json.loads(result_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            rows = next((v for v in parsed.values() if isinstance(v, list)), None)
+            if rows and len(rows) == 1 and rows[0].get("id") == detail_ids_by_tool[detail_tool]:
+                redundant.add(tool_call.id)
+        return redundant
+
+    redundant_list_call_ids = _find_redundant_list_call_ids(results)
 
     # (tool_name -> its name-search parameter) — used below to deterministically
     # correct a get_*_details call against the previous turn's own listing,
@@ -2363,6 +2430,18 @@ def tool_executor_node(state: ChatState) -> dict:
                         "name_key": name_key,
                         "name_value": name_value,
                     }
+            elif "multiple" in err_lower and "match" in err_lower:
+                # get_project_details/get_task_details/get_resolution_details'
+                # own disambiguation message (_resolve_unique_name_match in
+                # db_queries.py) — e.g. "Multiple projects match 'Test':
+                # Test Project, Chatbot. Please specify which one you
+                # mean." This is neither a technical failure nor an empty
+                # result (the opposite — MULTIPLE real records matched),
+                # and it's already fully self-explanatory, so it's
+                # deliberately left ungrounded here: the model just needs
+                # to relay it, not be told it was a glitch or that
+                # nothing was found.
+                pass
             else:
                 had_technical_error = True
         elif isinstance(parsed, list) and len(parsed) == 0:
@@ -2421,9 +2500,12 @@ def tool_executor_node(state: ChatState) -> dict:
 
         # Feed the LLM pre-rendered HTML instead of raw JSON — it should
         # never have to invent HTML structure for tool data itself.
-        tool_message_content = (
-            render_tool_result_html(parsed) if parsed is not None else result_str
-        )
+        if tool_call.id in redundant_list_call_ids:
+            tool_message_content = "<p>(Same single record — see the full detail result for this turn instead.)</p>"
+        else:
+            tool_message_content = (
+                render_tool_result_html(parsed) if parsed is not None else result_str
+            )
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
