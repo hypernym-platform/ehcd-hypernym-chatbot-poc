@@ -29,6 +29,8 @@ from db_queries import (
     get_task_details,
     list_resolutions,
     get_resolution_details,
+    get_all_entity_names,
+    list_users,
     list_sg_office_emails,
     get_sg_office_email_details,
     list_sg_office_meetings,
@@ -42,6 +44,63 @@ from db_queries import (
 from edu_pg import execute_education_sql, EDU_SCHEMA_FOR_TOOL
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Unsupported-action detection — this bot is read-only (no write tools
+# exist at all), so a request to CHANGE something must be declined
+# explicitly, not silently misrouted into an unrelated read question. Seen
+# live: "change the Chatbot project status to ongoing" got answered as if
+# it were a question about delayed projects — the router had no tool that
+# fit the request, so it free-associated to something adjacent instead of
+# recognizing the request itself as out of scope. A deterministic check
+# ahead of the router removes that failure mode entirely for the clear
+# cases, at zero latency/cost (no LLM call at all) and zero hallucination
+# risk, rather than hoping the router recognizes its own limits.
+# ---------------------------------------------------------------------------
+
+# A query opening with one of these is virtually always a READ question,
+# even if an action-shaped word (e.g. "status", "created") appears later
+# in it ("what's the status of X", "which tasks were created this month",
+# "can you update me on X" = give me info, not a command). Checked first
+# so these never get flagged — false positives (blocking a real question)
+# are far worse than false negatives (an edge-case write request slipping
+# through to normal routing, same as before this check existed).
+_READ_QUESTION_STARTERS_RE = re.compile(
+    r"^\s*(who|what|which|how|why|when|where|is|are|was|were|does|do|did|"
+    r"can|could|would|should|show|list|give|tell|find|get|has|have)\b",
+    re.IGNORECASE,
+)
+
+# Each alternative requires an imperative verb + a plausible direct object
+# close by, not just the bare presence of a word like "status" or "create"
+# anywhere in the sentence — e.g. "change the colors" never matches (no
+# status/priority/budget/etc. object), "create me a graph about projects"
+# never matches (no "new project", a chart isn't a record).
+_UNSUPPORTED_ACTION_RE = re.compile(
+    r"\b(change|update|set|mark|modify|edit)\b[^.?!]{0,40}\b"
+    r"(status|priority|readiness|budget|manager|assignee|owner)\b[^.?!]{0,20}\b(to|as|=)\b"
+    r"|\b(approve|reject|cancel|delete|remove|close|reassign|assign)\b[^.?!]{0,40}\b"
+    r"(project|task|resolution|meeting|request|direction\s*item|email|office)\b"
+    r"|\bcreate\b[^.?!]{0,30}\bnew\s+(project|task|resolution|meeting|direction\s*item)\b",
+    re.IGNORECASE,
+)
+
+UNSUPPORTED_ACTION_MESSAGE = (
+    "<p>I can only retrieve and display information — I'm not able to make "
+    "changes like updating a status, approving, assigning, or creating "
+    "records. I can show you the current data on this instead, if that "
+    "helps.</p>"
+)
+
+
+def detect_unsupported_action(query: str) -> bool:
+    """True if the query asks the bot to MODIFY data rather than retrieve
+    it. Conservative by design — see the regexes above for the reasoning."""
+    q = query.strip()
+    if not q or _READ_QUESTION_STARTERS_RE.match(q):
+        return False
+    return bool(_UNSUPPORTED_ACTION_RE.search(q))
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +147,7 @@ TOOL_DEFINITIONS = [
                     },
                     "category": {
                         "type": "string",
-                        "description": "Filter by category name (partial match)",
+                        "description": "Filter by the project's broad classification/category (e.g. 'Education', 'Infrastructure', 'Research and Innovation') — a general grouping tag, never a specific project's own name or title. If the user named one particular project, use project_name on get_project_details instead, not this.",
                     },
                     "project_manager": {
                         "type": "string",
@@ -520,7 +579,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "Filter by status. Use 'upcoming' ONLY when the user says just 'upcoming meetings' with no other status named — it means Confirmed OR Rescheduled combined (matches the UI's 'Upcoming' count). If the user names a SPECIFIC status too (e.g. 'upcoming confirmed meetings'), use that specific status here instead (e.g. 'confirmed') and set upcoming_only=true — do NOT use 'upcoming' here, it would silently include Rescheduled ones too.",
+                        "description": "Filter by status. Use 'upcoming' ONLY when the user says just 'upcoming meetings' with no other status named — it means Confirmed OR Rescheduled, AND not already past its scheduled date (both required server-side; a Confirmed meeting whose date has passed is never 'upcoming'). If the user names a SPECIFIC status too (e.g. 'upcoming confirmed meetings'), use that specific status here instead (e.g. 'confirmed') and set upcoming_only=true — do NOT use 'upcoming' here, it would silently include Rescheduled ones too.",
                         "enum": ["new", "under_review", "confirmed", "completed", "rescheduled", "cancelled", "upcoming"],
                     },
                     "upcoming_only": {
@@ -595,6 +654,42 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Set true for 'meetings this month' — computed server-side as the current calendar month, don't compute the date range yourself.",
                     },
+                    "scheduled_month": {
+                        "type": "integer",
+                        "description": "Set for 'meetings scheduled for <month name>' (e.g. 'October' -> 10) — ANY year, not just the current one (use scheduled_this_month instead for 'this month' specifically). Computed server-side as 1-12 — do NOT instead try to compute that month's first/last day yourself and pass them as scheduled_after/scheduled_before, you will get it wrong or skip the filter entirely. Combine with scheduled_year only if a specific year was named too.",
+                    },
+                    "scheduled_year": {
+                        "type": "integer",
+                        "description": "Only meaningful combined with scheduled_month (e.g. 'October 2025' specifically) — omit for 'October' alone, which should match any year.",
+                    },
+                    "date_filters": {
+                        "type": "array",
+                        "description": "Generic date comparisons for anything the named filters above don't cover (e.g. 'meetings created after 11am today', 'scheduled before 2026-12-01') — prefer a named filter when one fits (scheduled_month, scheduled_today, created_after, etc.), since those are simpler; use this only for ad-hoc comparisons. Each item filters independently (ANDed together).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "column": {
+                                    "type": "string",
+                                    "enum": ["scheduled_date", "created_at"],
+                                    "description": "Which date column — scheduled_date is when the meeting happens, created_at is when the request was submitted.",
+                                },
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["eq", "gte", "lte", "gt", "lt", "between"],
+                                    "description": "eq=exactly on, gte/lte=on or after/before, gt/lt=strictly after/before, between=needs value AND value2.",
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "ISO date or datetime (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS). Never compute a relative date (\"today\", \"this month\") yourself here — use the dedicated named filter for that instead.",
+                                },
+                                "value2": {
+                                    "type": "string",
+                                    "description": "Only for op=between — the upper bound.",
+                                },
+                            },
+                            "required": ["column", "op", "value"],
+                        },
+                    },
                     "not_ready": {
                         "type": "boolean",
                         "description": "Set true for 'meetings that aren't ready yet' or 'meetings with pending facility requests' — at least one of its facility prep tasks isn't Confirmed. Computed server-side from the facility tracker. Each result row's `facilities_summary` field already lists which facility types (Room, Parking, etc.) were requested for that meeting — don't call list_sg_office_meeting_facilities just to see what facilities a meeting needs.",
@@ -618,6 +713,10 @@ TOOL_DEFINITIONS = [
                     "created_after": {
                         "type": "string",
                         "description": "Only requests created on or after this date.",
+                    },
+                    "created_before": {
+                        "type": "string",
+                        "description": "Only requests created on or before this date — combine with created_after for a 'received between X and Y' range. For 'meetings scheduled/happening between X and Y' instead, use scheduled_after/scheduled_before, not these — \"received\"/\"submitted\"/\"requested\" means created_*, \"scheduled\"/\"happening\"/\"taking place\" means scheduled_*.",
                     },
                     "older_than_days": {
                         "type": "integer",
@@ -910,9 +1009,21 @@ TOOL_DEFINITIONS = [
                         "description": "Filter by status: 'in_progress', 'completed', 'delayed', 'on_hold'",
                         "enum": ["in_progress", "completed", "delayed", "on_hold"],
                     },
+                    "task_name": {
+                        "type": "string",
+                        "description": (
+                            "Filter by the TASK'S OWN name (partial match) — use this "
+                            "when the user named a specific task, e.g. 'tasks called "
+                            "X' or 'the X task'. Not the same as entity_name below."
+                        ),
+                    },
                     "entity_name": {
                         "type": "string",
-                        "description": "Filter by entity name (partial match)",
+                        "description": (
+                            "Filter by the organizational ENTITY associated with the "
+                            "task (e.g. a ministry or department) — NOT the task's own "
+                            "name. Use task_name above for that."
+                        ),
                     },
                     "requires_presentation": {
                         "type": "boolean",
@@ -1015,6 +1126,47 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "list_users",
+            "description": (
+                "List platform user accounts (name, email, department, "
+                "designation, role, active status). Superadmin / User "
+                "Management access only. Use when the user asks to list, "
+                "search, or count platform users/accounts — never for "
+                "project managers, task owners, or similar role-based "
+                "people lookups within a project/task/resolution, which "
+                "belong to those entities' own filters instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Filter by the user's name (partial match)",
+                    },
+                    "department": {
+                        "type": "string",
+                        "description": "Filter by department (partial match)",
+                    },
+                    "designation": {
+                        "type": "string",
+                        "description": "Filter by job designation/title (partial match)",
+                    },
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "Filter by active account status",
+                    },
+                    "is_superadmin": {
+                        "type": "boolean",
+                        "description": "Filter to only superadmin accounts (true) or only non-superadmin accounts (false)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_education_data",
             "description": (
                 "Query education statistics from EHCD's SQLite database using SQL. "
@@ -1070,6 +1222,21 @@ TOOL_DEFINITIONS = [
 
 # Build name→definition lookup
 TOOL_DEFS_BY_NAME = {t["function"]["name"]: t for t in TOOL_DEFINITIONS}
+
+# Which argument names each tool actually recognizes — used to catch the
+# router emitting a plausible-sounding but nonexistent parameter (seen
+# live: 'created_before' on list_sg_office_meetings, which wasn't in this
+# tool's schema OR handled in db_queries.py, so it silently did nothing —
+# the date range's upper bound just never applied, with no error anywhere
+# to notice it by). None of these schemas set additionalProperties:false,
+# so the API never rejects an unknown key either; this is the only thing
+# that catches it. Logged, not stripped — an unknown key already has zero
+# effect once it reaches db_queries.py, so there's nothing to correct,
+# only something to make visible.
+_VALID_ARG_KEYS_BY_TOOL = {
+    name: set(defn["function"]["parameters"]["properties"].keys())
+    for name, defn in TOOL_DEFS_BY_NAME.items()
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1332,8 @@ def execute_tool(
                 resolution_id=arguments.get("resolution_id"),
                 resolution_topic=arguments.get("resolution_topic"),
             )
+        elif tool_name == "list_users":
+            result = list_users(conn, user_id, filters=arguments)
         elif tool_name == "query_education_data":
             result = execute_education_sql(arguments.get("sql", ""))
         elif tool_name == "search_policy":
@@ -1427,6 +1596,13 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
     if flags.get("education"):
         tools.append(TOOL_DEFS_BY_NAME["query_education_data"])
 
+    # Platform user accounts — superadmin or the User Management feature
+    # (role_and_access_feature id 3), same "superadmin or feature flag"
+    # composite get_user_access_flags() already computes for every other
+    # gate here.
+    if flags.get("user_management"):
+        tools.append(TOOL_DEFS_BY_NAME["list_users"])
+
     return tools
 
 
@@ -1439,7 +1615,7 @@ ROUTER_SYSTEM_PROMPT = """You are a tool routing assistant for the Education, Hu
 Your ONLY job is to decide which tools to call based on the user's question. Do NOT answer the question yourself.
 
 Tool selection rules:
-1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities) → use the list/get tools.
+1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities, platform user accounts) → use the list/get tools.
 2. For education statistics → use query_education_data (generate a SQLite SELECT query).
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains. This
@@ -1491,6 +1667,25 @@ described (if several rows match, pick the one whose details — name/org/
 subject/purpose — genuinely match, never just the first one), and call
 "get details" with that id then. Never invent or guess an id that didn't
 literally appear in a tool result.
+11. "Call fresh" (rule 7) means rebuild the filter ARGUMENTS from THIS
+turn's wording too, not just re-issue the same call. A filter from a
+previous turn's call NEVER carries over into this turn's call unless this
+turn's own wording still asks for it. In particular, "all X" / "every X" /
+"X" with no criteria named means NO filters at all this time — even if the
+previous turn filtered that same entity by status, name, or anything else.
+Seen going wrong: "list upcoming meetings" (status=upcoming) followed by
+"create a chart of all external meetings" re-used status=upcoming instead
+of dropping it — "all" explicitly means unfiltered, and the second
+question never said "upcoming" itself.
+12. "Give me details of X" doesn't always say whether X is a project, a
+task, or a resolution. Don't withhold the tool call to hedge against
+guessing wrong — call whichever of get_project_details/get_task_details/
+get_resolution_details looks like the best fit (conversation context,
+wording, anything you have). A wrong guess here is NOT a dead end: it is
+caught and corrected automatically downstream from a real "not found", so
+guessing and being wrong costs nothing — but making NO tool call at all
+for a named-record question is never correct, since nothing downstream
+can recover from that.
 User information:
 - Name: {user_name}
 - Role: {user_role}
@@ -1585,7 +1780,7 @@ available in the conversation history.
 STRICT RULES:
 - NEVER invent or fabricate EHCD data — only use what the tool results contain.
 - If a tool returns an access denied error, tell the user they do not have permission to view that data.
-- If data is not found, say so clearly rather than guessing.
+- A technical failure (a tool/query error) and a legitimate zero-match result are NOT the same thing — never phrase either one as the other. A specific instruction for which applies to THIS turn is appended below when relevant; if neither is, still say plainly if data is not found rather than guessing.
 - When a tool result contains an explicit count such as total_count, treat that value as authoritative. Never calculate or infer the count by counting returned records.
 
 User information:
@@ -1642,6 +1837,15 @@ class ChatState(TypedDict):
     want_chart: bool
     chart_type: Optional[str]
     tool_call_count: int
+    had_technical_error: bool
+    had_empty_result: bool
+    all_items_unfiltered: bool
+    cached_meeting_date_filter: dict
+    meeting_date_filter: dict
+    cached_listed_names: dict
+    listed_names: dict
+    failed_detail_lookup: Optional[dict]
+    needs_entity_clarification: bool
     needs_more_tools: bool
     final_response: str
     chunk_queue: Any
@@ -1726,6 +1930,103 @@ def router_node(state: ChatState) -> dict:
 # Node 2: Tool Executor — parallel execution of all tool calls
 # ---------------------------------------------------------------------------
 
+#  A prompt rule alone ("rebuild filters from this turn's wording") was
+# tried for this and still failed on repeat — the router can simply re-
+# sample the wrong branch, same as every other stochastic failure found
+# this session. Verified live: "list upcoming meetings" (status=upcoming)
+# followed by "create a chart of ALL external meetings" kept re-using
+# status=upcoming 2 of 3 times even with the rule in place. This is the
+# deterministic backstop — scoped narrowly to the one proven case rather
+# than guessed generically, since a wrong strip (dropping a filter the
+# user DID want) is its own kind of bug.
+_BROADENING_RE = re.compile(r"\b(all|every)\b", re.IGNORECASE)
+_MEETING_STATUS_WORDS_RE = re.compile(
+    r"\b(upcoming|new|under\s*review|confirmed|completed|rescheduled|cancelled|canceled)\b",
+    re.IGNORECASE,
+)
+
+# Enforcement for a proven failure: "list meetings scheduled for October"
+# dropped its date constraint entirely, 3/3 live trials — not occasional,
+# every time, because the schema had no deterministic way to express a
+# named month (only scheduled_after/scheduled_before, which need the
+# model to compute exact day boundaries itself). scheduled_month now
+# exists for exactly this, but a schema addition alone doesn't guarantee
+# the router remembers to use it on a given sample — this is the actual
+# guarantee: parse the month directly from the query text and inject it
+# if the tool call came back with no date constraint of any kind.
+_MONTH_NAME_TO_NUM = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_NAME_RE = re.compile(
+    r"\b(" + "|".join(sorted(_MONTH_NAME_TO_NUM, key=len, reverse=True)) + r")\b", re.IGNORECASE
+)
+_YEAR_NEAR_MONTH_RE = re.compile(r"\b(20\d{2})\b")
+_MEETING_DATE_FILTER_KEYS = {
+    "scheduled_month", "scheduled_year", "scheduled_after", "scheduled_before", "scheduled_on",
+    "scheduled_today", "scheduled_this_week", "scheduled_tomorrow",
+    "scheduled_this_month", "date_filters", "created_after", "created_before",
+}
+
+# A bare reference back to "the same thing we were just discussing"
+# ("show them please", "please show them only") carries no new criteria
+# of its own — raw tool-call arguments from a prior turn are never part
+# of persisted conversation history (only the final text is), so without
+# an explicit cache the router has nothing to reconstruct the original
+# filter from and sometimes just drops it, returning everything instead
+# of the subset still being discussed. Proximity-based (verb near
+# pronoun) rather than anchored to the start of the string, since "please
+# show them only" and "show them please" both need to match.
+_BARE_CONTINUATION_RE = re.compile(
+    r"\b(show|list|display|give)\b.{0,12}\b(them|it|those|these)\b", re.IGNORECASE
+)
+
+# Which tool/name-argument lists each entity type, and which fetches one
+# record's full detail by that same kind of name — used together to
+# deterministically resolve "give detail about X" against whatever this
+# conversation already listed, instead of trusting the router to recall
+# and retype X exactly right, or to guess the correct entity type at all.
+_ENTITY_TYPE_TO_DETAIL_TOOL = {
+    "project": ("get_project_details", "project_name"),
+    "task": ("get_task_details", "task_name"),
+    "resolution": ("get_resolution_details", "resolution_topic"),
+}
+_LISTING_NAME_FIELDS = {
+    "list_projects": ("project", "project_name_en"),
+    "list_tasks": ("task", "task_name"),
+    "list_resolutions": ("resolution", "resolution_topic_en"),
+}
+
+
+def _match_cached_entity_name(name_value: str, cached_names: dict):
+    """Fuzzy-match name_value (whatever the router passed as a project/
+    task/resolution name) against names this conversation already listed
+    in a prior list_projects/list_tasks/list_resolutions call, across all
+    three types. Same multi-word ALL-words-present rule as
+    _multi_word_ilike (db_queries.py), just run in Python against cached
+    strings instead of SQL — these names already came from a real DB
+    listing, so resolving against them needs no extra DB round trip, and
+    it's immune to whatever the router's own recall of the exact spelling
+    does, since the cached string IS the real spelling. Returns
+    (entity_type, exact_cached_name) for the best (longest / most
+    specific) match, or None if nothing in the cache qualifies."""
+    if not cached_names or not name_value:
+        return None
+    words = [w for w in re.split(r"\W+", name_value.lower()) if w]
+    if not words:
+        return None
+    best = None
+    for entity_type, names in cached_names.items():
+        for cached in names or []:
+            cached_lower = cached.lower()
+            if all(w in cached_lower for w in words):
+                if best is None or len(cached) > len(best[1]):
+                    best = (entity_type, cached)
+    return best
+
+
 def tool_executor_node(state: ChatState) -> dict:
     """Execute ALL pending tool calls in parallel."""
     messages = list(state["messages"])
@@ -1734,6 +2035,7 @@ def tool_executor_node(state: ChatState) -> dict:
     policy_cfg = state["policy_cfg"]
     emb_obj = state["emb"]
     tool_results_for_chart = list(state.get("tool_results_for_chart") or [])
+    current_query_lower = (state.get("query") or "").lower()
 
     # Last message is assistant with tool_calls
     last_msg = messages[-1]
@@ -1750,6 +2052,109 @@ def tool_executor_node(state: ChatState) -> dict:
         # real filters — pop them before the DB layer ever sees them.
         want_chart = fn_args.pop("want_chart", None)
         chart_type = fn_args.pop("chart_type", None)
+        forced_all_unfiltered = False
+
+        if (
+            fn_name == "list_sg_office_meetings"
+            and _BROADENING_RE.search(current_query_lower)
+            and not _MEETING_STATUS_WORDS_RE.search(current_query_lower)
+        ):
+            # "all X" means NO filters, not just no status filter — found
+            # a case this narrower, status-only version of the guard
+            # missed: 13 turns into an unrelated conversation, "create a
+            # chart of ALL external meetings" got a completely fabricated
+            # request_type='official_visit' filter, never mentioned
+            # anywhere in the conversation — not carried over from
+            # anything, just invented under long-context conditions.
+            # Keep only presentation args (never real filters) and drop
+            # everything else; "all" is as unambiguous as scope gets.
+            # Exception: "all meetings in October" means "don't filter by
+            # STATUS", not "don't filter by date" — a named month in the
+            # query means the date constraint is wanted and must survive.
+            _NON_FILTER_ARGS = {"limit", "sort_by", "fields"}
+            if _MONTH_NAME_RE.search(current_query_lower):
+                _NON_FILTER_ARGS = _NON_FILTER_ARGS | _MEETING_DATE_FILTER_KEYS
+            for key in list(fn_args.keys()):
+                if key not in _NON_FILTER_ARGS:
+                    fn_args.pop(key, None)
+            forced_all_unfiltered = True
+
+        if (
+            fn_name == "list_sg_office_meetings"
+            and _MONTH_NAME_RE.search(current_query_lower)
+            and not (_MEETING_DATE_FILTER_KEYS & set(fn_args))
+        ):
+            # The proven failure: "list meetings scheduled for October"
+            # dropped the date constraint entirely, 3/3 live trials, not
+            # occasional — the schema had no deterministic way to express
+            # a named month (scheduled_month now exists, but a schema
+            # addition alone doesn't guarantee the router reaches for it
+            # on a given sample). Parsed directly from the query text and
+            # injected here so the result is correct regardless of what
+            # the router did or didn't include.
+            month_match = _MONTH_NAME_RE.search(current_query_lower)
+            fn_args["scheduled_month"] = _MONTH_NAME_TO_NUM[month_match.group(1).lower()]
+            year_match = _YEAR_NEAR_MONTH_RE.search(current_query_lower)
+            if year_match:
+                fn_args["scheduled_year"] = int(year_match.group(1))
+
+        effective_meeting_date_filter = {}
+        if (
+            fn_name == "list_sg_office_meetings"
+            and not (_MEETING_DATE_FILTER_KEYS & set(fn_args))
+            and _BARE_CONTINUATION_RE.search(current_query_lower)
+            and state.get("cached_meeting_date_filter")
+        ):
+            # Live bug: "26 meetings received 1-7 Oct" -> "show them
+            # please" returned ALL meetings (Sept through Nov), not the
+            # 26 — this turn names no new criteria, so there's nothing
+            # for the router to rebuild the original filter from. Reapply
+            # the filter that actually produced the data being discussed.
+            fn_args.update(state["cached_meeting_date_filter"])
+        if fn_name == "list_sg_office_meetings":
+            effective_meeting_date_filter = {
+                k: v for k, v in fn_args.items() if k in _MEETING_DATE_FILTER_KEYS
+            }
+
+        name_key_for_fn = next(
+            (k for t, k in _ENTITY_TYPE_TO_DETAIL_TOOL.values() if t == fn_name), None
+        )
+        if name_key_for_fn and fn_args.get(name_key_for_fn) and state.get("cached_listed_names"):
+            # Demo failure: "list all projects" then "give detail about
+            # [one of the names from that table]" came back "no project
+            # named X found" — not because X doesn't exist, but because
+            # raw tool-call arguments are never part of persisted
+            # conversation history (only the final text is), so the
+            # router has to retype X from memory of what it rendered,
+            # and/or re-guess which of the three detail tools applies.
+            # When this conversation already listed names (the previous
+            # turn's own real DB data, cached deterministically — see
+            # app.py's get/save_last_listed_names), resolve directly
+            # against THAT instead of trusting the router's recall: same
+            # tool_call, same id, just the exact name (and, if needed,
+            # the correct tool) substituted in before the one DB call
+            # that was always going to happen — no extra round trip.
+            match = _match_cached_entity_name(fn_args[name_key_for_fn], state["cached_listed_names"])
+            if match:
+                matched_type, exact_name = match
+                target_tool, target_key = _ENTITY_TYPE_TO_DETAIL_TOOL[matched_type]
+                if target_tool != fn_name or exact_name != fn_args[name_key_for_fn]:
+                    logger.info(
+                        f"[listing-continuation] resolved {fn_name}({name_key_for_fn}="
+                        f"{fn_args[name_key_for_fn]!r}) against the last listing -> "
+                        f"{target_tool}({target_key}={exact_name!r})"
+                    )
+                fn_name = target_tool
+                fn_args = {target_key: exact_name}
+
+        valid_keys = _VALID_ARG_KEYS_BY_TOOL.get(fn_name)
+        if valid_keys is not None:
+            unknown = set(fn_args) - valid_keys
+            if unknown:
+                logger.warning(
+                    f"[unknown-arg] {fn_name} called with {sorted(unknown)}, not in this "
+                    f"tool's schema — had no effect on the query. full args: {fn_args}"
+                )
 
         logger.info(f"Tool call: {fn_name}({fn_args})")
 
@@ -1763,19 +2168,55 @@ def tool_executor_node(state: ChatState) -> dict:
                 policy_cfg=policy_cfg,
                 emb=emb_obj,
             )
-        return tool_call, fn_args, result_str, want_chart, chart_type
+        return tool_call, fn_args, result_str, want_chart, chart_type, forced_all_unfiltered, effective_meeting_date_filter
 
     # Execute all tools in parallel
     with ThreadPoolExecutor(max_workers=min(len(tool_calls), 5)) as pool:
         results = list(pool.map(_run_one_tool, tool_calls))
+
+    # (tool_name -> its name-search parameter) — used below to deterministically
+    # correct a get_*_details call against the previous turn's own listing,
+    # not to react-and-retry after a miss (see _resolve_detail_name_from_last_listing).
+    _DETAIL_LOOKUP_TOOLS = {
+        "get_project_details": "project_name",
+        "get_task_details": "task_name",
+        "get_resolution_details": "resolution_topic",
+    }
+    # (list_* tool -> the one filter param a confused router plausibly
+    # stuffs a specific record's own name into instead of calling the
+    # matching get_*_details tool) — list_projects has no entity_name
+    # equivalent, only category; list_tasks/list_resolutions have no
+    # category equivalent, only entity_name. Deliberately NOT every
+    # string filter on each tool (status/project_manager/advisor/owner
+    # are people/status names, not evidenced as a misuse target, and
+    # checking them risks misreading a genuinely empty search as a
+    # missed entity lookup).
+    _LIST_TOOL_NAME_LIKE_FILTERS = {
+        "list_projects": "category",
+        "list_tasks": "entity_name",
+        "list_resolutions": "entity_name",
+    }
 
     # Any call in this turn asking for a chart means the turn wants one —
     # the router decided this directly, from the full conversation, not a
     # regex over the user's words guessing after the fact. Last explicit
     # chart_type wins; a null just means "keep whatever type was used
     # before" (resolved later, in app.py, against the conversation history).
-    want_chart = any(w for _, _, _, w, _ in results)
-    chart_type = next((c for *_, c in results if c), None)
+    want_chart = any(w for _, _, _, w, _, _, _ in results)
+    chart_type = next((c for _, _, _, _, c, _, _ in results if c), None)
+    # True whenever this turn's "all X" guard above actually stripped a
+    # filter — grounds answer_node so its own prose can't echo a narrower
+    # qualifier ("upcoming") from earlier conversation history even
+    # though the data itself is correctly unfiltered (seen live: the
+    # chart was right, 28/28 meetings, but the text still said "all
+    # upcoming external meetings" — a prose-only echo, not a data bug).
+    all_items_unfiltered = any(f for _, _, _, _, _, f, _ in results)
+    # Whichever date filter actually constrained this turn's meeting
+    # query (router-chosen, month-enforced, or continuation-cache-reused)
+    # — carried out to app.py so it can be cached for the NEXT turn's
+    # own continuation references. Last non-empty one wins; normally only
+    # one list_sg_office_meetings call happens per turn anyway.
+    meeting_date_filter = next((m for *_, m in results if m), {})
 
     # The filter a result was fetched under doesn't always survive as a
     # real field on the rows themselves (e.g. project_manager has no
@@ -1786,6 +2227,30 @@ def tool_executor_node(state: ChatState) -> dict:
     # ("how many projects is X included in" needs to know X's name to
     # label the one bar it draws), so this always runs, not just >1 calls.
     _PROVENANCE_FILTERS = ("status", "request_type", "priority", "readiness_status", "item_type", "project_manager")
+    # Boolean filters never qualified before (the loop below explicitly
+    # required isinstance(val, str)) — so a query like "workflow started
+    # versus Not Started" split into two calls (workflow_started=True/
+    # False) had no way to tell which call a row came from, and charting
+    # fell back to grouping by whatever other categorical field existed
+    # (seen live: a 72-slice pie of sender names instead of a 2-slice
+    # Started/Not Started one). Each value needs its own readable label,
+    # not just str(bool).title(), so this is a separate map rather than
+    # reusing the string-filter display logic above.
+    _BOOLEAN_PROVENANCE_LABELS = {
+        "is_read": {True: "Read", False: "Unread"},
+        # Matches db_queries.py's own pre-existing CASE expression for
+        # this exact column (list_sg_office_emails' workflow_label) —
+        # "Started" was a guess that didn't match the app's own already-
+        # established terminology, caught live: the router sometimes
+        # fetches this same data via the native workflow_label field
+        # instead of this boolean filter, and the two disagreed ("In
+        # Workflow" vs "Started") for what's actually the same value.
+        "workflow_started": {True: "In Workflow", False: "Not Started"},
+        "is_confirmed": {True: "Confirmed", False: "Not Confirmed"},
+        "overdue": {True: "Overdue", False: "Not Overdue"},
+        "not_ready": {True: "Not Ready", False: "Ready"},
+        "visitors_not_ready": {True: "Visitors Not Ready", False: "Visitors Ready"},
+    }
 
     def _tool_sig(fn_name, args):
         return (fn_name, tuple(sorted(
@@ -1814,8 +2279,33 @@ def tool_executor_node(state: ChatState) -> dict:
 
     seen_this_round = set()
 
+    # Four distinct outcomes a tool call can have this turn, tracked
+    # separately so answer_node can say the RIGHT thing for each instead of
+    # every non-success case collapsing into the same vague "no data
+    # found" — a technical failure (DB error, rejected query) is not the
+    # same fact as a filter that legitimately matched zero real rows, and
+    # conflating them either hides a real problem behind "nothing exists"
+    # or makes a normal empty result sound like something broke.
+    had_technical_error = False
+    had_empty_result = False
+    # Set when a name-based get_project_details/get_task_details/
+    # get_resolution_details call this round came back "not found" — read
+    # by after_tools (the conditional edge below) to route to
+    # entity_resolver_node instead of straight to router/answer. Last
+    # such failure in the round wins if more than one happened (rare);
+    # handling the common single-failure case cleanly matters more than
+    # a multi-failure edge case that's never been seen live.
+    failed_detail_lookup = None
+    # This turn's own project/task/resolution names, captured from any
+    # list_projects/list_tasks/list_resolutions call that actually ran —
+    # surfaced below as "listed_names" so app.py can cache it (merged with
+    # what earlier turns already listed) for the NEXT turn's own
+    # continuation references to resolve against (see _match_cached_entity_name
+    # and the redirect block in _run_one_tool above).
+    listed_names = {}
+
     # Append tool results to messages and collect for chart detection
-    for tool_call, fn_args, result_str, _, _ in results:
+    for tool_call, fn_args, result_str, _, _, _, _ in results:
         try:
             parsed = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
@@ -1825,6 +2315,82 @@ def tool_executor_node(state: ChatState) -> dict:
         is_duplicate_call = sig in prior_signatures or sig in seen_this_round
         seen_this_round.add(sig)
 
+        listing_info = _LISTING_NAME_FIELDS.get(tool_call.function.name)
+        if listing_info and isinstance(parsed, dict):
+            entity_type, name_field = listing_info
+            listing_rows = next((v for v in parsed.values() if isinstance(v, list)), [])
+            names = [
+                r[name_field] for r in listing_rows
+                if isinstance(r, dict) and r.get(name_field)
+            ]
+            if names:
+                listed_names[entity_type] = names
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            # Access-denied is already its own well-handled case (a
+            # dedicated ANSWER_SYSTEM_PROMPT rule tells the model exactly
+            # how to phrase it). A single-record get_*_details lookup
+            # (project/meeting/email/thread/direction item/task/resolution)
+            # that matches zero rows also returns this same {"error": ...}
+            # shape ("Project not found", etc.) — that's a legitimate empty
+            # result, same fact as an empty list elsewhere, not a technical
+            # problem, and was previously landing in had_technical_error
+            # purely because of its shape. That meant answer_node's own
+            # prompt told the model "this was a glitch, tell the user to
+            # retry" while the tool content right next to it plainly said
+            # "not found" — two contradictory signals for the same turn.
+            # Anything else here is a genuine technical failure (DB error,
+            # a rejected/invalid query, a tool exception).
+            err_lower = parsed["error"].lower()
+            if err_lower.startswith("access denied"):
+                pass
+            elif "not found" in err_lower:
+                had_empty_result = True
+                name_key = _DETAIL_LOOKUP_TOOLS.get(tool_call.function.name)
+                name_value = fn_args.get(name_key) if name_key else None
+                if name_value:
+                    # A real miss under THIS entity type — but "give
+                    # detail of X" often never says which of the three
+                    # types X is, so this could just be the wrong guess,
+                    # not proof X doesn't exist anywhere (seen live: a
+                    # real TASK, asked about with no type named, got
+                    # routed to get_project_details and reported "not
+                    # found"). entity_resolver_node checks the other two
+                    # types before accepting that.
+                    failed_detail_lookup = {
+                        "tool_call_id": tool_call.id,
+                        "fn_name": tool_call.function.name,
+                        "name_key": name_key,
+                        "name_value": name_value,
+                    }
+            else:
+                had_technical_error = True
+        elif isinstance(parsed, list) and len(parsed) == 0:
+            had_empty_result = True
+        elif isinstance(parsed, dict) and parsed.get("total_count") == 0:
+            had_empty_result = True
+            # Same recovery as the "not found" branch above, for a
+            # different shape of the same mistake: instead of calling
+            # get_project_details/get_task_details/get_resolution_details
+            # at all, the router sometimes stuffs a specific record's own
+            # name into a LISTING tool's nearest-sounding filter instead
+            # (seen live: list_projects({'category': 'Vocational
+            # curriculum review'}) — that's a real TASK's name, not a
+            # category, and the project listing came back legitimately
+            # empty). Only the filters known to plausibly take a name
+            # this way are checked, not every string filter, so a
+            # genuinely empty project_manager/advisor/status search isn't
+            # misread as a missed entity lookup.
+            name_key = _LIST_TOOL_NAME_LIKE_FILTERS.get(tool_call.function.name)
+            name_value = fn_args.get(name_key) if name_key else None
+            if name_value:
+                failed_detail_lookup = {
+                    "tool_call_id": tool_call.id,
+                    "fn_name": tool_call.function.name,
+                    "name_key": name_key,
+                    "name_value": name_value,
+                }
+
         if isinstance(parsed, (list, dict)) and not is_duplicate_call:
             for filt in _PROVENANCE_FILTERS:
                 val = fn_args.get(filt)
@@ -1832,6 +2398,20 @@ def tool_executor_node(state: ChatState) -> dict:
                     continue
                 label_key = f"{filt}_label"
                 display = val.replace("_", " ").title()
+                rows = parsed if isinstance(parsed, list) else (
+                    next((v for v in parsed.values() if isinstance(v, list)), [])
+                )
+                for row in rows:
+                    if isinstance(row, dict) and label_key not in row:
+                        row[label_key] = display
+            for filt, value_labels in _BOOLEAN_PROVENANCE_LABELS.items():
+                val = fn_args.get(filt)
+                if not isinstance(val, bool):
+                    continue
+                display = value_labels.get(val)
+                if display is None:
+                    continue
+                label_key = f"{filt}_label"
                 rows = parsed if isinstance(parsed, list) else (
                     next((v for v in parsed.values() if isinstance(v, list)), [])
                 )
@@ -1892,6 +2472,124 @@ def tool_executor_node(state: ChatState) -> dict:
         "want_chart": bool(state.get("want_chart")) or want_chart,
         "chart_type": chart_type or state.get("chart_type"),
         "tool_call_count": state.get("tool_call_count", 0) + len(results),
+        "had_technical_error": bool(state.get("had_technical_error")) or had_technical_error,
+        "had_empty_result": bool(state.get("had_empty_result")) or had_empty_result,
+        "all_items_unfiltered": bool(state.get("all_items_unfiltered")) or all_items_unfiltered,
+        "meeting_date_filter": meeting_date_filter or state.get("meeting_date_filter") or {},
+        # Carry-forward within this one turn, same as meeting_date_filter
+        # above — only entity types actually (re-)listed this round
+        # overwrite; a type listed in an earlier round of the same turn
+        # survives untouched into later rounds.
+        "listed_names": {**(state.get("listed_names") or {}), **listed_names},
+        # This round's own finding only (never OR'd/carried-forward like
+        # the flags above) — entity_resolver_node clears it once handled,
+        # and a round with no failure of its own must not re-trigger on a
+        # stale failure from an earlier round of the same turn.
+        "failed_detail_lookup": failed_detail_lookup,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2.5: Entity Resolver — runs only when tool_executor's round included
+# a name-based get_project_details/get_task_details/get_resolution_details
+# call that came back "not found" (see after_tools below for the routing).
+# ---------------------------------------------------------------------------
+
+ENTITY_CLARIFICATION_MESSAGE = (
+    "<p>I couldn't find anything by that name under projects, tasks, or "
+    "resolutions. Could you clarify what you're asking about — a project, "
+    "a task, an SG Office meeting, an email, or a resolution?</p>"
+)
+
+
+def entity_resolver_node(state: ChatState) -> dict:
+    """"Give detail of X" doesn't say which entity type X is, and a
+    name-based get_*_details call failing under its first guess doesn't
+    mean X doesn't exist — it might just be the WRONG type (seen live: a
+    real TASK, "Vocational curriculum review", asked about with no type
+    named at all, got routed to get_project_details and reported "not
+    found" — it's a task, not a project, and genuinely exists). Runs a
+    cheap, GLOBAL name-only search (get_all_entity_names — two plain
+    columns per entity, no joins) across all three types, not just what
+    THIS conversation happened to list earlier (that's the separate,
+    narrower cached_listed_names mechanism in tool_executor_node, for
+    continuation references like "the one named X" after a listing).
+
+    On a match: re-executes the correct tool and replaces the failed
+    call's own message content in place (same tool_call_id — the OpenAI
+    API only checks that id matches a real entry from the assistant's
+    tool_calls, never that the content "matches" what that tool nominally
+    returns, so swapping content under the original id is protocol-safe;
+    inventing a brand-new id here would not be, since nothing in the
+    conversation ever requested it).
+
+    On no match anywhere: sets needs_entity_clarification so answer_node
+    short-circuits with a deterministic question instead of letting the
+    model improvise a second, equally-unreliable "not found" guess at
+    phrasing — asking the LLM to recognize when to ask for clarification
+    has already been tried (a router prompt rule) and didn't hold up live."""
+    failure = state.get("failed_detail_lookup")
+    if not failure:
+        return {}
+
+    pg_conn_fn = state["pg_conn_fn"]
+    user_id = state["user_id"]
+    policy_cfg = state["policy_cfg"]
+    emb_obj = state["emb"]
+
+    with pg_conn_fn() as conn:
+        all_names = get_all_entity_names(conn, user_id)
+
+    match = _match_cached_entity_name(failure["name_value"], all_names)
+    if not match:
+        logger.info(
+            f"[entity-resolver] {failure['fn_name']}({failure['name_key']}="
+            f"{failure['name_value']!r}) not found under any entity type — asking user to clarify."
+        )
+        return {"failed_detail_lookup": None, "needs_entity_clarification": True}
+
+    matched_type, exact_name = match
+    target_tool, target_key = _ENTITY_TYPE_TO_DETAIL_TOOL[matched_type]
+    logger.info(
+        f"[entity-resolver] {failure['fn_name']}({failure['name_key']}="
+        f"{failure['name_value']!r}) not found, but a global search matched "
+        f"{target_tool}({target_key}={exact_name!r}) — using that instead."
+    )
+
+    with pg_conn_fn() as conn:
+        result_str = execute_tool(
+            target_tool, {target_key: exact_name}, conn, user_id,
+            policy_cfg=policy_cfg, emb=emb_obj,
+        )
+    try:
+        parsed = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    if not isinstance(parsed, dict) or "error" in parsed:
+        # The global index said this name exists, but re-fetching its
+        # full detail failed anyway (e.g. access was revoked between the
+        # listing and this call) — fall back to asking, same as no match.
+        return {"failed_detail_lookup": None, "needs_entity_clarification": True}
+
+    messages = list(state["messages"])
+    tool_message_content = render_tool_result_html(parsed)
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") == failure["tool_call_id"]:
+            m["content"] = tool_message_content
+            break
+
+    tool_results_for_chart = list(state.get("tool_results_for_chart") or [])
+    tool_results_for_chart.append(parsed)
+
+    return {
+        "messages": messages,
+        "tool_results_for_chart": tool_results_for_chart,
+        "failed_detail_lookup": None,
+        "needs_entity_clarification": False,
+        # The original failed call looked like an empty result — it
+        # wasn't, it was the wrong guess, now corrected with real data.
+        "had_empty_result": False,
     }
 
 
@@ -1932,12 +2630,81 @@ def _verified_breakdown_counts(tool_results) -> str:
     )
 
 
+def _memo_draft_exclusion_totals(tool_results):
+    """(total_memo_rows, non_draft_count) for this turn's memo rows, or
+    None when there's nothing to correct — fewer than 2 memo rows, or no
+    Draft among them. Shared by the deterministic prepend line and the
+    answer-prompt grounding note below, so both agree on the same number.
+
+    Deduplicates by "code" (e.g. MEM-023) before counting. Seen live: one
+    round issued an unfiltered item_type=memo call (23 rows) AND a second,
+    differently-parameterized call (fields=['code'], limit=1) that just
+    re-fetched one row already in the first 23 — not a cache-missed exact
+    duplicate (_tool_sig's dedup only catches identical fn_args, and these
+    differ), so it landed in tool_results_for_chart a second time and
+    inflated a true 23 into 24. "code" is always kept on every memo row
+    (_apply_fields' always_keep), so it's a reliable identity key here."""
+    if not isinstance(tool_results, list):
+        return None
+    seen_codes = set()
+    memo_rows = []
+    for r in tool_results:
+        if not isinstance(r, dict) or r.get("item_type_label") != "Memo":
+            continue
+        code = r.get("code")
+        if code is not None:
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+        memo_rows.append(r)
+    if len(memo_rows) < 2:
+        return None
+    non_draft_count = sum(1 for r in memo_rows if r.get("status_label") != "Draft")
+    if non_draft_count == len(memo_rows):
+        return None
+    return len(memo_rows), non_draft_count
+
+
+def _memo_draft_exclusion_note(tool_results) -> str:
+    """Draft memos don't count toward this office's "total memos" — see
+    db_queries.py's list_sg_office_direction_items, which already excludes
+    Draft from total_count for a single unfiltered memo call. But a "total
+    memos?" question doesn't always reach that function as one unfiltered
+    call — live testing showed the router sometimes fans out into one call
+    PER status instead, and then adds the per-call total_counts back up
+    itself (Draft's own 1 included), landing right back on the wrong total
+    regardless of what db_queries.py returned. tool_results_for_chart ends
+    up holding the full row set either way (one call's data, or the union
+    of several), so counting Draft rows directly here catches both call
+    patterns."""
+    totals = _memo_draft_exclusion_totals(tool_results)
+    if not totals:
+        return ""
+    total_memos, non_draft_count = totals
+    return (
+        f"\n\nThis office's own convention does not count Draft memos "
+        f"toward a \"total\" — if asked for the total number of memos "
+        f"(across all statuses), state {non_draft_count}, not "
+        f"{total_memos}. Still show Draft's own count normally in any "
+        f"per-status breakdown."
+    )
+
+
 def answer_node(state: ChatState) -> dict:
     """Generate final streamed answer. ALL responses go through this node."""
     client = state["client"]
     model = state["model"]
     messages = state["messages"]
     chunk_queue = state["chunk_queue"]
+
+    if state.get("needs_entity_clarification"):
+        # Deterministic, not left to the model to improvise — a plain
+        # router-prompt instruction to "ask when ambiguous" was tried
+        # first and didn't hold up live (see entity_resolver_node), so
+        # this bypasses the LLM call entirely for the exact wording.
+        chunk_queue.put(ENTITY_CLARIFICATION_MESSAGE)
+        chunk_queue.put(None)
+        return {"final_response": ENTITY_CLARIFICATION_MESSAGE}
 
     # Build answer-specific system prompt (no tool schemas)
     today = datetime.now(UAE_TZ).strftime("%B %d, %Y")
@@ -1949,6 +2716,7 @@ def answer_node(state: ChatState) -> dict:
         today=today,
     )
     answer_system += _verified_breakdown_counts(state.get("tool_results_for_chart"))
+    answer_system += _memo_draft_exclusion_note(state.get("tool_results_for_chart"))
     # Ground the model in its OWN router decision instead of letting it
     # freely claim/deny a chart — it has no other way to know whether one
     # will actually render below its text.
@@ -1957,10 +2725,63 @@ def answer_node(state: ChatState) -> dict:
     else:
         answer_system += "\n\nNo chart will be shown below this response — do not say one is provided/shown/below."
 
+    # Same grounding principle, for which of three distinct outcomes this
+    # turn's data lookup actually had — without this the model has no way
+    # to tell "nothing matched your filter" (a real, legitimate fact) apart
+    # from "the lookup technically failed" (a problem on this end), and
+    # both can otherwise collapse into the same vague "no data found".
+    # Access-denied already has its own STRICT RULES line above — this is
+    # for the two cases that didn't.
+    if state.get("had_technical_error"):
+        answer_system += (
+            "\n\nOne of this turn's data lookups failed due to a technical "
+            "problem (not because the data doesn't exist) — tell the user "
+            "plainly that something went wrong retrieving the data and "
+            "they should try again or rephrase. Do not say 'no data found' "
+            "and do not guess at an answer from anything else in context."
+        )
+    elif state.get("had_empty_result"):
+        answer_system += (
+            "\n\nThis turn's data lookup succeeded but matched zero "
+            "records — this is a legitimate result, not a technical "
+            "problem. Say plainly that nothing matched the given criteria."
+        )
+
+    if state.get("all_items_unfiltered"):
+        # Seen live: the chart/data was correctly unfiltered (all 28
+        # meetings) but the model's own prose still said "all UPCOMING
+        # external meetings" — an echo of an earlier turn's framing still
+        # sitting in conversation history, even though this turn's own
+        # query said "all" and the data backing this answer has zero
+        # filters applied. The data fix alone doesn't stop the text from
+        # drifting independently, so this is told directly, not inferred.
+        answer_system += (
+            "\n\nThis turn's data has NO status/date/type filter applied — "
+            "the user asked for ALL of them. Describe it that way. Do NOT "
+            "describe it using a narrower word (e.g. 'upcoming', 'confirmed', "
+            "a specific status or date range) just because an earlier turn "
+            "in this conversation used one — that word does not apply to "
+            "this turn's actual data."
+        )
+
     # Replace the system prompt with the leaner answer prompt
     answer_messages = [{"role": "system", "content": answer_system}] + messages[1:]
 
+    # Deterministic prepend, not just a prompt instruction the model might
+    # skip — seen live: asked only for a per-status breakdown (no "total"
+    # in the question), the model correctly listed Draft's own count but
+    # never volunteered a total line at all, so there was nothing for the
+    # grounding note above to even correct. Emitted directly into the
+    # stream before the model's own tokens, so it's there every time this
+    # turn's data is a multi-status memo set, independent of whether the
+    # model decides a total belongs in its own answer.
+    memo_totals = _memo_draft_exclusion_totals(state.get("tool_results_for_chart"))
     full_text = ""
+    if memo_totals:
+        _, non_draft_count = memo_totals
+        full_text = f"<p><strong>Total memos: {non_draft_count} (excluding drafts)</strong></p>"
+        chunk_queue.put(full_text)
+
     try:
         response = client.chat.completions.create(
             model=model,
@@ -2006,8 +2827,12 @@ def should_continue(state: ChatState) -> str:
 
 
 def after_tools(state: ChatState) -> str:
-    """After tool_executor: route back to router for multi-step reasoning,
-    or go to answer if we've already done enough rounds (max 3)."""
+    """After tool_executor: resolve a failed name-based get_*_details
+    lookup first (takes priority — see entity_resolver_node), otherwise
+    route back to router for multi-step reasoning, or go to answer if
+    we've already done enough rounds (max 3)."""
+    if state.get("failed_detail_lookup"):
+        return "entity_resolver"
     if state.get("tool_call_count", 0) >= 8:
         return "answer"
     return "router"
@@ -2022,6 +2847,7 @@ def _build_graph():
 
     graph.add_node("router", router_node)
     graph.add_node("tool_executor", tool_executor_node)
+    graph.add_node("entity_resolver", entity_resolver_node)
     graph.add_node("answer", answer_node)
 
     graph.set_entry_point("router")
@@ -2035,8 +2861,12 @@ def _build_graph():
     graph.add_conditional_edges(
         "tool_executor",
         after_tools,
-        {"router": "router", "answer": "answer"},
+        {"router": "router", "answer": "answer", "entity_resolver": "entity_resolver"},
     )
+    # Always straight to answer — entity_resolver has already either
+    # fixed the failed call in place or set needs_entity_clarification,
+    # nothing more to decide.
+    graph.add_edge("entity_resolver", "answer")
     graph.add_edge("answer", END)
 
     return graph.compile()
@@ -2073,6 +2903,24 @@ def _detect_sg_office_topic(query: str) -> Optional[str]:
     return None
 
 
+_USER_MANAGEMENT_KEYWORDS = (
+    "list users", "all users", "user accounts", "user account",
+    "platform users", "how many users", "which users", "user management",
+)
+
+
+def _mentions_user_management(query: str) -> bool:
+    """Same deterministic-keyword-gate idea as _detect_sg_office_topic
+    above, for the same reason: an unauthorized user asking "list all
+    users" was getting a confusing fallback answer (the router, with no
+    list_users tool even offered to it, improvised with an unrelated
+    tool like list_tasks instead of a clear decline) rather than a clean
+    "you're not authorized" — this only ever tightens that case; an
+    authorized user is unaffected regardless of whether it matches."""
+    q = query.lower()
+    return any(kw in q for kw in _USER_MANAGEMENT_KEYWORDS)
+
+
 def run_chatbot_graph(
     query: str,
     conversation_history: list,
@@ -2090,6 +2938,10 @@ def run_chatbot_graph(
     emb=None,
     tool_results_collector: list = None,
     chart_intent_collector: dict = None,
+    cached_meeting_date_filter: dict = None,
+    meeting_date_filter_collector: dict = None,
+    cached_listed_names: dict = None,
+    listed_names_collector: dict = None,
 ):
     """
     Run the LangGraph chatbot and yield response chunks.
@@ -2107,6 +2959,12 @@ def run_chatbot_graph(
             flags = get_user_access_flags(conn, user_id)
         allowed = flags.get(f"sg_office_{sg_topic}")
         if not allowed:
+            yield "<p>You are unauthorized for this information.</p>"
+            return
+    elif _mentions_user_management(query):
+        with pg_conn_fn() as conn:
+            flags = get_user_access_flags(conn, user_id)
+        if not flags.get("user_management"):
             yield "<p>You are unauthorized for this information.</p>"
             return
 
@@ -2161,6 +3019,15 @@ def run_chatbot_graph(
         "want_chart": False,
         "chart_type": None,
         "tool_call_count": 0,
+        "had_technical_error": False,
+        "had_empty_result": False,
+        "all_items_unfiltered": False,
+        "cached_meeting_date_filter": cached_meeting_date_filter or {},
+        "meeting_date_filter": {},
+        "cached_listed_names": cached_listed_names or {},
+        "listed_names": {},
+        "failed_detail_lookup": None,
+        "needs_entity_clarification": False,
         "needs_more_tools": False,
         "final_response": "",
         "chunk_queue": chunk_q,
@@ -2195,3 +3062,7 @@ def run_chatbot_graph(
     if chart_intent_collector is not None and graph_result[0]:
         chart_intent_collector["want_chart"] = bool(graph_result[0].get("want_chart"))
         chart_intent_collector["chart_type"] = graph_result[0].get("chart_type")
+    if meeting_date_filter_collector is not None and graph_result[0]:
+        meeting_date_filter_collector.update(graph_result[0].get("meeting_date_filter") or {})
+    if listed_names_collector is not None and graph_result[0]:
+        listed_names_collector.update(graph_result[0].get("listed_names") or {})

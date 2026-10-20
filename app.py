@@ -48,10 +48,14 @@ from emb_pace import PacedEmbeddings
 
 # Modular imports
 from rbac import fetch_user_profile
-from tools import build_available_tools, run_chatbot_graph, render_tool_result_html
+from tools import (
+    build_available_tools, run_chatbot_graph, render_tool_result_html,
+    detect_unsupported_action, UNSUPPORTED_ACTION_MESSAGE,
+)
 from chart_engine import (
     detect_chart_opportunity, is_chart_request, detect_palette_from_query,
     CHART_SHOWN_MARKER, recent_turn_had_chart, last_user_query, _encode_palette_marker,
+    validate_output_consistency,
 )
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -306,6 +310,71 @@ def save_last_chart_rows(user_key: str, rows: list):
         redis_client.set(redis_key, json.dumps(rows, ensure_ascii=False, default=str), ex=3600)
     except Exception as e:
         logger.error(f"[CHART_ROWS][SAVE] Failed for key={redis_key}: {e}")
+
+
+def get_last_meeting_date_filter(user_key: str) -> dict:
+    """The date-constraining filter (scheduled_month, created_after, etc.)
+    actually used by the last list_sg_office_meetings call that had one.
+    A bare continuation reference ("show them please") carries no new
+    criteria of its own — the router sometimes re-calls with NO date
+    filter at all instead of re-applying the one still being discussed
+    (seen live: "26 meetings received 1-7 Oct" -> "show them please"
+    returned ALL meetings, Sept through Nov, not the 26). Raw tool-call
+    arguments are never part of persisted conversation history (only the
+    final text is), so this is the only place that filter survives
+    between turns."""
+    redis_key = f"user_{user_key}_meeting_date_filter"
+    try:
+        raw = redis_client.get(redis_key)
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.error(f"[MEETING_FILTER][GET] Failed for key={redis_key}: {e}")
+        return {}
+
+
+def save_last_meeting_date_filter(user_key: str, filters: dict):
+    redis_key = f"user_{user_key}_meeting_date_filter"
+    try:
+        redis_client.set(redis_key, json.dumps(filters, ensure_ascii=False, default=str), ex=3600)
+    except Exception as e:
+        logger.error(f"[MEETING_FILTER][SAVE] Failed for key={redis_key}: {e}")
+
+
+def get_last_listed_names(user_key: str) -> dict:
+    """{"project": [...], "task": [...], "resolution": [...]} — the real
+    names from the last list_projects/list_tasks/list_resolutions call of
+    each type. Demo failure this covers: "list all projects" then "give
+    detail about [one of the names from that table]" came back "no
+    project named X found" — not because X doesn't exist, but because raw
+    tool-call arguments are never part of persisted conversation history
+    (only the final text is), so the router has to retype X from memory
+    and/or re-guess which of the three detail tools applies. Resolving
+    the NEXT turn's name-based detail lookup against this cache instead
+    (see tools.py's _match_cached_entity_name) is deterministic and costs
+    no extra DB call — it substitutes the already-known-real name into
+    the one lookup that was always going to happen."""
+    redis_key = f"user_{user_key}_listed_names"
+    try:
+        raw = redis_client.get(redis_key)
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.error(f"[LISTED_NAMES][GET] Failed for key={redis_key}: {e}")
+        return {}
+
+
+def save_last_listed_names(user_key: str, names_by_type: dict):
+    """Merged with whatever's already cached, not overwritten — listing
+    tasks in turn 3 shouldn't erase projects listed back in turn 1; the
+    two entity types' continuation references are independent facts."""
+    if not names_by_type:
+        return
+    redis_key = f"user_{user_key}_listed_names"
+    try:
+        existing = get_last_listed_names(user_key)
+        existing.update(names_by_type)
+        redis_client.set(redis_key, json.dumps(existing, ensure_ascii=False, default=str), ex=3600)
+    except Exception as e:
+        logger.error(f"[LISTED_NAMES][SAVE] Failed for key={redis_key}: {e}")
 
 
 def save_conversation_history(user_key: str, history: list):
@@ -577,39 +646,59 @@ async def handle_query(
         assistant_response = ""
         tool_results_for_chart = []
         chart_intent = {}
+        meeting_date_filter = {}
+        cached_meeting_filter = get_last_meeting_date_filter(history_key)
+        listed_names = {}
+        cached_listed_names = get_last_listed_names(history_key)
         pending_tag = ""
 
-        try:
-            for chunk in run_chatbot_graph(
-                query=query,
-                conversation_history=conversation_history,
-                available_tools=available_tools,
-                user_id=rbac_user_id,
-                user_name=user_name,
-                user_role=user_role,
-                user_email=user_email,
-                user_contact_no=user_contact_no,
-                client=client,
-                model=cfg.AZURE_OPENAI_DEPLOYMENT,
-                pg_conn_fn=pg_conn,
-                policy_cfg=POLICY_CFG,
-                emb=emb,
-                tool_results_collector=tool_results_for_chart,
-                chart_intent_collector=chart_intent,
-            ):
-                assistant_response += chunk
-                plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
-                if plain_text_chunk:
-                    yield plain_text_chunk
+        # Caught before any LLM call at all — this bot has no write tools,
+        # so a request to change/approve/delete/assign something can never
+        # be fulfilled. Declining explicitly here is strictly better than
+        # letting the router free-associate to an unrelated read question
+        # (seen live: "change the Chatbot project status" got answered as
+        # if it were about delayed projects) — faster, free, and certain.
+        if detect_unsupported_action(query):
+            assistant_response = UNSUPPORTED_ACTION_MESSAGE
+            plain_text_chunk, pending_tag = _strip_html_incremental(assistant_response, pending_tag)
+            if plain_text_chunk:
+                yield plain_text_chunk
+        else:
+            try:
+                for chunk in run_chatbot_graph(
+                    query=query,
+                    conversation_history=conversation_history,
+                    available_tools=available_tools,
+                    user_id=rbac_user_id,
+                    user_name=user_name,
+                    user_role=user_role,
+                    user_email=user_email,
+                    user_contact_no=user_contact_no,
+                    client=client,
+                    model=cfg.AZURE_OPENAI_DEPLOYMENT,
+                    pg_conn_fn=pg_conn,
+                    policy_cfg=POLICY_CFG,
+                    emb=emb,
+                    tool_results_collector=tool_results_for_chart,
+                    chart_intent_collector=chart_intent,
+                    cached_meeting_date_filter=cached_meeting_filter,
+                    meeting_date_filter_collector=meeting_date_filter,
+                    cached_listed_names=cached_listed_names,
+                    listed_names_collector=listed_names,
+                ):
+                    assistant_response += chunk
+                    plain_text_chunk, pending_tag = _strip_html_incremental(chunk, pending_tag)
+                    if plain_text_chunk:
+                        yield plain_text_chunk
 
-        except Exception as e:
-            logger.error(f"Error in tool response generation: {e}")
-            error_msg = (
-                "I encountered an error processing your request. "
-                "Please try again or rephrase your question."
-            )
-            assistant_response = error_msg
-            yield error_msg
+            except Exception as e:
+                logger.error(f"Error in tool response generation: {e}")
+                error_msg = (
+                    "I encountered an error processing your request. "
+                    "Please try again or rephrase your question."
+                )
+                assistant_response = error_msg
+                yield error_msg
 
         # Detect chart opportunity and build final payload — computed
         # before saving history so CHART_SHOWN_MARKER (below) can record
@@ -636,6 +725,88 @@ async def handle_query(
         if chart_data and rows_for_chart:
             save_last_chart_rows(history_key, rows_for_chart)
 
+        # One retry when a chart was wanted but the pipeline produced
+        # none — this path is only ever reached for a query that already
+        # looked chart-shaped (is_chart_request), never for an ordinary
+        # query like "list tasks", so this adds zero latency to normal
+        # traffic. Demonstrated live that an identical failing request
+        # can succeed on a fresh sample (the router's tool-call choice is
+        # genuinely stochastic, not deterministic) — worth a few extra
+        # seconds on a request that's otherwise a guaranteed "couldn't
+        # generate a chart" apology. Runs before history is saved, so a
+        # successful retry is what actually gets persisted, not the
+        # failed first attempt.
+        if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
+            retry_tool_results, retry_chart_intent, retry_response = [], {}, ""
+            retry_meeting_filter = {}
+            retry_listed_names = {}
+            try:
+                for chunk in run_chatbot_graph(
+                    query=query, conversation_history=conversation_history,
+                    available_tools=available_tools, user_id=rbac_user_id,
+                    user_name=user_name, user_role=user_role, user_email=user_email,
+                    user_contact_no=user_contact_no, client=client,
+                    model=cfg.AZURE_OPENAI_DEPLOYMENT, pg_conn_fn=pg_conn,
+                    policy_cfg=POLICY_CFG, emb=emb,
+                    tool_results_collector=retry_tool_results,
+                    chart_intent_collector=retry_chart_intent,
+                    cached_meeting_date_filter=cached_meeting_filter,
+                    meeting_date_filter_collector=retry_meeting_filter,
+                    cached_listed_names=cached_listed_names,
+                    listed_names_collector=retry_listed_names,
+                ):
+                    retry_response += chunk
+            except Exception as e:
+                logger.error(f"Chart retry error: {e}")
+
+            if retry_response:
+                retry_rows = retry_tool_results
+                if not retry_rows and recent_had_chart:
+                    retry_rows = get_last_chart_rows(history_key)
+                retry_palette = detect_palette_from_query(query, conversation_history)
+                retry_chart_data = None
+                try:
+                    retry_chart_data = detect_chart_opportunity(
+                        query, retry_rows, retry_response, palette=retry_palette,
+                        recent_had_chart=recent_had_chart, previous_query=previous_query,
+                        want_chart=retry_chart_intent.get("want_chart"),
+                        router_chart_type=retry_chart_intent.get("chart_type"),
+                    )
+                except Exception as e:
+                    logger.error(f"Chart retry detection error: {e}")
+                if retry_chart_data:
+                    assistant_response = retry_response
+                    tool_results_for_chart = retry_tool_results
+                    rows_for_chart = retry_rows
+                    chart_data = retry_chart_data
+                    chart_palette = retry_palette
+                    if retry_meeting_filter:
+                        meeting_date_filter = retry_meeting_filter
+                    if retry_listed_names:
+                        listed_names = retry_listed_names
+                    if rows_for_chart:
+                        save_last_chart_rows(history_key, rows_for_chart)
+
+        # Cache this turn's actual meeting date filter (if any) for a
+        # bare continuation reference next turn — see
+        # get_last_meeting_date_filter for why this can't be reconstructed
+        # from conversation history alone.
+        if meeting_date_filter:
+            save_last_meeting_date_filter(history_key, meeting_date_filter)
+        # Same idea for project/task/resolution names this turn actually
+        # listed — see get_last_listed_names for the exact demo failure
+        # this exists to prevent.
+        if listed_names:
+            save_last_listed_names(history_key, listed_names)
+
+        # Log-only sanity check — never alters the response, just surfaces
+        # a chart/text/data mismatch for review (see validate_output_consistency).
+        try:
+            for warning in validate_output_consistency(chart_data, rows_for_chart, assistant_response):
+                logger.warning(f"[output-consistency] {warning}")
+        except Exception as e:
+            logger.error(f"Output consistency check error: {e}")
+
         # Save conversation history (plain-text — see _strip_html_for_history)
         history_text = _strip_html_for_history(assistant_response)
         if chart_data:
@@ -649,7 +820,8 @@ async def handle_query(
         # after its response is already generated, ended up finding nothing
         # chartable (e.g. the requested field doesn't exist for that entity,
         # like a task's "budget"). Without this, the model's text falsely
-        # claims a chart is coming when none will ever show up.
+        # claims a chart is coming when none will ever show up. (The retry
+        # above already had its shot — this only fires if that failed too.)
         if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
             assistant_response = (
                 "<p>I couldn't generate a chart for this — the data needed "
@@ -770,6 +942,10 @@ async def websocket_chat(ws: WebSocket):
             assistant_response = ""
             tool_results_for_chart = []
             chart_intent = {}
+            meeting_date_filter = {}
+            cached_meeting_filter = get_last_meeting_date_filter(history_key)
+            listed_names = {}
+            cached_listed_names = get_last_listed_names(history_key)
             pending_tag = ""
             async_q = asyncio.Queue()
             loop = asyncio.get_event_loop()
@@ -793,6 +969,10 @@ async def websocket_chat(ws: WebSocket):
                         emb=emb,
                         tool_results_collector=tool_results_for_chart,
                         chart_intent_collector=chart_intent,
+                        cached_meeting_date_filter=cached_meeting_filter,
+                        meeting_date_filter_collector=meeting_date_filter,
+                        cached_listed_names=cached_listed_names,
+                        listed_names_collector=listed_names,
                     ):
                         loop.call_soon_threadsafe(async_q.put_nowait, ("chunk", chunk))
                 except Exception as e:
@@ -801,22 +981,31 @@ async def websocket_chat(ws: WebSocket):
                 finally:
                     loop.call_soon_threadsafe(async_q.put_nowait, ("done", None))
 
-            loop.run_in_executor(None, _run_graph_sync)
+            # Same reasoning as the REST endpoint — see there. Caught before
+            # the graph ever runs: no LLM call, no latency, no chance of
+            # misrouting a write request into an unrelated read answer.
+            if detect_unsupported_action(query):
+                assistant_response = UNSUPPORTED_ACTION_MESSAGE
+                plain, pending_tag = _strip_html_incremental(assistant_response, pending_tag)
+                if plain:
+                    await ws.send_json({"type": "chunk", "content": plain})
+            else:
+                loop.run_in_executor(None, _run_graph_sync)
 
-            # Consume chunks asynchronously — each chunk is sent immediately
-            while True:
-                msg_type, msg_data = await async_q.get()
-                if msg_type == "done":
-                    break
-                elif msg_type == "error":
-                    assistant_response = "I encountered an error processing your request."
-                    await ws.send_json({"type": "error", "message": assistant_response})
-                    break
-                elif msg_type == "chunk":
-                    assistant_response += msg_data
-                    plain, pending_tag = _strip_html_incremental(msg_data, pending_tag)
-                    if plain:
-                        await ws.send_json({"type": "chunk", "content": plain})
+                # Consume chunks asynchronously — each chunk is sent immediately
+                while True:
+                    msg_type, msg_data = await async_q.get()
+                    if msg_type == "done":
+                        break
+                    elif msg_type == "error":
+                        assistant_response = "I encountered an error processing your request."
+                        await ws.send_json({"type": "error", "message": assistant_response})
+                        break
+                    elif msg_type == "chunk":
+                        assistant_response += msg_data
+                        plain, pending_tag = _strip_html_incremental(msg_data, pending_tag)
+                        if plain:
+                            await ws.send_json({"type": "chunk", "content": plain})
 
             # Chart detection — computed before saving history so
             # CHART_SHOWN_MARKER can record whether this turn had one.
@@ -839,6 +1028,83 @@ async def websocket_chat(ws: WebSocket):
             if chart_data and rows_for_chart:
                 save_last_chart_rows(history_key, rows_for_chart)
 
+            # One retry when a chart was wanted but none was produced —
+            # same reasoning as the REST endpoint, see there. Run via
+            # run_in_executor since run_chatbot_graph is a blocking sync
+            # generator and this must not block the event loop; no live
+            # streaming needed here, just the final text.
+            if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
+                retry_tool_results, retry_chart_intent = [], {}
+                retry_meeting_filter = {}
+                retry_listed_names = {}
+
+                def _run_retry_sync():
+                    text = ""
+                    for c in run_chatbot_graph(
+                        query=query, conversation_history=conversation_history,
+                        available_tools=available_tools, user_id=rbac_user_id,
+                        user_name=user_name, user_role=user_role, user_email=user_email,
+                        user_contact_no=user_contact_no, client=client,
+                        model=cfg.AZURE_OPENAI_DEPLOYMENT, pg_conn_fn=pg_conn,
+                        policy_cfg=POLICY_CFG, emb=emb,
+                        tool_results_collector=retry_tool_results,
+                        chart_intent_collector=retry_chart_intent,
+                        cached_meeting_date_filter=cached_meeting_filter,
+                        meeting_date_filter_collector=retry_meeting_filter,
+                        cached_listed_names=cached_listed_names,
+                        listed_names_collector=retry_listed_names,
+                    ):
+                        text += c
+                    return text
+
+                retry_response = ""
+                try:
+                    retry_response = await loop.run_in_executor(None, _run_retry_sync)
+                except Exception as e:
+                    logger.error(f"WS chart retry error: {e}")
+
+                if retry_response:
+                    retry_rows = retry_tool_results
+                    if not retry_rows and recent_had_chart:
+                        retry_rows = get_last_chart_rows(history_key)
+                    retry_palette = detect_palette_from_query(query, conversation_history)
+                    retry_chart_data = None
+                    try:
+                        retry_chart_data = detect_chart_opportunity(
+                            query, retry_rows, retry_response, palette=retry_palette,
+                            recent_had_chart=recent_had_chart, previous_query=previous_query,
+                            want_chart=retry_chart_intent.get("want_chart"),
+                            router_chart_type=retry_chart_intent.get("chart_type"),
+                        )
+                    except Exception as e:
+                        logger.error(f"WS chart retry detection error: {e}")
+                    if retry_chart_data:
+                        assistant_response = retry_response
+                        tool_results_for_chart = retry_tool_results
+                        rows_for_chart = retry_rows
+                        chart_data = retry_chart_data
+                        chart_palette = retry_palette
+                        if retry_meeting_filter:
+                            meeting_date_filter = retry_meeting_filter
+                        if retry_listed_names:
+                            listed_names = retry_listed_names
+                        if rows_for_chart:
+                            save_last_chart_rows(history_key, rows_for_chart)
+
+            # Cache this turn's actual meeting date filter — see the REST
+            # endpoint for the same.
+            if meeting_date_filter:
+                save_last_meeting_date_filter(history_key, meeting_date_filter)
+            if listed_names:
+                save_last_listed_names(history_key, listed_names)
+
+            # Log-only sanity check — see the REST endpoint for the same.
+            try:
+                for warning in validate_output_consistency(chart_data, rows_for_chart, assistant_response):
+                    logger.warning(f"[output-consistency] {warning}")
+            except Exception as e:
+                logger.error(f"WS output consistency check error: {e}")
+
             # Save history (plain-text — see _strip_html_for_history)
             history_text = _strip_html_for_history(assistant_response)
             if chart_data:
@@ -847,7 +1113,8 @@ async def websocket_chat(ws: WebSocket):
             save_conversation_history(history_key, conversation_history)
 
             # Same honest-fallback reasoning as the REST endpoint — see the
-            # comment there.
+            # comment there. (The retry above already had its shot — this
+            # only fires if that failed too.)
             if is_chart_request(query, recent_had_chart, chart_intent.get("want_chart")) and not chart_data:
                 assistant_response = (
                     "<p>I couldn't generate a chart for this — the data needed "
