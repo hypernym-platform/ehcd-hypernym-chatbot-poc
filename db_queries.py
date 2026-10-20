@@ -339,12 +339,24 @@ def _status_label(val) -> str:
 
 
 def _fmt_jsonb(j: Any) -> str:
+    """Flatten a JSONB column's value into plain readable text for a
+    table cell — never raw JSON/list syntax (brackets, quotes, commas-
+    as-separators). A list of strings becomes one "; "-joined sentence;
+    anything else (a dict, a list of dicts) falls back to simple
+    "key: value" joining, since that shape is rare/unexpected here but
+    still needs to render as something readable rather than raw JSON."""
     if j is None:
         return ""
-    if isinstance(j, (dict, list)):
+    if isinstance(j, list):
         if not j:
             return ""
-        return json.dumps(j, ensure_ascii=False, indent=2)
+        if all(isinstance(v, (str, int, float)) for v in j):
+            return "; ".join(str(v) for v in j)
+        return "; ".join(_fmt_jsonb(v) for v in j)
+    if isinstance(j, dict):
+        if not j:
+            return ""
+        return "; ".join(f"{k}: {v}" for k, v in j.items())
     return str(j)
 
 
@@ -365,6 +377,58 @@ def _flatten_detail_result(result: dict) -> dict:
         if val is None or val == "" or val == [] or val == {}:
             result.pop(key)
     return result
+
+
+def get_all_entity_names(conn, user_id: int) -> dict:
+    """{"project": [...], "task": [...], "resolution": [...]} — every
+    name the user can access, across all three. Two plain columns each,
+    no joins, same RBAC each entity's own list_*/get_*_details function
+    already applies (so this never reveals the existence of a record the
+    user couldn't otherwise see). Used by entity_resolver_node (the
+    LangGraph node that runs when a name-based get_*_details call comes
+    back "not found") to find which entity TYPE a name actually belongs
+    to — cheap enough to run every time that happens, unlike a fallback
+    chain of full detail-fetch attempts."""
+    names = {"project": [], "task": [], "resolution": []}
+    superadmin = is_superadmin(conn, user_id)
+
+    with conn.cursor() as cur:
+        all_projects = superadmin or db_has_feature(conn, user_id, FeatureID.ALL_PROJECTS)
+        if all_projects:
+            cur.execute("SELECT project_name_en FROM project_management_project WHERE project_name_en IS NOT NULL")
+            names["project"] = [r[0] for r in cur.fetchall()]
+        else:
+            ids = accessible_project_ids(conn, user_id)
+            if ids:
+                cur.execute(
+                    "SELECT project_name_en FROM project_management_project WHERE id = ANY(%s) AND project_name_en IS NOT NULL",
+                    (ids,),
+                )
+                names["project"] = [r[0] for r in cur.fetchall()]
+
+        task_ids = accessible_task_ids(conn, user_id)
+        if task_ids is None:
+            cur.execute("SELECT task_name FROM task_management_task WHERE task_name IS NOT NULL")
+            names["task"] = [r[0] for r in cur.fetchall()]
+        elif task_ids:
+            cur.execute(
+                "SELECT task_name FROM task_management_task WHERE id = ANY(%s) AND task_name IS NOT NULL",
+                (task_ids,),
+            )
+            names["task"] = [r[0] for r in cur.fetchall()]
+
+        resolution_ids = accessible_resolution_ids(conn, user_id)
+        if resolution_ids is None:
+            cur.execute("SELECT resolution_topic_en FROM resolution_management_resolution WHERE resolution_topic_en IS NOT NULL")
+            names["resolution"] = [r[0] for r in cur.fetchall()]
+        elif resolution_ids:
+            cur.execute(
+                "SELECT resolution_topic_en FROM resolution_management_resolution WHERE id = ANY(%s) AND resolution_topic_en IS NOT NULL",
+                (resolution_ids,),
+            )
+            names["resolution"] = [r[0] for r in cur.fetchall()]
+
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +717,16 @@ def get_project_details(conn, user_id: int, project_id: int = None,
                 f"{n['title']}: {n['note']}" if n.get("title") else n["note"]
                 for n in note_rows
             ) if note_rows else None
+
+        # Dropped outright, not just reformatted — explicitly asked to be
+        # removed from the "give details" view as low-value/redundant for
+        # a chat answer (summary_description_en/progress_to_date_en/ar
+        # still carry the same kind of content and stay).
+        for key in (
+            "summary_heading_en", "summary_heading_ar", "summary_description_ar",
+            "next_step_en", "next_step_ar", "next_step_due_date", "project_file",
+        ):
+            result.pop(key, None)
 
         result = _flatten_detail_result(result)
 
