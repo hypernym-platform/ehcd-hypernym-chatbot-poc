@@ -333,15 +333,36 @@ def user_can_access_resolution(conn, user_id: int, resolution_id: int) -> bool:
         return cur.fetchone() is not None
 
 
+def is_her_excellency(conn, user_id: int) -> bool:
+    """True only for the "Her Excellency" ROLE specifically
+    (role_and_access_role.role_name = 'Her Excellency') — a named role a
+    user is assigned, not a feature flag. Checked explicitly rather than
+    through whatever role_and_access_role_features currently grants that
+    role (confirmed live: User Management, feature id 3, is NOT in that
+    role's current grant list) — this is a deliberate, standing exception
+    alongside superadmin, not something that should depend on the mutable
+    features table staying in sync."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM user_management_user_roles ur
+            JOIN role_and_access_role r ON r.id = ur.role_id
+            WHERE ur.user_id = %s AND r.role_name = 'Her Excellency'
+            LIMIT 1
+        """, (user_id,))
+        return cur.fetchone() is not None
+
+
 def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
     """Get all access flags for a user in a single DB query."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT u.is_superuser,
-                   ARRAY_AGG(DISTINCT rf.feature_id) FILTER (WHERE rf.feature_id IS NOT NULL) AS feature_ids
+                   ARRAY_AGG(DISTINCT rf.feature_id) FILTER (WHERE rf.feature_id IS NOT NULL) AS feature_ids,
+                   BOOL_OR(r.role_name = 'Her Excellency') AS is_her_excellency
             FROM user_management_user u
             LEFT JOIN user_management_user_roles ur ON ur.user_id = u.id
             LEFT JOIN role_and_access_role_features rf ON rf.role_id = ur.role_id
+            LEFT JOIN role_and_access_role r ON r.id = ur.role_id
             WHERE u.id = %s
             GROUP BY u.id, u.is_superuser
         """, (user_id,))
@@ -354,11 +375,15 @@ def get_user_access_flags(conn, user_id: int) -> Dict[str, bool]:
 
     sa = bool(row[0])
     feature_ids = set(row[1] or [])
+    is_he = bool(row[2])
     return {
         "superadmin": sa,
         "all_projects": sa or FeatureID.ALL_PROJECTS in feature_ids,
         "budget": sa or FeatureID.BUDGET_INFO in feature_ids,
-        "user_management": sa or FeatureID.USER_MANAGEMENT in feature_ids,
+        # Her Excellency is a standing exception here, same as superadmin
+        # — see is_her_excellency()'s own docstring for why this isn't
+        # just "give that role the feature" in the access-features table.
+        "user_management": sa or is_he or FeatureID.USER_MANAGEMENT in feature_ids,
         "notes": sa or FeatureID.NOTES in feature_ids,
         "education": sa or FeatureID.EDUCATION_DASH in feature_ids,
         "project_docs": sa or FeatureID.PROJECT_DOCS in feature_ids,

@@ -12,6 +12,7 @@ from psycopg2.extras import RealDictCursor
 
 from rbac import (
     is_superadmin,
+    is_her_excellency,
     db_has_feature,
     FeatureID,
     accessible_project_ids,
@@ -429,6 +430,77 @@ def get_all_entity_names(conn, user_id: int) -> dict:
             names["resolution"] = [r[0] for r in cur.fetchall()]
 
     return names
+
+
+# ---------------------------------------------------------------------------
+# USERS
+# ---------------------------------------------------------------------------
+
+def list_users(conn, user_id: int, filters: dict = None) -> Dict[str, Any]:
+    """List platform user accounts. Superadmin, Her Excellency, or the
+    User Management feature only — checked here (defense-in-depth) even
+    though build_available_tools() already keeps this tool out of a non-
+    authorized user's offered tool list entirely; a user without any of
+    these must never get this data back under any circumstance. Never
+    exposes password or azure_ad_object_id — those aren't columns a chat
+    answer has any legitimate reason to echo."""
+    filters = filters or {}
+    if not (
+        is_superadmin(conn, user_id)
+        or is_her_excellency(conn, user_id)
+        or db_has_feature(conn, user_id, FeatureID.USER_MANAGEMENT)
+    ):
+        return {"error": "Access denied to user management"}
+
+    query = """
+        SELECT id, full_name_en, full_name_ar, email, department, designation,
+               contact_no, gender, is_active, is_superuser, is_staff,
+               created_at, last_login
+        FROM user_management_user
+    """
+    conditions, params = [], []
+
+    if filters.get("name"):
+        clause, p = _multi_word_ilike("full_name_en", filters["name"])
+        conditions.append(clause)
+        params.extend(p)
+
+    if filters.get("department"):
+        conditions.append("department ILIKE %s")
+        params.append(f"%{filters['department']}%")
+
+    if filters.get("designation"):
+        conditions.append("designation ILIKE %s")
+        params.append(f"%{filters['designation']}%")
+
+    if filters.get("is_active") is not None:
+        conditions.append("is_active = %s")
+        params.append(filters["is_active"])
+
+    if filters.get("is_superadmin") is not None:
+        conditions.append("is_superuser = %s")
+        params.append(filters["is_superadmin"])
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY full_name_en"
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["status"] = "Active" if item.pop("is_active") else "Inactive"
+        is_super = item.pop("is_superuser")
+        is_staff = item.pop("is_staff")
+        item["role"] = "Superadmin" if is_super else ("Staff" if is_staff else "Standard")
+        item["created_at"] = str(item["created_at"]) if item.get("created_at") else None
+        item["last_login"] = str(item["last_login"]) if item.get("last_login") else None
+        result.append(item)
+
+    return {"total_count": len(result), "data": result}
 
 
 # ---------------------------------------------------------------------------
