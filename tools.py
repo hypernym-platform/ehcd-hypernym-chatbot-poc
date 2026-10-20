@@ -3159,16 +3159,13 @@ MAX_TOOL_ROUNDS = 3  # router<->tool_executor round trips, not raw tool-call cou
 def after_tools(state: ChatState) -> str:
     """After tool_executor: resolve a failed name-based get_*_details
     lookup first (takes priority — see entity_resolver_node), otherwise
-    route back to router for multi-step reasoning, or go to answer if
-    we've already done enough rounds (max 3)."""
+    route back to router for multi-step reasoning, or go to answer once
+    we've done enough rounds. Capping by round (a full router LLM call)
+    rather than raw tool_call_count bounds worst-case latency to
+    MAX_TOOL_ROUNDS extra router round trips, instead of up to 8
+    sequential ones when the router calls one tool at a time."""
     if state.get("failed_detail_lookup"):
         return "entity_resolver"
-    if state.get("tool_call_count", 0) >= 8:
-    """After tool_executor: route back to router for multi-step reasoning,
-    or go to answer once we've done enough rounds. Capping by round (a full
-    router LLM call) rather than raw tool_call_count bounds worst-case
-    latency to MAX_TOOL_ROUNDS extra router round trips, instead of up to 8
-    sequential ones when the router calls one tool at a time."""
     if state.get("round_count", 0) >= MAX_TOOL_ROUNDS:
         return "answer"
     return "router"
