@@ -33,6 +33,7 @@ from db_queries import (
     list_resolutions,
     get_resolution_details,
     get_all_entity_names,
+    list_users,
     list_sg_office_emails,
     get_sg_office_email_details,
     list_sg_office_meetings,
@@ -1128,6 +1129,47 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "list_users",
+            "description": (
+                "List platform user accounts (name, email, department, "
+                "designation, role, active status). Superadmin / User "
+                "Management access only. Use when the user asks to list, "
+                "search, or count platform users/accounts — never for "
+                "project managers, task owners, or similar role-based "
+                "people lookups within a project/task/resolution, which "
+                "belong to those entities' own filters instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Filter by the user's name (partial match)",
+                    },
+                    "department": {
+                        "type": "string",
+                        "description": "Filter by department (partial match)",
+                    },
+                    "designation": {
+                        "type": "string",
+                        "description": "Filter by job designation/title (partial match)",
+                    },
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "Filter by active account status",
+                    },
+                    "is_superadmin": {
+                        "type": "boolean",
+                        "description": "Filter to only superadmin accounts (true) or only non-superadmin accounts (false)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_education_data",
             "description": (
                 "Query education statistics from EHCD's SQLite database using SQL. "
@@ -1429,6 +1471,8 @@ def execute_tool(
                 resolution_id=arguments.get("resolution_id"),
                 resolution_topic=arguments.get("resolution_topic"),
             )
+        elif tool_name == "list_users":
+            result = list_users(conn, user_id, filters=arguments)
         elif tool_name == "query_education_data":
             result = execute_education_sql(arguments.get("sql", ""))
         elif tool_name == "search_policy":
@@ -1697,6 +1741,13 @@ def build_available_tools(conn, user_id: int) -> List[Dict]:
     if flags.get("education"):
         tools.append(TOOL_DEFS_BY_NAME["query_education_data"])
 
+    # Platform user accounts — superadmin or the User Management feature
+    # (role_and_access_feature id 3), same "superadmin or feature flag"
+    # composite get_user_access_flags() already computes for every other
+    # gate here.
+    if flags.get("user_management"):
+        tools.append(TOOL_DEFS_BY_NAME["list_users"])
+
     return tools
 
 
@@ -1709,7 +1760,7 @@ ROUTER_SYSTEM_PROMPT = """You are a tool routing assistant for the Education, Hu
 Your ONLY job is to decide which tools to call based on the user's question. Do NOT answer the question yourself.
 
 Tool selection rules:
-1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities) → use the list/get tools.
+1. For structured data (projects, SG offices, tasks, resolutions, SG Office internal email correspondence, SG Office external meetings/visitors/facilities, platform user accounts) → use the list/get tools.
 2. For education statistics → use query_education_data (generate a SQLite SELECT query).
 3. For policy questions → use search_policy.
 4. You may call multiple tools if the question spans multiple domains. This
@@ -3106,6 +3157,24 @@ def _detect_sg_office_topic(query: str) -> Optional[str]:
     return None
 
 
+_USER_MANAGEMENT_KEYWORDS = (
+    "list users", "all users", "user accounts", "user account",
+    "platform users", "how many users", "which users", "user management",
+)
+
+
+def _mentions_user_management(query: str) -> bool:
+    """Same deterministic-keyword-gate idea as _detect_sg_office_topic
+    above, for the same reason: an unauthorized user asking "list all
+    users" was getting a confusing fallback answer (the router, with no
+    list_users tool even offered to it, improvised with an unrelated
+    tool like list_tasks instead of a clear decline) rather than a clean
+    "you're not authorized" — this only ever tightens that case; an
+    authorized user is unaffected regardless of whether it matches."""
+    q = query.lower()
+    return any(kw in q for kw in _USER_MANAGEMENT_KEYWORDS)
+
+
 def run_chatbot_graph(
     query: str,
     conversation_history: list,
@@ -3146,6 +3215,12 @@ def run_chatbot_graph(
             flags = get_user_access_flags(conn, user_id)
         allowed = flags.get(f"sg_office_{sg_topic}")
         if not allowed:
+            yield "<p>You are unauthorized for this information.</p>"
+            return
+    elif _mentions_user_management(query):
+        with pg_conn_fn() as conn:
+            flags = get_user_access_flags(conn, user_id)
+        if not flags.get("user_management"):
             yield "<p>You are unauthorized for this information.</p>"
             return
 
